@@ -206,6 +206,22 @@ pub enum Command {
         command: NamespaceCommand,
     },
 
+    /// Serve the HTTP management API (and MCP over HTTP) so a native app or any
+    /// client can drive memory operations.
+    Serve {
+        /// Port to listen on.
+        #[arg(long, default_value = "8766")]
+        port: u16,
+
+        /// Bind 0.0.0.0 (reachable off-host) instead of loopback. The API is
+        /// unauthenticated, so this is off by default.
+        #[arg(long)]
+        public: bool,
+    },
+
+    /// Run the MCP server over stdio (for direct assistant integration).
+    Mcp,
+
     /// Launch the interactive terminal UI (Memory browser + Import).
     Tui,
 }

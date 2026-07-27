@@ -4,12 +4,9 @@
 //! return domain values. Every handler returns a `String` for `main` to print,
 //! or a [`DomainError`] to report.
 
-use crate::application::{
-    resource_slug, DreamReport, ExtractionReport, ImportOutcome, MEMORY_ROOT_URI,
-    RESOURCES_ROOT_URI, SESSIONS_ROOT_URI,
-};
+use crate::application::{DreamReport, ExtractionReport, ImportOutcome};
 use crate::cli::{Cli, Command, MemoryKindArg, NamespaceCommand, OutputFormat};
-use crate::connector::adapter::{fetch_resource, parse_transcript_file};
+use crate::connector::api::controller::{self, SearchOutcome, SearchScope};
 use crate::connector::api::Container;
 use crate::domain::{
     DomainError, MemoryItem, MemoryKind, MemoryNode, MemoryOperation, SessionStatus,
@@ -39,18 +36,16 @@ pub async fn run(cli: Cli, container: &Container) -> Result<String, DomainError>
         Command::Tree { uri, format } => tree(container, uri, format).await,
         Command::Stats { format } => stats(container, format).await,
         Command::Namespace { command } => namespace(container, command).await,
-        // `tui` takes over the terminal and is launched by `main` before the
-        // router runs; it should never reach here.
-        Command::Tui => Err(DomainError::internal(
-            "the `tui` command is handled by main, not the router",
+        // `tui` / `serve` / `mcp` are long-running commands dispatched by `main`
+        // before the (text-returning) router runs; they never reach here.
+        Command::Tui | Command::Serve { .. } | Command::Mcp => Err(DomainError::internal(
+            "this command is handled by main, not the router",
         )),
     }
 }
 
 async fn import(container: &Container, path: String, force: bool) -> Result<String, DomainError> {
-    let transcript = parse_transcript_file(std::path::Path::new(&path))?;
-    let use_case = container.memory_import_use_case()?;
-    let outcome = use_case.execute(&transcript, force).await?;
+    let outcome = controller::import(container, &path, force).await?;
     Ok(render_import_outcome(&outcome))
 }
 
@@ -64,33 +59,23 @@ async fn search(
     namespace: Option<String>,
     format: OutputFormat,
 ) -> Result<String, DomainError> {
-    let use_case = container.memory_search_use_case()?;
     let kind = kind.map(MemoryKind::from);
-
-    // Scope: a --namespace expands to its member projects (globals always
-    // included); a single --project is a one-element scope; neither searches
-    // everything. The two flags are mutually exclusive at the CLI layer.
-    let scope: Option<Vec<String>> = match (namespace, project) {
-        (Some(ns), _) => {
-            let projects = container
-                .memory_repository()?
-                .namespace_projects(&ns)
-                .await?;
-            if projects.is_empty() {
-                return Ok(format!(
-                    "Namespace '{ns}' has no projects (assign one with: memory-rs namespace assign {ns} <project>). \
-                     Only global memories would match."
-                ));
-            }
-            Some(projects)
-        }
-        (None, Some(p)) => Some(vec![p]),
-        (None, None) => None,
+    // The CLI makes --project and --namespace mutually exclusive.
+    let scope = match (namespace, project) {
+        (Some(ns), _) => SearchScope::Namespace(ns),
+        (None, Some(p)) => SearchScope::Project(p),
+        (None, None) => SearchScope::All,
     };
 
-    let results = use_case
-        .execute(&query, kind, scope.as_deref(), num)
-        .await?;
+    let results = match controller::search(container, &query, kind, &scope, num).await? {
+        SearchOutcome::Hits(hits) => hits,
+        SearchOutcome::EmptyNamespace(ns) => {
+            return Ok(format!(
+                "Namespace '{ns}' has no projects (assign one with: memory-rs namespace assign \
+                 {ns} <project>). Only global memories would match."
+            ));
+        }
+    };
 
     match format {
         OutputFormat::Json => {
@@ -134,24 +119,23 @@ async fn namespace(
     container: &Container,
     command: NamespaceCommand,
 ) -> Result<String, DomainError> {
-    let repo = container.memory_repository()?;
     match command {
         NamespaceCommand::Create { name } => {
-            if repo.create_namespace(&name).await? {
+            if controller::create_namespace(container, &name).await? {
                 Ok(format!("Created namespace '{name}'."))
             } else {
                 Ok(format!("Namespace '{name}' already exists."))
             }
         }
         NamespaceCommand::Delete { name } => {
-            if repo.delete_namespace(&name).await? {
+            if controller::delete_namespace(container, &name).await? {
                 Ok(format!("Deleted namespace '{name}'."))
             } else {
                 Ok(format!("No namespace '{name}'."))
             }
         }
         NamespaceCommand::Assign { namespace, project } => {
-            if repo.assign_project(&namespace, &project).await? {
+            if controller::assign_project(container, &namespace, &project).await? {
                 Ok(format!("Assigned '{project}' to namespace '{namespace}'."))
             } else {
                 Ok(format!(
@@ -160,14 +144,14 @@ async fn namespace(
             }
         }
         NamespaceCommand::Unassign { namespace, project } => {
-            if repo.unassign_project(&namespace, &project).await? {
+            if controller::unassign_project(container, &namespace, &project).await? {
                 Ok(format!("Removed '{project}' from namespace '{namespace}'."))
             } else {
                 Ok(format!("'{project}' is not in namespace '{namespace}'."))
             }
         }
         NamespaceCommand::List { format } => {
-            let namespaces = repo.list_namespaces().await?;
+            let namespaces = controller::list_namespaces(container).await?;
             match format {
                 OutputFormat::Json => to_json(&namespaces),
                 OutputFormat::Text => {
@@ -186,7 +170,7 @@ async fn namespace(
             }
         }
         NamespaceCommand::Show { name, format } => {
-            let projects = repo.namespace_projects(&name).await?;
+            let projects = controller::namespace_projects(container, &name).await?;
             match format {
                 OutputFormat::Json => to_json(&projects),
                 OutputFormat::Text => {
@@ -245,77 +229,38 @@ async fn list(
 }
 
 async fn show(container: &Container, id: String) -> Result<String, DomainError> {
-    let repo = container.memory_repository()?;
-
-    // A 'memory://' URI addresses a virtual-filesystem node.
-    if id.starts_with("memory://") {
-        return match repo.find_node(&id).await? {
-            Some(node) => Ok(render_node(&node)),
-            None => Ok(format!("No memory node found at '{id}'.")),
-        };
-    }
-
-    // Accept '<kind>/<name>' as an alternative to the item ID. The same name can
-    // exist in several projects, so show them all rather than guessing one.
-    if let Some((kind_str, name)) = id.split_once('/') {
-        if let Some(kind) = MemoryKind::parse(kind_str) {
-            let items = repo.find_items_named(kind, name).await?;
-            match items.as_slice() {
-                [item] => return Ok(render_item(item)),
-                [] => {}
-                many => {
-                    return Ok(render_many_matches(
-                        &id,
-                        many,
-                        "Show one with: memory-rs show",
-                    ))
-                }
+    match controller::show(container, &id).await? {
+        controller::ShowOutcome::Node(node) => Ok(render_node(&node)),
+        controller::ShowOutcome::Item(item) => Ok(render_item(&item)),
+        controller::ShowOutcome::Many(items) => Ok(render_many_matches(
+            &id,
+            &items,
+            "Show one with: memory-rs show",
+        )),
+        controller::ShowOutcome::NotFound => {
+            if id.starts_with("memory://") {
+                Ok(format!("No memory node found at '{id}'."))
+            } else {
+                Ok(format!("No memory item found with ID '{id}'."))
             }
         }
-    }
-
-    match repo.find_item_by_id(&id).await? {
-        Some(item) => Ok(render_item(&item)),
-        None => Ok(format!("No memory item found with ID '{id}'.")),
     }
 }
 
 async fn delete(container: &Container, id: String) -> Result<String, DomainError> {
-    let repo = container.memory_repository()?;
-
-    // Accept '<kind>/<name>' as an alternative to the item ID. When the name
-    // exists in several projects it is refused rather than guessed — deleting
-    // the wrong project's memory is unrecoverable.
-    if let Some((kind_str, name)) = id.split_once('/') {
-        if let Some(kind) = MemoryKind::parse(kind_str) {
-            let items = repo.find_items_named(kind, name).await?;
-            match items.as_slice() {
-                [item] => {
-                    repo.delete_item_by_id(item.id()).await?;
-                    return Ok(format!("Deleted memory item '{id}'."));
-                }
-                [] => {}
-                many => {
-                    return Ok(render_many_matches(
-                        &id,
-                        many,
-                        "Delete one by ID: memory-rs delete",
-                    ))
-                }
-            }
-        }
-    }
-
-    if repo.delete_item_by_id(&id).await? {
-        Ok(format!("Deleted memory item '{id}'."))
-    } else {
-        Ok(format!("No memory item found with ID '{id}'."))
+    match controller::delete(container, &id).await? {
+        controller::DeleteOutcome::Deleted => Ok(format!("Deleted memory item '{id}'.")),
+        controller::DeleteOutcome::Ambiguous(items) => Ok(render_many_matches(
+            &id,
+            &items,
+            "Delete one by ID: memory-rs delete",
+        )),
+        controller::DeleteOutcome::NotFound => Ok(format!("No memory item found with ID '{id}'.")),
     }
 }
 
 async fn sessions(container: &Container, format: OutputFormat) -> Result<String, DomainError> {
-    let repo = container.memory_repository()?;
-    let sessions = repo.list_sessions().await?;
+    let sessions = controller::sessions(container).await?;
 
     match format {
         OutputFormat::Json => to_json(&sessions),
@@ -351,37 +296,18 @@ async fn add_resource(
     source: String,
     name: Option<String>,
 ) -> Result<String, DomainError> {
-    // Fetch first — a bad path/URL should fail before we spin up the LLM.
-    let fetched = fetch_resource(&source)
-        .await
-        .map_err(|e| DomainError::internal(format!("failed to fetch resource '{source}': {e}")))?;
-    let slug = resource_slug(name.as_deref().unwrap_or(&fetched.title));
-
-    let summary = container.memory_summary_use_case()?;
-    let node = summary
-        .summarize_resource(&slug, &fetched.source, &fetched.text)
-        .await?;
-    // Keep the whole-memory digest in sync (best-effort).
-    if let Err(e) = summary.regenerate_digest().await {
-        tracing::warn!("failed to regenerate memory digest after `add`: {e}");
-    }
-
+    let added = controller::add_resource(container, &source, name.as_deref()).await?;
     Ok(format!(
         "Added resource '{}' ({} chars) at {}\n\n{}",
-        fetched.source,
-        fetched.text.len(),
-        node.uri(),
-        node.abstract_()
+        added.source,
+        added.chars,
+        added.node.uri(),
+        added.node.abstract_()
     ))
 }
 
 async fn dream(container: &Container, idle_minutes: u64) -> Result<String, DomainError> {
-    let use_case = container.memory_dream_use_case()?;
-    // Clamp instead of wrapping: an absurd --idle-minutes must not become a
-    // negative threshold that makes still-active sessions eligible.
-    let idle_secs = i64::try_from(idle_minutes.saturating_mul(60)).unwrap_or(i64::MAX);
-    // A manual `dream` always harvests.
-    let report = use_case.execute(idle_secs, true).await?;
+    let report = controller::dream(container, idle_minutes).await?;
     Ok(render_dream_report(&report))
 }
 
@@ -390,22 +316,10 @@ async fn tree(
     uri: Option<String>,
     format: OutputFormat,
 ) -> Result<String, DomainError> {
-    let repo = container.memory_repository()?;
-
-    let (children, header) = match uri.as_deref() {
-        None => {
-            let mut nodes = Vec::new();
-            if let Some(digest) = repo.find_node(MEMORY_ROOT_URI).await? {
-                nodes.push(digest);
-            }
-            nodes.extend(repo.list_child_nodes(SESSIONS_ROOT_URI).await?);
-            nodes.extend(repo.list_child_nodes(RESOURCES_ROOT_URI).await?);
-            (nodes, "Memory filesystem".to_string())
-        }
-        Some(dir) => (
-            repo.list_child_nodes(dir).await?,
-            format!("Children of {dir}"),
-        ),
+    let children = controller::tree(container, uri.as_deref()).await?;
+    let header = match uri.as_deref() {
+        None => "Memory filesystem".to_string(),
+        Some(dir) => format!("Children of {dir}"),
     };
 
     match format {
@@ -432,8 +346,7 @@ async fn tree(
 }
 
 async fn stats(container: &Container, format: OutputFormat) -> Result<String, DomainError> {
-    let repo = container.memory_repository()?;
-    let stats = repo.stats().await?;
+    let stats = controller::stats(container).await?;
 
     match format {
         OutputFormat::Json => {

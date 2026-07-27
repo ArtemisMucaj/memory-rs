@@ -58,10 +58,17 @@ async fn run(
 ) -> Result<(), memory_rs::DomainError> {
     let container = Container::new(config)?;
 
-    // The TUI takes over the terminal and produces no printable output, so it is
-    // dispatched here rather than through the (text-returning) router.
-    if matches!(cli.command, Command::Tui) {
-        return memory_rs::tui::run(container, log_capture).await;
+    // Long-running commands take over the process (terminal / socket / stdio)
+    // and produce no printable output, so they are dispatched here rather than
+    // through the (text-returning) router.
+    match &cli.command {
+        Command::Tui => return memory_rs::tui::run(container, log_capture).await,
+        Command::Serve { port, public } => {
+            return memory_rs::connector::adapter::management::serve(container, *port, *public)
+                .await
+        }
+        Command::Mcp => return memory_rs::connector::adapter::mcp::serve_stdio(container).await,
+        _ => {}
     }
 
     let output = router::run(cli, &container).await?;

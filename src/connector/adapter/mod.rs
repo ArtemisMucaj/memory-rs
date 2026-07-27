@@ -11,6 +11,8 @@
 mod config;
 mod duckdb_memory_repository;
 mod embedding;
+pub mod management;
+pub mod mcp;
 mod resource_fetch;
 mod session_discovery;
 mod transcript;
