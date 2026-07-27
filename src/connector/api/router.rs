@@ -37,6 +37,11 @@ pub async fn run(cli: Cli, container: &Container) -> Result<String, DomainError>
         Command::Dream { idle_minutes } => dream(container, idle_minutes).await,
         Command::Tree { uri, format } => tree(container, uri, format).await,
         Command::Stats { format } => stats(container, format).await,
+        // `tui` takes over the terminal and is launched by `main` before the
+        // router runs; it should never reach here.
+        Command::Tui => Err(DomainError::internal(
+            "the `tui` command is handled by main, not the router",
+        )),
     }
 }
 

@@ -49,6 +49,16 @@ impl MemoryKind {
         }
     }
 
+    /// Title-cased plural, used for group headers in the memory tree.
+    pub fn plural_title(&self) -> &'static str {
+        match self {
+            MemoryKind::Preference => "Preferences",
+            MemoryKind::Experience => "Experiences",
+            MemoryKind::Skill => "Skills",
+            MemoryKind::Fact => "Facts",
+        }
+    }
+
     pub fn parse(s: &str) -> Option<MemoryKind> {
         match s.trim().to_ascii_lowercase().as_str() {
             "preference" | "preferences" => Some(MemoryKind::Preference),

@@ -191,4 +191,7 @@ pub enum Command {
         #[arg(short = 'F', long, value_enum, default_value = "text")]
         format: OutputFormat,
     },
+
+    /// Launch the interactive terminal UI (Memory browser + Import).
+    Tui,
 }

@@ -6,7 +6,7 @@
 
 use clap::Parser;
 
-use memory_rs::cli::Cli;
+use memory_rs::cli::{Cli, Command};
 use memory_rs::connector::api::{router, Container, ContainerConfig};
 
 #[tokio::main]
@@ -40,6 +40,13 @@ async fn main() {
 
 async fn run(cli: Cli, config: ContainerConfig) -> Result<(), memory_rs::DomainError> {
     let container = Container::new(config)?;
+
+    // The TUI takes over the terminal and produces no printable output, so it is
+    // dispatched here rather than through the (text-returning) router.
+    if matches!(cli.command, Command::Tui) {
+        return memory_rs::tui::run(container).await;
+    }
+
     let output = router::run(cli, &container).await?;
     print!("{output}");
     if !output.ends_with('\n') {

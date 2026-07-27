@@ -67,6 +67,11 @@ impl MemoryLevel {
 pub enum RowTarget {
     /// A directory header (`sessions/`, …) — not itself content.
     Directory,
+    /// A collapsible group header in the grouped tree (`Memories`, a category
+    /// like `Preferences`, `Projects`, `Sessions`). Carries a stable `key` the
+    /// UI uses to track collapse state across refreshes, and the `count` of
+    /// direct children shown as a badge.
+    Group { key: String, count: usize },
     /// A whole node: the detail pane shows all its levels.
     Node(MemoryNode),
     /// A single level of a node: the detail pane shows just that level.
@@ -124,6 +129,79 @@ impl MemoryBrowseUseCase {
         } else {
             self.search(query, limit).await
         }
+    }
+
+    /// The memory store as a *grouped* tree for the TUI: category groups with
+    /// counts, then leaves — and no inline L0/L1/L2 level rows (the detail pane
+    /// shows those). When `query` is non-empty this defers to the same ranked
+    /// hit list as [`Self::execute`], so a search replaces the tree with results.
+    ///
+    /// Layout (each group header is a collapsible [`RowTarget::Group`]):
+    /// ```text
+    /// Memories (9)
+    ///   Preferences (1)
+    ///     memory_view_default
+    ///   Skills (2)
+    ///     …
+    ///   Facts (6)
+    ///     …
+    /// Projects (1)
+    ///   github.com/matter-js/matter.js
+    /// Sessions (130)
+    ///   <session title>
+    /// ```
+    /// Empty groups are omitted. Items keep their `(kind, name, project)`
+    /// identity; only the presentation is grouped.
+    pub async fn grouped_tree(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryRow>, DomainError> {
+        let query = query.trim();
+        if !query.is_empty() {
+            return self.search(query, limit).await;
+        }
+
+        let items = self.memory_repo.list_items(None).await?;
+        let nodes = self.memory_repo.list_nodes(None).await?;
+
+        let mut rows: Vec<MemoryRow> = Vec::new();
+
+        // ── Memories: one group over all items, with a category subgroup per
+        //    non-empty kind (preferences/experiences/skills/facts). ──────────
+        if !items.is_empty() {
+            rows.push(group_row("memories", "Memories", items.len(), 0));
+            for kind in MemoryKind::ALL {
+                let group: Vec<&MemoryItem> = items.iter().filter(|i| i.kind() == kind).collect();
+                if group.is_empty() {
+                    continue;
+                }
+                rows.push(group_row(
+                    &format!("memories/{}", kind.as_str()),
+                    kind.plural_title(),
+                    group.len(),
+                    1,
+                ));
+                for item in group {
+                    rows.push(item_row(item, 2, None));
+                }
+            }
+        }
+
+        // ── Projects and Sessions: a group per node kind, node leaves under it
+        //    (no level rows). Resources join Projects-style under their own
+        //    group so nothing is orphaned. ────────────────────────────────────
+        push_node_group(&mut rows, "projects", "Projects", NodeKind::Project, &nodes);
+        push_node_group(&mut rows, "sessions", "Sessions", NodeKind::Session, &nodes);
+        push_node_group(
+            &mut rows,
+            "resources",
+            "Resources",
+            NodeKind::Resource,
+            &nodes,
+        );
+
+        Ok(rows)
     }
 
     /// Hybrid semantic + keyword recall over items *and* nodes, fused per
@@ -334,6 +412,40 @@ fn dir_row(label: &str, depth: u8) -> MemoryRow {
     }
 }
 
+/// A collapsible group header row for the grouped tree.
+fn group_row(key: &str, label: &str, count: usize, depth: u8) -> MemoryRow {
+    MemoryRow {
+        depth,
+        kind_label: String::new(),
+        label: label.to_string(),
+        preview: None,
+        score: None,
+        target: RowTarget::Group {
+            key: key.to_string(),
+            count,
+        },
+    }
+}
+
+/// Append a group header for `kind`'s nodes (with count) plus one leaf row per
+/// node — no L0/L1/L2 level rows. Omitted entirely when the group is empty.
+fn push_node_group(
+    rows: &mut Vec<MemoryRow>,
+    key: &str,
+    label: &str,
+    kind: NodeKind,
+    nodes: &[MemoryNode],
+) {
+    let group: Vec<&MemoryNode> = nodes.iter().filter(|n| n.kind() == kind).collect();
+    if group.is_empty() {
+        return;
+    }
+    rows.push(group_row(key, label, group.len(), 0));
+    for node in group {
+        rows.push(node_row(node, 1, None));
+    }
+}
+
 fn node_row(node: &MemoryNode, depth: u8, score: Option<f32>) -> MemoryRow {
     MemoryRow {
         depth,
@@ -492,5 +604,90 @@ mod tests {
             .filter(|r| matches!(r.target, RowTarget::Item(_)))
             .count();
         assert_eq!(item_count, 3);
+    }
+
+    use crate::connector::adapter::DuckdbMemoryRepository;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn grouped_tree_matches_the_app_shape() {
+        let repo = Arc::new(DuckdbMemoryRepository::in_memory(4, "mock").unwrap());
+        // Two facts, one preference, and a session node.
+        for it in [
+            item(MemoryKind::Fact, "duckdb_locks"),
+            item(MemoryKind::Fact, "storage_engine"),
+            item(MemoryKind::Preference, "commit_style"),
+        ] {
+            repo.upsert_item(&it, None).await.unwrap();
+        }
+        repo.upsert_node(
+            &node(
+                "memory://sessions/abc",
+                NodeKind::Session,
+                "ov",
+                "transcript",
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let use_case = MemoryBrowseUseCase::new(repo, Embedder::disabled());
+        let rows = use_case.grouped_tree("", 50).await.unwrap();
+
+        // Group headers, in order, with their counts.
+        let groups: Vec<(String, usize)> = rows
+            .iter()
+            .filter_map(|r| match &r.target {
+                RowTarget::Group { count, .. } => Some((r.label.clone(), *count)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            groups,
+            vec![
+                ("Memories".to_string(), 3),
+                ("Preferences".to_string(), 1),
+                ("Facts".to_string(), 2),
+                ("Sessions".to_string(), 1),
+            ]
+        );
+
+        // No inline L0/L1/L2 level rows in the grouped tree.
+        assert!(
+            !rows
+                .iter()
+                .any(|r| matches!(r.target, RowTarget::NodeLevel { .. })),
+            "grouped tree must not carry level rows"
+        );
+
+        // Category subgroups are nested (depth 1) under Memories (depth 0);
+        // items are depth 2; the Sessions group is a top-level (depth 0) header.
+        let memories = &rows[0];
+        assert_eq!(memories.depth, 0);
+        assert!(matches!(memories.target, RowTarget::Group { .. }));
+        let prefs = rows
+            .iter()
+            .find(|r| r.label == "Preferences")
+            .expect("preferences group");
+        assert_eq!(prefs.depth, 1);
+    }
+
+    #[tokio::test]
+    async fn grouped_tree_defers_to_search_when_querying() {
+        let repo = Arc::new(DuckdbMemoryRepository::in_memory(4, "mock").unwrap());
+        repo.upsert_item(&item(MemoryKind::Fact, "network_timeout"), None)
+            .await
+            .unwrap();
+        let use_case = MemoryBrowseUseCase::new(repo, Embedder::disabled());
+
+        // A non-empty query returns ranked hit rows (depth 0), not group headers.
+        let rows = use_case.grouped_tree("network", 10).await.unwrap();
+        assert!(!rows.is_empty());
+        assert!(
+            rows.iter()
+                .all(|r| !matches!(r.target, RowTarget::Group { .. })),
+            "search results should not contain group headers"
+        );
     }
 }

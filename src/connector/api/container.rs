@@ -12,7 +12,7 @@ use openai_rs::{ChatClient, Endpoint};
 use crate::application::interfaces::Embedder;
 use crate::application::{
     ImportSessionUseCase, MemoryBrowseUseCase, MemoryDreamUseCase, MemoryExtractionUseCase,
-    MemoryRepository, MemorySearchUseCase, SummarizeMemoryUseCase,
+    MemoryRepository, MemorySearchUseCase, SessionDiscovery, SummarizeMemoryUseCase,
 };
 use crate::connector::adapter::{
     build_chat_client, build_embedding_client, DuckdbMemoryRepository, LocalSessionDiscovery,
@@ -201,6 +201,12 @@ impl Container {
             import,
             summary,
         ))
+    }
+
+    /// Session discovery over the local Claude / OpenCode / Zed stores. Used by
+    /// the TUI import screen to list sessions and materialize transcripts.
+    pub fn session_discovery(&self) -> Arc<dyn SessionDiscovery> {
+        Arc::new(LocalSessionDiscovery::new(None))
     }
 }
 

@@ -26,6 +26,7 @@ pub mod application;
 pub mod cli;
 pub mod connector;
 pub mod domain;
+pub mod tui;
 
 pub use application::{
     resource_slug, DreamReport, ExtractionReport, HarvestReport, ImportOutcome,
