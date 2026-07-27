@@ -16,7 +16,7 @@ use crate::application::{
 };
 use crate::connector::adapter::{
     build_chat_client, build_embedding_client, DuckdbMemoryRepository, LocalSessionDiscovery,
-    MemoryConfig, ResolvedEndpoint, MEMORY_DB_FILE,
+    MemoryConfig, ResolvedChatEndpoint, ResolvedEmbeddingEndpoint, MEMORY_DB_FILE,
 };
 use crate::domain::DomainError;
 
@@ -47,12 +47,16 @@ impl ContainerConfig {
 /// The memory repository is opened lazily and cached, so the (potentially
 /// migrating) DuckDB open happens once per process and only for commands that
 /// touch storage. The chat client and embedder are built eagerly at
-/// construction from the resolved endpoint.
+/// construction, each from its **own** resolved endpoint — so chat and
+/// embeddings can point at different servers (e.g. a remote LLM with local
+/// embeddings).
 pub struct Container {
     config: ContainerConfig,
-    /// The resolved endpoint, if a backend is configured; `None` runs
-    /// embeddings-disabled and errors on commands that need an LLM.
-    endpoint: Option<ResolvedEndpoint>,
+    /// Resolved chat endpoint (extraction / summarization / dreaming).
+    chat_endpoint: ResolvedChatEndpoint,
+    /// Resolved embedding endpoint. Kept so the memory database can be pinned to
+    /// its model name on first open.
+    embedding_endpoint: ResolvedEmbeddingEndpoint,
     embedder: Embedder,
     memory_repo: Mutex<Option<Arc<dyn MemoryRepository>>>,
 }
@@ -65,23 +69,26 @@ impl Container {
     pub fn new(config: ContainerConfig) -> Result<Self, DomainError> {
         let file_config = MemoryConfig::load(&config.data_dir)?;
         let embedding_cfg = file_config.embedding();
-        let endpoint = file_config
-            .resolve_openai_endpoint(config.openai_endpoint.as_deref(), &embedding_cfg.model);
 
-        let embedder = match &endpoint {
-            Some(ep) => {
-                let client = build_embedding_client(
-                    &endpoint_from_resolved(ep),
-                    ep.embedding_model.clone(),
-                )?;
-                Embedder::new(client)
-            }
-            None => Embedder::disabled(),
+        // Chat and embeddings resolve independently, so a remote LLM can pair
+        // with local embeddings (or vice versa). `--openai-endpoint` overrides
+        // both.
+        let chat_endpoint = file_config.resolve_chat_endpoint(config.openai_endpoint.as_deref());
+        let embedding_endpoint = file_config
+            .resolve_embedding_endpoint(config.openai_endpoint.as_deref(), &embedding_cfg.model);
+
+        let embedder = {
+            let client = build_embedding_client(
+                &endpoint_from_parts(&embedding_endpoint.base_url, &embedding_endpoint.api_key),
+                embedding_endpoint.model.clone(),
+            )?;
+            Embedder::new(client)
         };
 
         Ok(Self {
             config,
-            endpoint,
+            chat_endpoint,
+            embedding_endpoint,
             embedder,
             memory_repo: Mutex::new(None),
         })
@@ -91,21 +98,20 @@ impl Container {
         &self.config.data_dir
     }
 
-    /// The chat client for the resolved endpoint. Errors when no backend is
-    /// configured or the endpoint names no chat model — the LLM-driven commands
-    /// (`import`, `dream`, `add`) need it.
+    /// The chat client for the resolved chat endpoint. Errors when that endpoint
+    /// names no chat model — the LLM-driven commands (`import`, `dream`, `add`)
+    /// need one.
     pub fn chat_client(&self) -> Result<Arc<dyn ChatClient>, DomainError> {
-        let ep = self.endpoint.as_ref().ok_or_else(|| {
+        let ep = &self.chat_endpoint;
+        let model = ep.model.clone().ok_or_else(|| {
             DomainError::invalid_input(
-                "no LLM backend configured; set OPENAI_BASE_URL or add an endpoint to config.json",
+                "the chat endpoint has no model; set OPENAI_MODEL or the endpoint's `model`",
             )
         })?;
-        let model = ep.chat_model.clone().ok_or_else(|| {
-            DomainError::invalid_input(
-                "the active endpoint has no chat model; set OPENAI_MODEL or the endpoint's `model`",
-            )
-        })?;
-        Ok(build_chat_client(&endpoint_from_resolved(ep), model)?)
+        Ok(build_chat_client(
+            &endpoint_from_parts(&ep.base_url, &ep.api_key),
+            model,
+        )?)
     }
 
     /// Open (or return the cached) memory repository, pinned to the configured
@@ -125,15 +131,10 @@ impl Container {
                 self.config.data_dir
             ))
         })?;
-        let embedding_model = self
-            .endpoint
-            .as_ref()
-            .map(|e| e.embedding_model.clone())
-            .unwrap_or_else(|| "none".to_string());
         let repo: Arc<dyn MemoryRepository> = Arc::new(DuckdbMemoryRepository::new(
             &db_path,
             self.config.embedding_dimensions,
-            &embedding_model,
+            &self.embedding_endpoint.model,
         )?);
         *cache = Some(Arc::clone(&repo));
         Ok(repo)
@@ -210,7 +211,7 @@ impl Container {
     }
 }
 
-/// Build an `openai_rs::Endpoint` from a resolved config/env endpoint.
-fn endpoint_from_resolved(ep: &ResolvedEndpoint) -> Endpoint {
-    Endpoint::new(ep.base_url.clone()).with_optional_api_key(ep.api_key.clone())
+/// Build an `openai_rs::Endpoint` from a base URL and optional API key.
+fn endpoint_from_parts(base_url: &str, api_key: &Option<String>) -> Endpoint {
+    Endpoint::new(base_url.to_string()).with_optional_api_key(api_key.clone())
 }
