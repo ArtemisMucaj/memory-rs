@@ -12,7 +12,8 @@ use axum::routing::{delete, get, post};
 use axum::Router;
 use tower_http::cors::CorsLayer;
 
-use super::handlers;
+use super::session_import::SessionImportService;
+use super::{handlers, sessions};
 use crate::connector::api::Container;
 use crate::domain::DomainError;
 
@@ -21,11 +22,15 @@ use crate::domain::DomainError;
 pub struct AppState {
     /// The dependency-injection container wiring adapters to use cases.
     pub container: Arc<Container>,
+    /// Session discovery + background imports. Shared (not per-request) so an
+    /// import's status survives the request that queued it.
+    pub sessions: Arc<SessionImportService>,
 }
 
 impl AppState {
     pub fn new(container: Arc<Container>) -> Self {
-        Self { container }
+        let sessions = SessionImportService::build(Arc::clone(&container));
+        Self { container, sessions }
     }
 }
 
@@ -59,6 +64,15 @@ pub fn routes(state: AppState) -> Router {
         .route(
             "/api/namespaces/{name}/projects/{project}",
             delete(handlers::unassign_project),
+        )
+        // Session discovery + background import (what the TUI's Import screen
+        // does in-process). Discovery is under `/discover` because `/api/sessions`
+        // above already serves the *imported* sessions — a different set.
+        .route("/api/sessions/discover", get(sessions::discover))
+        .route("/api/sessions/transcript", get(sessions::transcript))
+        .route(
+            "/api/sessions/import",
+            get(sessions::import_status).post(sessions::import),
         )
         .route("/api/import", post(handlers::import))
         .route("/api/resources", post(handlers::add_resource))
