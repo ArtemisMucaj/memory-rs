@@ -1,0 +1,82 @@
+[package]
+name = "memory-rs"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Long-term memory for coding assistants: import sessions, extract durable memories, recall by hybrid search"
+repository = "https://github.com/ArtemisMucaj/memory-rs"
+
+[lib]
+name = "memory_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "memory-rs"
+path = "src/main.rs"
+
+[dependencies]
+# LLM + embeddings (ChatClient / EmbeddingClient ports and OpenAI-compatible
+# adapters). Pulled from git so CI and release builds resolve it without the
+# sibling checkout a local `path` would need.
+openai-rs = { git = "https://github.com/ArtemisMucaj/openai-rs", branch = "main" }
+
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+async-trait = "0.1"
+
+# CLI
+clap = { version = "4.4", features = ["derive"] }
+
+# Terminal UI (the `tui` command)
+ratatui = { version = "0.29", features = ["crossterm"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+
+# HTTP management API + MCP server (the `serve` / `mcp` commands)
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors"] }
+rmcp = { version = "0.14", features = [
+    "server",
+    "transport-io",
+    "transport-streamable-http-server",
+    "macros",
+] }
+schemars = "1.0"
+
+# Logging setup for the binary
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+
+# Memory store — its own DuckDB file, separate from any code index
+duckdb = { version = "1.4", features = ["bundled"] }
+
+# Session discovery: OpenCode / Zed keep sessions in SQLite; zstd decompresses
+# Zed's compressed thread bodies; walkdir for Claude session discovery.
+rusqlite = { version = "0.32", features = ["bundled"] }
+zstd = "0.13"
+walkdir = "2.5"
+
+# Ids for memory items; short hashes for project-digest node URIs
+uuid = { version = "1.6", features = ["v4"] }
+sha2 = "0.10"
+
+# Resource fetch (`memory add <url>`)
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "stream",
+    "rustls-tls",
+] }
+
+[dev-dependencies]
+tokio = { version = "1.35", features = ["full"] }
+tempfile = "3"
