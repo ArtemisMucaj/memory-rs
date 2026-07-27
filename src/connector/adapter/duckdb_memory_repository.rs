@@ -3,9 +3,11 @@
 //! Memory lives in its own database file (`memory.duckdb`), so the store can be
 //! inspected, backed up, or wiped independently. Vectors are stored as
 //! fixed-width `FLOAT[dimensions]` columns and recalled with DuckDB's native
-//! `array_cosine_distance`; `dimensions` and the embedding model are persisted
-//! on first open and a later open with a different setup is rejected, since
-//! stored vectors would otherwise be incomparable.
+//! `array_cosine_distance`. `dimensions` is pinned on first open — a later open
+//! at a different width is rejected, since vectors would be incomparable. The
+//! embedding *model* is also recorded on first open, but an existing store keeps
+//! its original: it is authoritative for retrieval, so queries are embedded with
+//! it (see [`MemoryRepository::embedding_model`]) rather than being rejected.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -27,14 +29,20 @@ pub const MEMORY_DB_FILE: &str = "memory.duckdb";
 pub struct DuckdbMemoryRepository {
     conn: Arc<Mutex<Connection>>,
     dimensions: usize,
+    /// The embedding model that wrote the stored vectors — the value seeded on
+    /// first open (an existing store keeps its original, ignoring the argument).
+    /// Authoritative for retrieval; exposed via [`Self::stored_embedding_model`].
+    stored_embedding_model: String,
 }
 
 impl DuckdbMemoryRepository {
     /// Open (or create) the memory database at `db_path`.
     ///
-    /// `dimensions` and `embedding_model` describe the embedding setup and
-    /// are persisted on first open; subsequent opens with a different setup
-    /// are rejected, since stored vectors would be incomparable.
+    /// `dimensions` and `embedding_model` describe the embedding setup. Both are
+    /// persisted on first open. A later open at a different `dimensions` is
+    /// rejected (incomparable vector widths); a different `embedding_model` is
+    /// *not* — the stored model wins and is returned by
+    /// [`Self::stored_embedding_model`], since it must be used to embed queries.
     pub fn new(
         db_path: &Path,
         dimensions: usize,
@@ -159,14 +167,34 @@ impl DuckdbMemoryRepository {
 
         Self::migrate_item_identity(&conn)?;
 
+        // `dimensions` is a hard pin: vectors of different widths cannot be
+        // compared, so a mismatch is a genuine incompatibility and is rejected.
         Self::check_meta(&conn, "dimensions", &dimensions.to_string())?;
-        Self::check_meta(&conn, "embedding_model", embedding_model)?;
+        // The embedding *model* is seeded on a fresh store but NOT rejected on
+        // reopen: the stored model is authoritative for retrieval (queries must
+        // be embedded with whatever wrote the vectors). Callers read it back via
+        // [`MemoryRepository::embedding_model`] and embed queries with it.
+        Self::seed_meta(&conn, "embedding_model", embedding_model)?;
+        // Read back the effective model: for a fresh store this is the argument
+        // just seeded; for an existing store it is the original, which wins.
+        let stored_embedding_model = Self::read_meta(&conn, "embedding_model")?
+            .unwrap_or_else(|| embedding_model.to_string());
 
-        debug!("memory database schema initialized ({dimensions} dims)");
+        debug!(
+            "memory database schema initialized ({dimensions} dims, model '{stored_embedding_model}')"
+        );
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             dimensions,
+            stored_embedding_model,
         })
+    }
+
+    /// The embedding model that wrote the stored vectors, read at open time.
+    /// Synchronous companion to [`MemoryRepository::embedding_model`], so the
+    /// container can build the retrieval embedder without an async hop.
+    pub fn stored_embedding_model(&self) -> &str {
+        &self.stored_embedding_model
     }
 
     /// Widen item identity from `(kind, name)` to `(kind, name, project)` on
@@ -269,6 +297,38 @@ impl DuckdbMemoryRepository {
                 Ok(())
             }
         }
+    }
+
+    /// Read a `memory_meta` value, or `None` when the key is absent.
+    fn read_meta(conn: &Connection, key: &str) -> Result<Option<String>, DomainError> {
+        conn.query_row(
+            "SELECT value FROM memory_meta WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            duckdb::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(DomainError::storage(format!(
+                "Failed to read memory meta '{key}': {other}"
+            ))),
+        })
+    }
+
+    /// Persist `value` under `key` only if the key is absent — used to record
+    /// the embedding model on a fresh store while leaving an existing store's
+    /// recorded value untouched (the stored value stays authoritative).
+    fn seed_meta(conn: &Connection, key: &str, value: &str) -> Result<(), DomainError> {
+        if Self::read_meta(conn, key)?.is_none() {
+            conn.execute(
+                "INSERT INTO memory_meta (key, value) VALUES (?1, ?2)",
+                params![key, value],
+            )
+            .map_err(|e| {
+                DomainError::storage(format!("Failed to write memory meta '{key}': {e}"))
+            })?;
+        }
+        Ok(())
     }
 
     /// Render a vector as a DuckDB `[..]::FLOAT[n]` literal (FLOAT arrays
@@ -1098,6 +1158,13 @@ impl MemoryRepository for DuckdbMemoryRepository {
                 nodes_by_kind,
             })
         })
+        .await
+    }
+
+    async fn embedding_model(&self) -> Result<String, DomainError> {
+        self.query_blocking(
+            |conn| Ok(Self::read_meta(conn, "embedding_model")?.unwrap_or_default()),
+        )
         .await
     }
 }

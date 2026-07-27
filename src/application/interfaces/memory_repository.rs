@@ -157,6 +157,12 @@ pub trait MemoryRepository: Send + Sync {
     /// Aggregate memory-store statistics: item counts by kind, session count,
     /// and node counts by kind.
     async fn stats(&self) -> Result<MemoryStats, DomainError>;
+
+    /// The embedding model that wrote the stored vectors, persisted on first
+    /// open. This is authoritative for **retrieval**: queries must be embedded
+    /// with the same model the vectors were, or the cosine comparison is
+    /// meaningless. Empty only for a store that has never recorded one.
+    async fn embedding_model(&self) -> Result<String, DomainError>;
 }
 
 /// Statistics about the memory store.

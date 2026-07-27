@@ -322,3 +322,43 @@ async fn wrong_dimension_vector_is_rejected() {
         "a {DIMS}-dim store must reject a 2-dim vector"
     );
 }
+
+#[tokio::test]
+async fn stored_embedding_model_wins_on_reopen() {
+    // The embedding model that wrote the vectors is authoritative for
+    // retrieval. Reopening a store with a *different* configured model must
+    // adopt the stored one (not reject, not overwrite), so query embeddings
+    // stay comparable with the stored vectors.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("memory.duckdb");
+
+    let first = DuckdbMemoryRepository::new(&db_path, DIMS, "model-A").unwrap();
+    assert_eq!(first.stored_embedding_model(), "model-A");
+    assert_eq!(first.embedding_model().await.unwrap(), "model-A");
+    drop(first);
+
+    // Reopen with a different configured model — the store keeps model-A.
+    let reopened = DuckdbMemoryRepository::new(&db_path, DIMS, "model-B").unwrap();
+    assert_eq!(
+        reopened.stored_embedding_model(),
+        "model-A",
+        "the stored model must win over the newly-configured one"
+    );
+    assert_eq!(reopened.embedding_model().await.unwrap(), "model-A");
+}
+
+#[tokio::test]
+async fn dimension_mismatch_on_reopen_is_still_rejected() {
+    // Dimensions remain a hard pin: different-width vectors are incomparable,
+    // so reopening at a different dimension is a genuine error (unlike the
+    // model, which is adopted).
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("memory.duckdb");
+
+    DuckdbMemoryRepository::new(&db_path, 4, "model-A").unwrap();
+    let err = DuckdbMemoryRepository::new(&db_path, 8, "model-A");
+    assert!(
+        err.is_err(),
+        "reopening a 4-dim store at 8 dims must be rejected"
+    );
+}
