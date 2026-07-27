@@ -22,11 +22,20 @@ use crate::domain::DomainError;
 /// File name (under the resolved data directory) holding user configuration.
 const CONFIG_FILE: &str = "config.json";
 
-/// Default embedding model when none is configured (OpenAI `text-embedding-3-small`).
-pub const DEFAULT_EMBEDDING_MODEL: &str = "text-embedding-3-small";
+/// Base URL of the built-in default endpoint — a local LM Studio server. Used
+/// when neither a named endpoint nor `OPENAI_BASE_URL` is configured, so the
+/// LLM-driven commands work out of the box against a local model.
+pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:1234";
+
+/// Default chat model for the built-in endpoint (a local LM Studio model).
+pub const DEFAULT_CHAT_MODEL: &str = "google/gemma-4-e2b";
+
+/// Default embedding model when none is configured — the LM Studio
+/// `nomic-embed-text-v1.5` model (768-dimensional).
+pub const DEFAULT_EMBEDDING_MODEL: &str = "text-embedding-nomic-embed-text-v1.5";
 
 /// Default embedding dimension (output width of [`DEFAULT_EMBEDDING_MODEL`]).
-pub const DEFAULT_EMBEDDING_DIMENSIONS: usize = 1536;
+pub const DEFAULT_EMBEDDING_DIMENSIONS: usize = 768;
 
 /// Root configuration document persisted to `<data_dir>/config.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -198,9 +207,12 @@ impl MemoryConfig {
 
     /// Resolve which endpoint to talk to, honoring `name_override` first, then
     /// the configured `active` endpoint, then the `OPENAI_*` environment
-    /// variables. Returns `None` only when nothing is configured *and* no
-    /// `OPENAI_BASE_URL` is set — the caller then reports that no backend is
-    /// available (or proceeds embeddings-disabled).
+    /// variables, and finally a built-in **local LM Studio** default so the
+    /// LLM-driven commands work out of the box with no configuration.
+    ///
+    /// Because of the built-in default this always resolves to *some* endpoint;
+    /// a command still fails clearly at call time if that endpoint is not
+    /// actually reachable (e.g. LM Studio isn't running).
     ///
     /// `default_embedding_model` (from config or the built-in default) fills in
     /// the embedding model when an endpoint does not name its own.
@@ -224,12 +236,16 @@ impl MemoryConfig {
                 }
             }
         }
-        // Environment fallback.
-        let base_url = std::env::var("OPENAI_BASE_URL").ok()?;
+        // Environment overrides, else the built-in local LM Studio default. Each
+        // field falls back independently, so setting only `OPENAI_MODEL` (say)
+        // still points at the default LM Studio server.
         Some(ResolvedEndpoint {
-            base_url,
+            base_url: std::env::var("OPENAI_BASE_URL")
+                .unwrap_or_else(|_| DEFAULT_BASE_URL.to_string()),
             api_key: std::env::var("OPENAI_API_KEY").ok(),
-            chat_model: std::env::var("OPENAI_MODEL").ok(),
+            chat_model: Some(
+                std::env::var("OPENAI_MODEL").unwrap_or_else(|_| DEFAULT_CHAT_MODEL.to_string()),
+            ),
             embedding_model: std::env::var("OPENAI_EMBEDDING_MODEL")
                 .unwrap_or_else(|_| default_embedding_model.to_string()),
         })
@@ -349,5 +365,42 @@ mod tests {
             .resolve_openai_endpoint(None, "custom-embed")
             .expect("resolves");
         assert_eq!(resolved.embedding_model, "custom-embed");
+    }
+
+    #[test]
+    fn empty_config_resolves_to_the_builtin_lm_studio_default() {
+        // With no named endpoints and no OPENAI_* environment, resolution must
+        // fall back to the built-in local LM Studio default so the LLM-driven
+        // commands work out of the box. Snapshot/restore the env vars so this
+        // test is independent of the caller's shell.
+        let saved: Vec<(&str, Option<String>)> = [
+            "OPENAI_BASE_URL",
+            "OPENAI_API_KEY",
+            "OPENAI_MODEL",
+            "OPENAI_EMBEDDING_MODEL",
+        ]
+        .iter()
+        .map(|k| (*k, std::env::var(k).ok()))
+        .collect();
+        for (k, _) in &saved {
+            std::env::remove_var(k);
+        }
+
+        let cfg = MemoryConfig::default();
+        let resolved = cfg
+            .resolve_openai_endpoint(None, DEFAULT_EMBEDDING_MODEL)
+            .expect("built-in default resolves");
+
+        for (k, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+
+        assert_eq!(resolved.base_url, DEFAULT_BASE_URL);
+        assert_eq!(resolved.chat_model.as_deref(), Some(DEFAULT_CHAT_MODEL));
+        assert_eq!(resolved.embedding_model, DEFAULT_EMBEDDING_MODEL);
+        assert!(resolved.api_key.is_none());
     }
 }

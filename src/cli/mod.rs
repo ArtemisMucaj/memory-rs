@@ -7,6 +7,7 @@
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+use crate::connector::adapter::DEFAULT_EMBEDDING_DIMENSIONS;
 use crate::domain::{MemoryKind, NodeKind};
 
 /// Long-term memory for coding assistants: import sessions, extract durable
@@ -19,8 +20,9 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub data_dir: Option<String>,
 
-    /// Embedding dimension the database is pinned to on first open.
-    #[arg(long, global = true, default_value = "1536")]
+    /// Embedding dimension the database is pinned to on first open. The default
+    /// matches the built-in LM Studio embedding model.
+    #[arg(long, global = true, default_value_t = DEFAULT_EMBEDDING_DIMENSIONS)]
     pub embedding_dimensions: usize,
 
     /// Use a named OpenAI endpoint from `config.json` instead of the active one.
