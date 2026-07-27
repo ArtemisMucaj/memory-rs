@@ -146,14 +146,10 @@ impl MemoryExtractionUseCase {
                     // Prefetch within the session's project (its items +
                     // globals) so merging happens against memories that are
                     // actually relevant to this project/namespace.
+                    let scope = transcript.project.clone().map(|p| vec![p]);
                     match self
                         .memory_repo
-                        .search_semantic(
-                            &vector,
-                            None,
-                            transcript.project.as_deref(),
-                            PREFETCH_LIMIT,
-                        )
+                        .search_semantic(&vector, None, scope.as_deref(), PREFETCH_LIMIT)
                         .await
                     {
                         Ok(results) => return results.into_iter().map(|(item, _)| item).collect(),

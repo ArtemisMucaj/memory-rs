@@ -8,7 +8,7 @@ use crate::application::{
     resource_slug, DreamReport, ExtractionReport, ImportOutcome, MEMORY_ROOT_URI,
     RESOURCES_ROOT_URI, SESSIONS_ROOT_URI,
 };
-use crate::cli::{Cli, Command, MemoryKindArg, OutputFormat};
+use crate::cli::{Cli, Command, MemoryKindArg, NamespaceCommand, OutputFormat};
 use crate::connector::adapter::{fetch_resource, parse_transcript_file};
 use crate::connector::api::Container;
 use crate::domain::{
@@ -27,8 +27,9 @@ pub async fn run(cli: Cli, container: &Container) -> Result<String, DomainError>
             num,
             kind,
             project,
+            namespace,
             format,
-        } => search(container, query, num, kind, project, format).await,
+        } => search(container, query, num, kind, project, namespace, format).await,
         Command::List { kind, format } => list(container, kind, format).await,
         Command::Show { id } => show(container, id).await,
         Command::Delete { id } => delete(container, id).await,
@@ -37,6 +38,7 @@ pub async fn run(cli: Cli, container: &Container) -> Result<String, DomainError>
         Command::Dream { idle_minutes } => dream(container, idle_minutes).await,
         Command::Tree { uri, format } => tree(container, uri, format).await,
         Command::Stats { format } => stats(container, format).await,
+        Command::Namespace { command } => namespace(container, command).await,
         // `tui` takes over the terminal and is launched by `main` before the
         // router runs; it should never reach here.
         Command::Tui => Err(DomainError::internal(
@@ -59,12 +61,35 @@ async fn search(
     num: usize,
     kind: Option<MemoryKindArg>,
     project: Option<String>,
+    namespace: Option<String>,
     format: OutputFormat,
 ) -> Result<String, DomainError> {
     let use_case = container.memory_search_use_case()?;
     let kind = kind.map(MemoryKind::from);
+
+    // Scope: a --namespace expands to its member projects (globals always
+    // included); a single --project is a one-element scope; neither searches
+    // everything. The two flags are mutually exclusive at the CLI layer.
+    let scope: Option<Vec<String>> = match (namespace, project) {
+        (Some(ns), _) => {
+            let projects = container
+                .memory_repository()?
+                .namespace_projects(&ns)
+                .await?;
+            if projects.is_empty() {
+                return Ok(format!(
+                    "Namespace '{ns}' has no projects (assign one with: memory-rs namespace assign {ns} <project>). \
+                     Only global memories would match."
+                ));
+            }
+            Some(projects)
+        }
+        (None, Some(p)) => Some(vec![p]),
+        (None, None) => None,
+    };
+
     let results = use_case
-        .execute(&query, kind, project.as_deref(), num)
+        .execute(&query, kind, scope.as_deref(), num)
         .await?;
 
     match format {
@@ -101,6 +126,84 @@ async fn search(
                 ));
             }
             Ok(output)
+        }
+    }
+}
+
+async fn namespace(
+    container: &Container,
+    command: NamespaceCommand,
+) -> Result<String, DomainError> {
+    let repo = container.memory_repository()?;
+    match command {
+        NamespaceCommand::Create { name } => {
+            if repo.create_namespace(&name).await? {
+                Ok(format!("Created namespace '{name}'."))
+            } else {
+                Ok(format!("Namespace '{name}' already exists."))
+            }
+        }
+        NamespaceCommand::Delete { name } => {
+            if repo.delete_namespace(&name).await? {
+                Ok(format!("Deleted namespace '{name}'."))
+            } else {
+                Ok(format!("No namespace '{name}'."))
+            }
+        }
+        NamespaceCommand::Assign { namespace, project } => {
+            if repo.assign_project(&namespace, &project).await? {
+                Ok(format!("Assigned '{project}' to namespace '{namespace}'."))
+            } else {
+                Ok(format!(
+                    "'{project}' is already in namespace '{namespace}'."
+                ))
+            }
+        }
+        NamespaceCommand::Unassign { namespace, project } => {
+            if repo.unassign_project(&namespace, &project).await? {
+                Ok(format!("Removed '{project}' from namespace '{namespace}'."))
+            } else {
+                Ok(format!("'{project}' is not in namespace '{namespace}'."))
+            }
+        }
+        NamespaceCommand::List { format } => {
+            let namespaces = repo.list_namespaces().await?;
+            match format {
+                OutputFormat::Json => to_json(&namespaces),
+                OutputFormat::Text => {
+                    if namespaces.is_empty() {
+                        return Ok(
+                            "No namespaces. Create one with: memory-rs namespace create <name>"
+                                .to_string(),
+                        );
+                    }
+                    let mut out = format!("{} namespace(s):\n\n", namespaces.len());
+                    for (name, count) in &namespaces {
+                        out.push_str(&format!("{name}  ({count} project(s))\n"));
+                    }
+                    Ok(out)
+                }
+            }
+        }
+        NamespaceCommand::Show { name, format } => {
+            let projects = repo.namespace_projects(&name).await?;
+            match format {
+                OutputFormat::Json => to_json(&projects),
+                OutputFormat::Text => {
+                    if projects.is_empty() {
+                        return Ok(format!(
+                            "Namespace '{name}' has no projects (assign one with: \
+                             memory-rs namespace assign {name} <project>)."
+                        ));
+                    }
+                    let mut out =
+                        format!("Namespace '{name}' ({} project(s)):\n\n", projects.len());
+                    for p in &projects {
+                        out.push_str(&format!("  {p}\n"));
+                    }
+                    Ok(out)
+                }
+            }
         }
     }
 }

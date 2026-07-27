@@ -362,3 +362,143 @@ async fn dimension_mismatch_on_reopen_is_still_rejected() {
         "reopening a 4-dim store at 8 dims must be rejected"
     );
 }
+
+#[tokio::test]
+async fn namespace_crud_and_membership() {
+    let repo = repo();
+
+    // Create is idempotent.
+    assert!(repo.create_namespace("payments").await.unwrap());
+    assert!(!repo.create_namespace("payments").await.unwrap());
+
+    // An empty namespace exists but lists no projects.
+    assert_eq!(repo.namespace_projects("payments").await.unwrap().len(), 0);
+    assert_eq!(
+        repo.list_namespaces().await.unwrap(),
+        vec![("payments".to_string(), 0)]
+    );
+
+    // Assign is idempotent and reflected in the count + projects.
+    assert!(repo
+        .assign_project("payments", "svc-billing")
+        .await
+        .unwrap());
+    assert!(!repo
+        .assign_project("payments", "svc-billing")
+        .await
+        .unwrap());
+    assert!(repo.assign_project("payments", "svc-ledger").await.unwrap());
+    assert_eq!(
+        repo.namespace_projects("payments").await.unwrap(),
+        vec!["svc-billing".to_string(), "svc-ledger".to_string()]
+    );
+    assert_eq!(
+        repo.list_namespaces().await.unwrap(),
+        vec![("payments".to_string(), 2)]
+    );
+
+    // Unassign removes membership; the namespace persists.
+    assert!(repo
+        .unassign_project("payments", "svc-ledger")
+        .await
+        .unwrap());
+    assert!(!repo
+        .unassign_project("payments", "svc-ledger")
+        .await
+        .unwrap());
+    assert_eq!(
+        repo.namespace_projects("payments").await.unwrap(),
+        vec!["svc-billing".to_string()]
+    );
+
+    // Delete removes the namespace entirely.
+    assert!(repo.delete_namespace("payments").await.unwrap());
+    assert!(!repo.delete_namespace("payments").await.unwrap());
+    assert!(repo.list_namespaces().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn assigning_a_project_autocreates_the_namespace() {
+    let repo = repo();
+    // Assigning to a not-yet-created namespace creates it (with the member).
+    assert!(repo.assign_project("infra", "svc-a").await.unwrap());
+    assert_eq!(
+        repo.list_namespaces().await.unwrap(),
+        vec![("infra".to_string(), 1)]
+    );
+}
+
+#[tokio::test]
+async fn namespace_scoped_search_returns_globals_plus_member_projects() {
+    let repo = repo();
+    // A global fact, two project facts (in the namespace), and one outside it.
+    repo.upsert_item(&item("global_fact", "shared knowledge", None), None)
+        .await
+        .unwrap();
+    repo.upsert_item(&item("a_fact", "billing detail", Some("svc-billing")), None)
+        .await
+        .unwrap();
+    repo.upsert_item(&item("b_fact", "ledger detail", Some("svc-ledger")), None)
+        .await
+        .unwrap();
+    repo.upsert_item(
+        &item("other_fact", "unrelated repo", Some("svc-other")),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Scope = the namespace's two member projects.
+    let scope = vec!["svc-billing".to_string(), "svc-ledger".to_string()];
+    let hits = repo
+        .search_keyword(
+            "detail knowledge billing ledger unrelated",
+            None,
+            Some(&scope),
+            50,
+        )
+        .await
+        .unwrap();
+    let names: std::collections::HashSet<&str> = hits.iter().map(|(i, _)| i.name()).collect();
+
+    assert!(names.contains("global_fact"), "globals are always in scope");
+    assert!(
+        names.contains("a_fact"),
+        "member project svc-billing in scope"
+    );
+    assert!(
+        names.contains("b_fact"),
+        "member project svc-ledger in scope"
+    );
+    assert!(
+        !names.contains("other_fact"),
+        "a project outside the namespace must be excluded"
+    );
+}
+
+#[tokio::test]
+async fn empty_scope_restricts_to_globals_only() {
+    let repo = repo();
+    repo.upsert_item(&item("g", "global", None), None)
+        .await
+        .unwrap();
+    repo.upsert_item(&item("p", "project scoped", Some("svc-a")), None)
+        .await
+        .unwrap();
+
+    // An empty scope slice means "globals only".
+    let hits = repo
+        .search_keyword("global project scoped", None, Some(&[]), 50)
+        .await
+        .unwrap();
+    let names: std::collections::HashSet<&str> = hits.iter().map(|(i, _)| i.name()).collect();
+    assert!(names.contains("g"));
+    assert!(!names.contains("p"), "empty scope excludes project items");
+}
+
+#[tokio::test]
+async fn empty_namespace_name_is_rejected() {
+    let repo = repo();
+    assert!(repo.create_namespace("   ").await.is_err());
+    assert!(repo.assign_project("ns", "").await.is_err());
+}

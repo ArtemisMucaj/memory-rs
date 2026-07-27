@@ -110,10 +110,15 @@ pub enum Command {
         #[arg(short, long, value_enum)]
         kind: Option<MemoryKindArg>,
 
-        /// Restrict to memories relevant in this project/namespace (its items
-        /// plus globals). Omit to search everything.
+        /// Restrict to memories relevant in this project (its items plus
+        /// globals). Omit to search everything.
         #[arg(long)]
         project: Option<String>,
+
+        /// Restrict to a namespace: the union of its member projects' items,
+        /// plus globals. Mutually exclusive with --project.
+        #[arg(long, conflicts_with = "project")]
+        namespace: Option<String>,
 
         /// Output format: text or json.
         #[arg(short = 'F', long, value_enum, default_value = "text")]
@@ -194,6 +199,61 @@ pub enum Command {
         format: OutputFormat,
     },
 
+    /// Manage namespaces — cohesive groups of projects that focus retrieval
+    /// across a set of related repositories.
+    Namespace {
+        #[command(subcommand)]
+        command: NamespaceCommand,
+    },
+
     /// Launch the interactive terminal UI (Memory browser + Import).
     Tui,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum NamespaceCommand {
+    /// Create an (empty) namespace.
+    Create {
+        /// Namespace name.
+        name: String,
+    },
+
+    /// Delete a namespace and its project memberships (member items are kept).
+    Delete {
+        /// Namespace name.
+        name: String,
+    },
+
+    /// List namespaces with their project counts.
+    List {
+        /// Output format: text or json.
+        #[arg(short = 'F', long, value_enum, default_value = "text")]
+        format: OutputFormat,
+    },
+
+    /// Show a namespace's member projects.
+    Show {
+        /// Namespace name.
+        name: String,
+
+        /// Output format: text or json.
+        #[arg(short = 'F', long, value_enum, default_value = "text")]
+        format: OutputFormat,
+    },
+
+    /// Add a project to a namespace.
+    Assign {
+        /// Namespace name.
+        namespace: String,
+        /// Project (repository / working-directory name) to add.
+        project: String,
+    },
+
+    /// Remove a project from a namespace.
+    Unassign {
+        /// Namespace name.
+        namespace: String,
+        /// Project to remove.
+        project: String,
+    },
 }

@@ -62,25 +62,26 @@ pub trait MemoryRepository: Send + Sync {
     /// Cosine-similarity search over item embeddings.
     /// Returns `(item, score)` pairs, best first, score in `[0, 1]`.
     ///
-    /// `project` filters to items relevant in that project/namespace —
-    /// global items plus items belonging to exactly that project. `None`
-    /// searches everything.
+    /// `projects` scopes the search: `None` searches everything; `Some(list)`
+    /// returns global items plus items belonging to any project in `list`. A
+    /// single-project scope passes a one-element slice; a namespace passes its
+    /// member projects. An empty slice restricts to globals only.
     async fn search_semantic(
         &self,
         vector: &[f32],
         kind: Option<MemoryKind>,
-        project: Option<&str>,
+        projects: Option<&[String]>,
         limit: usize,
     ) -> Result<Vec<(MemoryItem, f32)>, DomainError>;
 
     /// Case-insensitive keyword search over item names and content.
-    /// Returns `(item, score)` pairs, best first. `project` filters as in
+    /// Returns `(item, score)` pairs, best first. `projects` scopes as in
     /// [`Self::search_semantic`].
     async fn search_keyword(
         &self,
         query: &str,
         kind: Option<MemoryKind>,
-        project: Option<&str>,
+        projects: Option<&[String]>,
         limit: usize,
     ) -> Result<Vec<(MemoryItem, f32)>, DomainError>;
 
@@ -153,6 +154,31 @@ pub trait MemoryRepository: Send + Sync {
 
     /// The most recently finished dream run, if any.
     async fn last_dream_run(&self) -> Result<Option<DreamRun>, DomainError>;
+
+    // ── Namespaces (cohesive groups of projects) ─────────────────────────────
+
+    /// Create a namespace (a named group of projects). Idempotent — creating an
+    /// existing namespace is a no-op. Returns `true` when it was newly created.
+    async fn create_namespace(&self, name: &str) -> Result<bool, DomainError>;
+
+    /// Delete a namespace and all its project memberships (the member projects'
+    /// items are untouched — only the grouping is removed). Returns whether it
+    /// existed.
+    async fn delete_namespace(&self, name: &str) -> Result<bool, DomainError>;
+
+    /// Add `project` to `namespace` (creating the namespace if needed).
+    /// Idempotent. Returns `true` when the membership was newly added.
+    async fn assign_project(&self, namespace: &str, project: &str) -> Result<bool, DomainError>;
+
+    /// Remove `project` from `namespace`. Returns whether the membership existed.
+    async fn unassign_project(&self, namespace: &str, project: &str) -> Result<bool, DomainError>;
+
+    /// All namespaces with their member-project counts, name order.
+    async fn list_namespaces(&self) -> Result<Vec<(String, u64)>, DomainError>;
+
+    /// The member projects of `namespace`, name order (empty if it has none or
+    /// does not exist).
+    async fn namespace_projects(&self, namespace: &str) -> Result<Vec<String>, DomainError>;
 
     /// Aggregate memory-store statistics: item counts by kind, session count,
     /// and node counts by kind.

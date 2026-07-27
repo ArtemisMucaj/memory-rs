@@ -127,6 +127,11 @@ impl DuckdbMemoryRepository {
                 operations_skipped BIGINT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'completed'
             );
+            CREATE TABLE IF NOT EXISTS memory_namespaces (
+                namespace TEXT NOT NULL,
+                project TEXT NOT NULL,
+                UNIQUE (namespace, project)
+            );
             "#
         ))
         .map_err(|e| DomainError::storage(format!("Failed to initialize memory schema: {e}")))?;
@@ -609,7 +614,7 @@ impl MemoryRepository for DuckdbMemoryRepository {
         &self,
         vector: &[f32],
         kind: Option<MemoryKind>,
-        project: Option<&str>,
+        projects: Option<&[String]>,
         limit: usize,
     ) -> Result<Vec<(MemoryItem, f32)>, DomainError> {
         let literal = self.vector_literal(vector)?;
@@ -617,11 +622,8 @@ impl MemoryRepository for DuckdbMemoryRepository {
         if let Some(k) = kind {
             conditions.push(format!("i.kind = '{}'", k.as_str()));
         }
-        if let Some(p) = project {
-            conditions.push(format!(
-                "(i.project = '' OR i.project = '{}')",
-                sql_quote(p)
-            ));
+        if let Some(clause) = project_scope_clause("i.project", projects) {
+            conditions.push(clause);
         }
         let kind_clause = if conditions.is_empty() {
             String::new()
@@ -661,7 +663,7 @@ impl MemoryRepository for DuckdbMemoryRepository {
         &self,
         query: &str,
         kind: Option<MemoryKind>,
-        project: Option<&str>,
+        projects: Option<&[String]>,
         limit: usize,
     ) -> Result<Vec<(MemoryItem, f32)>, DomainError> {
         let terms: Vec<String> = query
@@ -696,11 +698,8 @@ impl MemoryRepository for DuckdbMemoryRepository {
             Some(k) => format!("AND kind = '{}'", k.as_str()),
             None => String::new(),
         };
-        if let Some(p) = project {
-            kind_clause.push_str(&format!(
-                " AND (project = '' OR project = '{}')",
-                sql_quote(p)
-            ));
+        if let Some(clause) = project_scope_clause("project", projects) {
+            kind_clause.push_str(&format!(" AND {clause}"));
         }
         let sql = format!(
             "SELECT {ITEM_COLUMNS}, {score_expr} AS score \
@@ -1167,11 +1166,145 @@ impl MemoryRepository for DuckdbMemoryRepository {
         )
         .await
     }
+
+    async fn create_namespace(&self, name: &str) -> Result<bool, DomainError> {
+        let name = validate_namespace(name)?;
+        let conn = self.conn.lock().await;
+        // An empty namespace is recorded with a placeholder row (project = '')
+        // so it can exist before any project is assigned. The placeholder is
+        // never returned by `namespace_projects` (globals are implicit).
+        let existing: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_namespaces WHERE namespace = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .map_err(|e| DomainError::storage(format!("Failed to check namespace: {e}")))?;
+        if existing > 0 {
+            return Ok(false);
+        }
+        conn.execute(
+            "INSERT INTO memory_namespaces (namespace, project) VALUES (?1, '')",
+            params![name],
+        )
+        .map_err(|e| DomainError::storage(format!("Failed to create namespace: {e}")))?;
+        Ok(true)
+    }
+
+    async fn delete_namespace(&self, name: &str) -> Result<bool, DomainError> {
+        let conn = self.conn.lock().await;
+        let deleted = conn
+            .execute(
+                "DELETE FROM memory_namespaces WHERE namespace = ?1",
+                params![name],
+            )
+            .map_err(|e| DomainError::storage(format!("Failed to delete namespace: {e}")))?;
+        Ok(deleted > 0)
+    }
+
+    async fn assign_project(&self, namespace: &str, project: &str) -> Result<bool, DomainError> {
+        let namespace = validate_namespace(namespace)?;
+        if project.is_empty() {
+            return Err(DomainError::invalid_input("project must not be empty"));
+        }
+        let conn = self.conn.lock().await;
+        let existing: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_namespaces WHERE namespace = ?1 AND project = ?2",
+                params![namespace, project],
+                |row| row.get(0),
+            )
+            .map_err(|e| DomainError::storage(format!("Failed to check membership: {e}")))?;
+        if existing > 0 {
+            return Ok(false);
+        }
+        conn.execute(
+            "INSERT INTO memory_namespaces (namespace, project) VALUES (?1, ?2)",
+            params![namespace, project],
+        )
+        .map_err(|e| DomainError::storage(format!("Failed to assign project: {e}")))?;
+        Ok(true)
+    }
+
+    async fn unassign_project(&self, namespace: &str, project: &str) -> Result<bool, DomainError> {
+        let conn = self.conn.lock().await;
+        let deleted = conn
+            .execute(
+                "DELETE FROM memory_namespaces WHERE namespace = ?1 AND project = ?2",
+                params![namespace, project],
+            )
+            .map_err(|e| DomainError::storage(format!("Failed to unassign project: {e}")))?;
+        Ok(deleted > 0)
+    }
+
+    async fn list_namespaces(&self) -> Result<Vec<(String, u64)>, DomainError> {
+        let conn = self.conn.lock().await;
+        // Count only real project memberships, not the empty-string placeholder.
+        let mut stmt = conn
+            .prepare(
+                "SELECT namespace, SUM(CASE WHEN project = '' THEN 0 ELSE 1 END) \
+                 FROM memory_namespaces GROUP BY namespace ORDER BY namespace",
+            )
+            .map_err(|e| DomainError::storage(format!("Failed to prepare list_namespaces: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })
+            .map_err(|e| DomainError::storage(format!("Failed to list namespaces: {e}")))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| DomainError::storage(format!("Failed to read namespace row: {e}")))
+    }
+
+    async fn namespace_projects(&self, namespace: &str) -> Result<Vec<String>, DomainError> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT project FROM memory_namespaces \
+                 WHERE namespace = ?1 AND project <> '' ORDER BY project",
+            )
+            .map_err(|e| {
+                DomainError::storage(format!("Failed to prepare namespace_projects: {e}"))
+            })?;
+        let rows = stmt
+            .query_map(params![namespace], |row| row.get::<_, String>(0))
+            .map_err(|e| {
+                DomainError::storage(format!("Failed to query namespace projects: {e}"))
+            })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| DomainError::storage(format!("Failed to read project row: {e}")))
+    }
+}
+
+/// Validate a user-supplied namespace name: non-empty after trimming. Returns
+/// the trimmed name.
+fn validate_namespace(name: &str) -> Result<&str, DomainError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(DomainError::invalid_input("namespace must not be empty"));
+    }
+    Ok(trimmed)
 }
 
 /// Escape a string for interpolation into a single-quoted SQL literal.
 fn sql_quote(s: &str) -> String {
     s.replace('\'', "''")
+}
+
+/// Build the project-scoping `WHERE` fragment for a search over `column`
+/// (`i.project` or `project`). `None` → no restriction (search everything).
+/// `Some(list)` → global items (`= ''`) plus items in any listed project; an
+/// empty list restricts to globals only.
+fn project_scope_clause(column: &str, projects: Option<&[String]>) -> Option<String> {
+    let projects = projects?;
+    if projects.is_empty() {
+        return Some(format!("{column} = ''"));
+    }
+    let in_list = projects
+        .iter()
+        .map(|p| format!("'{}'", sql_quote(p)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!("({column} = '' OR {column} IN ({in_list}))"))
 }
 
 fn dream_run_from_row(row: &Row<'_>) -> Result<DreamRun, duckdb::Error> {
