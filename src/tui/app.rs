@@ -21,6 +21,7 @@ use ratatui::Frame;
 
 use crate::connector::api::Container;
 use crate::domain::DomainError;
+use crate::tui::log_capture::LogCapture;
 use crate::tui::screens::{ImportScreen, MemoryScreen};
 use crate::tui::theme;
 
@@ -52,16 +53,20 @@ pub struct App {
     tab: Tab,
     memory: MemoryScreen,
     import: ImportScreen,
+    /// Captured `tracing` output; the most recent warning is shown on the footer
+    /// so log lines surface *in* the UI instead of corrupting the render.
+    logs: LogCapture,
     should_quit: bool,
 }
 
 impl App {
-    pub fn new(container: Container) -> Self {
+    pub fn new(container: Container, logs: LogCapture) -> Self {
         Self {
             container,
             tab: Tab::Memory,
             memory: MemoryScreen::new(),
             import: ImportScreen::new(),
+            logs,
             should_quit: false,
         }
     }
@@ -203,20 +208,32 @@ impl App {
     }
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
-        // A screen may surface a transient status here (an import result, or a
-        // load error) instead of the key hints. Errors show in red, other
-        // statuses in the accent colour; either is truncated to one line.
-        let status = match self.tab {
-            Tab::Memory => self.memory.status_line().map(|s| (s, true)),
-            Tab::Import => self.import.status_line().map(|s| (s, false)),
-        };
-        if let Some((status, is_error)) = status {
-            let color = if is_error {
-                ratatui::style::Color::Red
-            } else {
-                theme::ACCENT
-            };
-            let text = one_line(status, area.width.saturating_sub(2) as usize);
+        // Footer precedence, highest first:
+        //   1. a screen error (red) — e.g. the store could not be opened,
+        //   2. a screen status (accent) — e.g. an import result,
+        //   3. a recent captured log line (yellow) — e.g. a model WARN,
+        //   4. the key hints.
+        // Logs are surfaced here so `tracing` output appears *in* the UI rather
+        // than being written to the terminal and corrupting the render.
+        let status: Option<(String, ratatui::style::Color)> = self
+            .memory
+            .status_line()
+            .filter(|_| self.tab == Tab::Memory)
+            .map(|s| (s.to_string(), ratatui::style::Color::Red))
+            .or_else(|| {
+                self.import
+                    .status_line()
+                    .filter(|_| self.tab == Tab::Import)
+                    .map(|s| (s.to_string(), theme::ACCENT))
+            })
+            .or_else(|| {
+                self.logs
+                    .latest()
+                    .map(|s| (format!("log: {s}"), ratatui::style::Color::Yellow))
+            });
+
+        if let Some((status, color)) = status {
+            let text = one_line(&status, area.width.saturating_sub(2) as usize);
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     format!("  {text}"),
@@ -249,15 +266,16 @@ fn one_line(text: &str, max: usize) -> String {
     theme::truncate(&flat, max)
 }
 
-/// Launch the TUI against `container`, blocking until the user quits.
-pub async fn run(container: Container) -> Result<(), DomainError> {
+/// Launch the TUI against `container`, blocking until the user quits. `logs`
+/// carries the captured `tracing` output surfaced on the footer.
+pub async fn run(container: Container, logs: LogCapture) -> Result<(), DomainError> {
     // Guard: a terminal is required.
     if !io::IsTerminal::is_terminal(&io::stdout()) {
         return Err(DomainError::invalid_input(
             "the `tui` command needs an interactive terminal (stdout is not a TTY)",
         ));
     }
-    App::new(container).run().await
+    App::new(container, logs).run().await
 }
 
 #[cfg(test)]
@@ -295,7 +313,7 @@ mod tests {
     #[tokio::test]
     async fn tab_bar_shows_both_screens_memory_active() {
         let dir = tempfile::tempdir().unwrap();
-        let mut app = App::new(temp_container(dir.path()));
+        let mut app = App::new(temp_container(dir.path()), LogCapture::new());
         let text = render_to_text(&mut app, 120, 24);
         assert!(text.contains("memory-rs"), "app title");
         assert!(text.contains("Memory"), "Memory tab");
@@ -323,7 +341,7 @@ mod tests {
             repo.upsert_item(&item, None).await.unwrap();
         }
 
-        let mut app = App::new(container);
+        let mut app = App::new(container, LogCapture::new());
         app.memory.refresh(&app.container).await;
         let text = render_to_text(&mut app, 120, 24);
         assert!(text.contains("Memories"), "top group renders");
@@ -334,7 +352,7 @@ mod tests {
     #[tokio::test]
     async fn tab_switches_to_import() {
         let dir = tempfile::tempdir().unwrap();
-        let mut app = App::new(temp_container(dir.path()));
+        let mut app = App::new(temp_container(dir.path()), LogCapture::new());
         app.set_tab(Tab::Import).await;
         let text = render_to_text(&mut app, 120, 24);
         // Import header shows the found/imported counters.
@@ -358,7 +376,7 @@ mod tests {
         })
         .unwrap();
 
-        let mut app = App::new(mismatched);
+        let mut app = App::new(mismatched, LogCapture::new());
         app.memory.refresh(&app.container).await; // sets the error
         let h = 24;
         let text = render_to_text(&mut app, 120, h);
@@ -381,6 +399,28 @@ mod tests {
         assert!(
             footer.contains("dimensions") || footer.contains("768"),
             "the error is on the footer status line: {footer:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn captured_log_warning_surfaces_on_the_footer() {
+        use std::io::Write;
+        use tracing_subscriber::fmt::MakeWriter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let logs = LogCapture::new();
+        // Simulate a subscriber writing a warning line into the capture.
+        logs.make_writer()
+            .write_all(b"WARN openai_rs: responses rejected the response schema\n")
+            .unwrap();
+
+        let mut app = App::new(temp_container(dir.path()), logs);
+        let text = render_to_text(&mut app, 120, 24);
+        let footer = text.lines().last().unwrap_or_default();
+
+        assert!(
+            footer.contains("log:") && footer.contains("rejected the response schema"),
+            "the captured warning is shown on the footer, not on the render: {footer:?}"
         );
     }
 }

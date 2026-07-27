@@ -5,8 +5,10 @@
 //! [`app::App`] for the shell and [`screens`] for each screen.
 
 mod app;
+mod log_capture;
 mod markdown;
 mod screens;
 mod theme;
 
 pub use app::run;
+pub use log_capture::LogCapture;
