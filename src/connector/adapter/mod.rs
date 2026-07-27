@@ -6,13 +6,16 @@
 //! - `parse_transcript_file` / `parse_transcript` — JSONL transcript parsing
 //! - `fetch_resource` — URL/file fetch with HTML-to-Markdown cleaning
 //! - `build_chat_client` / `build_embedding_client` — OpenAI client builders
+//! - [`MemoryConfig`] — on-disk `config.json` (endpoints, embedding, dream)
 
+mod config;
 mod duckdb_memory_repository;
 mod embedding;
 mod resource_fetch;
 mod session_discovery;
 mod transcript;
 
+pub use config::*;
 pub use duckdb_memory_repository::*;
 pub use embedding::*;
 pub use resource_fetch::*;

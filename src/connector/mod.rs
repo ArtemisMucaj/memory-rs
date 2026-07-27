@@ -4,5 +4,6 @@
 //! Depends on the application layer (port traits) and the domain layer.
 
 pub mod adapter;
+pub mod api;
 
 pub use adapter::*;

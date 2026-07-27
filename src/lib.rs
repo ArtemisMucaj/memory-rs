@@ -23,6 +23,7 @@
 //! connector layer builds its OpenAI-compatible adapters.
 
 pub mod application;
+pub mod cli;
 pub mod connector;
 pub mod domain;
 

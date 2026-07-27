@@ -10,6 +10,10 @@ repository = "https://github.com/ArtemisMucaj/memory-rs"
 name = "memory_rs"
 path = "src/lib.rs"
 
+[[bin]]
+name = "memory-rs"
+path = "src/main.rs"
+
 [dependencies]
 # LLM + embeddings (ChatClient / EmbeddingClient ports and OpenAI-compatible adapters)
 openai-rs = { path = "../openai-rs" }
@@ -17,6 +21,12 @@ openai-rs = { path = "../openai-rs" }
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
 async-trait = "0.1"
+
+# CLI
+clap = { version = "4.4", features = ["derive"] }
+
+# Logging setup for the binary
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
