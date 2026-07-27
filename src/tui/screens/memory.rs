@@ -237,6 +237,13 @@ impl MemoryScreen {
         }
     }
 
+    /// A load/storage error to surface on the footer status line (e.g. the
+    /// memory database could not be opened), rather than dumping it into the
+    /// tree pane where it reads as content.
+    pub fn status_line(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
     // ── Rendering ────────────────────────────────────────────────────────────
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
@@ -308,10 +315,12 @@ impl MemoryScreen {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        if let Some(err) = &self.error {
+        if self.error.is_some() {
+            // The full error is shown on the footer status line; keep the pane
+            // itself calm rather than dumping a wide message into it.
             frame.render_widget(
-                Paragraph::new(format!("  Error: {err}"))
-                    .style(Style::default().fg(ratatui::style::Color::Red))
+                Paragraph::new("  Memory unavailable — see the status line below.")
+                    .style(Style::default().fg(theme::MUTED))
                     .wrap(Wrap { trim: false }),
                 inner,
             );
@@ -683,5 +692,29 @@ mod tests {
             text.contains("content body"),
             "item content in the detail pane"
         );
+    }
+
+    #[test]
+    fn load_error_is_not_dumped_into_the_tree_pane() {
+        // A DB-open error (e.g. an embedding-dimension mismatch) must NOT be
+        // rendered as tree-pane body text; it belongs on the footer status line
+        // (see `status_line`). The pane shows a short, calm placeholder instead.
+        let mut s = MemoryScreen::new();
+        s.error = Some(
+            "memory database was created with dimensions='1536' but the current configuration \
+             uses '768'; delete the memory database to start over"
+                .to_string(),
+        );
+        let text = render_to_text(&mut s, 100, 20);
+        assert!(
+            text.contains("Memory unavailable"),
+            "the pane shows a calm placeholder"
+        );
+        assert!(
+            !text.contains("1536"),
+            "the raw error must not appear in the tree pane"
+        );
+        // The full error is available for the footer.
+        assert_eq!(s.status_line(), s.error.as_deref());
     }
 }

@@ -203,19 +203,28 @@ impl App {
     }
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
-        // A screen may surface a transient status (e.g. an import result); it
-        // takes precedence over the key hints and is shown in the accent colour.
-        if let Tab::Import = self.tab {
-            if let Some(status) = self.import.status_line() {
-                frame.render_widget(
-                    Paragraph::new(Line::from(Span::styled(
-                        format!("  {status}"),
-                        Style::default().fg(theme::ACCENT),
-                    ))),
-                    area,
-                );
-                return;
-            }
+        // A screen may surface a transient status here (an import result, or a
+        // load error) instead of the key hints. Errors show in red, other
+        // statuses in the accent colour; either is truncated to one line.
+        let status = match self.tab {
+            Tab::Memory => self.memory.status_line().map(|s| (s, true)),
+            Tab::Import => self.import.status_line().map(|s| (s, false)),
+        };
+        if let Some((status, is_error)) = status {
+            let color = if is_error {
+                ratatui::style::Color::Red
+            } else {
+                theme::ACCENT
+            };
+            let text = one_line(status, area.width.saturating_sub(2) as usize);
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!("  {text}"),
+                    Style::default().fg(color),
+                ))),
+                area,
+            );
+            return;
         }
 
         let hint = match self.tab {
@@ -231,6 +240,13 @@ impl App {
             area,
         );
     }
+}
+
+/// Collapse whitespace (newlines included) to a single line and truncate to
+/// `max` display columns, so a multi-line error fits the one-row footer.
+fn one_line(text: &str, max: usize) -> String {
+    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    theme::truncate(&flat, max)
 }
 
 /// Launch the TUI against `container`, blocking until the user quits.
@@ -324,5 +340,47 @@ mod tests {
         // Import header shows the found/imported counters.
         assert!(text.contains("found"), "import header rendered");
         assert!(text.contains("imported"), "import header rendered");
+    }
+
+    #[tokio::test]
+    async fn db_open_error_goes_to_the_footer_not_the_tree() {
+        // Create a store pinned at 4 dims, then open the SAME data dir at 8 dims:
+        // the container's DuckDB open fails with a dimension-mismatch error.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let seed = temp_container(dir.path()); // 4 dims (see helper)
+            seed.memory_repository().unwrap(); // creates memory.duckdb at dim 4
+        }
+        let mismatched = Container::new(ContainerConfig {
+            data_dir: dir.path().to_str().unwrap().to_string(),
+            embedding_dimensions: 8, // ← different width → open error
+            openai_endpoint: None,
+        })
+        .unwrap();
+
+        let mut app = App::new(mismatched);
+        app.memory.refresh(&app.container).await; // sets the error
+        let h = 24;
+        let text = render_to_text(&mut app, 120, h);
+        let rows: Vec<&str> = text.lines().collect();
+        // The last row is the footer; everything above the footer is the
+        // tab-bar + the two panes (the "tree region").
+        let footer = rows.last().copied().unwrap_or_default();
+        let body = rows[..rows.len().saturating_sub(1)].join("\n");
+
+        // The tree/body shows the calm placeholder, not the raw error.
+        assert!(
+            body.contains("Memory unavailable"),
+            "calm pane placeholder in the body"
+        );
+        assert!(
+            !body.contains("1536") && !body.contains("dimensions"),
+            "the raw mismatch error must NOT appear in the body:\n{body}"
+        );
+        // The footer surfaces the flattened error.
+        assert!(
+            footer.contains("dimensions") || footer.contains("768"),
+            "the error is on the footer status line: {footer:?}"
+        );
     }
 }
