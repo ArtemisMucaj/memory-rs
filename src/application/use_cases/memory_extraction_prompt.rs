@@ -90,6 +90,8 @@ Each item has a `"project_specific"` boolean:
 - `false` — it generalizes across all projects (a user taste/habit, a language idiom, a general technique).
 User preferences and universal techniques are almost always `false`. (You never name the project — the system fills that in from `true`.)
 
+A memory has ONE scope: it is either global or tied to one project, never both. When you rewrite an item from "Existing memories", KEEP the scope shown next to it — re-encountering a global memory while working in a repo is not evidence that it is specific to that repo. Only change the scope when the session actively shows the current one is wrong.
+
 ## Output format
 Respond with ONLY a JSON object — no prose, no markdown fence:
 
@@ -115,10 +117,14 @@ pub fn user_prompt(transcript: &SessionTranscript, existing: &[MemoryItem]) -> S
         );
         for item in existing {
             let content = truncate_chars(item.content(), MAX_EXISTING_ITEM_CHARS);
+            // The scope is shown so the model can preserve it. Without it, an
+            // item's scope is invisible at rewrite time and flip-flops between
+            // sessions, which is what produced global/project duplicate pairs.
             prompt.push_str(&format!(
-                "### [{}] {}\n{}\n\n",
+                "### [{}] {} (scope: {})\n{}\n\n",
                 item.kind(),
                 item.name(),
+                item.project().unwrap_or("global"),
                 content
             ));
         }

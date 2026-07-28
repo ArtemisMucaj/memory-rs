@@ -20,7 +20,9 @@ use openai_rs::ChatClient;
 
 use crate::application::interfaces::{Embedder, MemoryRepository};
 use crate::application::use_cases::memory_extraction_prompt as prompt;
-use crate::application::use_cases::memory_support::{unix_now, upsert_preserving_identity};
+use crate::application::use_cases::memory_support::{
+    unix_now, upsert_preserving_identity, WriteScope,
+};
 use crate::domain::{DomainError, MemoryItem, MemoryKind, MemoryOperation, SessionTranscript};
 
 /// How many existing memories are prefetched into the extraction context.
@@ -254,6 +256,7 @@ impl MemoryExtractionUseCase {
                         name,
                         content,
                         project.clone(),
+                        WriteScope::Session(transcript.project.as_deref()),
                         Some(&transcript.id),
                         now,
                     )

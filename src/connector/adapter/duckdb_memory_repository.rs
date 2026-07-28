@@ -218,6 +218,12 @@ impl DuckdbMemoryRepository {
     /// means global), because SQL treats NULLs as distinct in a UNIQUE
     /// constraint — with NULLs, two global items of the same name would both be
     /// allowed and the constraint would not bind where it matters most.
+    ///
+    /// Note that this key permits one more thing than the model allows: a name
+    /// held *both* globally and by a project. That combination is meaningless
+    /// (recall for that project returns both rows, with nothing to choose
+    /// between them) but it cannot be excluded by a `UNIQUE`, so it is enforced
+    /// on the write path instead — see `resolve_scope` in `memory_support`.
     fn migrate_item_identity(conn: &Connection) -> Result<(), DomainError> {
         // `project` is nullable only on the pre-migration schema, so it is a
         // reliable, cheap marker that avoids rebuilding on every open.

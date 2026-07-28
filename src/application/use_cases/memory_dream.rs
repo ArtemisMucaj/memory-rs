@@ -44,7 +44,9 @@ use crate::application::use_cases::memory_extraction::{
     extract_json_object, normalize_name, repair_json_string_escapes,
 };
 use crate::application::use_cases::memory_summary::SummarizeMemoryUseCase;
-use crate::application::use_cases::memory_support::{unix_now, upsert_preserving_identity};
+use crate::application::use_cases::memory_support::{
+    unix_now, upsert_preserving_identity, WriteScope,
+};
 use crate::domain::{
     cosine_similarity, DomainError, DreamRun, ImportedSession, MemoryItem, MemoryKind,
     MemoryOperation, SessionStatus,
@@ -690,6 +692,7 @@ impl MemoryDreamUseCase {
             name,
             content,
             project.clone(),
+            WriteScope::Consolidation,
             None,
             unix_now(),
         )
@@ -769,7 +772,14 @@ fn parse_dream_operations(response: &str) -> Result<Vec<MemoryOperation>, Domain
             .project
             .as_deref()
             .map(str::trim)
-            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("null"))
+            // "null"/"global" are how a global item's scope reads in the
+            // prompt and in the schema; a model echoing either back means
+            // "global", never a project that happens to be called that.
+            .filter(|s| {
+                !s.is_empty()
+                    && !s.eq_ignore_ascii_case("null")
+                    && !s.eq_ignore_ascii_case("global")
+            })
             .map(str::to_string);
         operations.push(MemoryOperation::Upsert {
             kind,
@@ -853,6 +863,22 @@ mod tests {
     fn dream_parse_treats_string_null_project_as_global() {
         let response = r#"{"items": [
             {"kind": "fact", "name": "n", "content": "c", "project": "null"}
+        ], "delete": []}"#;
+        let ops = parse_dream_operations(response).unwrap();
+        let MemoryOperation::Upsert { project, .. } = &ops[0] else {
+            panic!("expected upsert");
+        };
+        assert_eq!(*project, None);
+    }
+
+    #[test]
+    fn dream_parse_treats_string_global_project_as_global() {
+        // The prompts list an item's scope and tell the model to copy it
+        // through. When that label reads as a word, the model copies the word
+        // back — and a project literally named "global" lands in the store next
+        // to the real global row, as a duplicate of it.
+        let response = r#"{"items": [
+            {"kind": "fact", "name": "n", "content": "c", "project": "global"}
         ], "delete": []}"#;
         let ops = parse_dream_operations(response).unwrap();
         let MemoryOperation::Upsert { project, .. } = &ops[0] else {
