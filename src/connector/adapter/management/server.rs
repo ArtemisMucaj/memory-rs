@@ -12,8 +12,9 @@ use axum::routing::{delete, get, post};
 use axum::Router;
 use tower_http::cors::CorsLayer;
 
+use super::dream::DreamService;
 use super::session_import::SessionImportService;
-use super::{handlers, sessions};
+use super::{dream_routes, handlers, llm, sessions};
 use crate::connector::api::Container;
 use crate::domain::DomainError;
 
@@ -25,12 +26,25 @@ pub struct AppState {
     /// Session discovery + background imports. Shared (not per-request) so an
     /// import's status survives the request that queued it.
     pub sessions: Arc<SessionImportService>,
+    /// The dream scheduler. Shared so the background loop and the status/trigger
+    /// endpoints observe the same `running` flag and live config.
+    pub dream: Arc<DreamService>,
 }
 
 impl AppState {
-    pub fn new(container: Arc<Container>) -> Self {
+    /// Build the shared state.
+    ///
+    /// Fallible because the dream scheduler needs the resolved chat endpoint and
+    /// the memory store up front; a server that cannot schedule dreams should
+    /// fail at start-up rather than 500 on the first status poll.
+    pub fn new(container: Arc<Container>) -> Result<Self, DomainError> {
         let sessions = SessionImportService::build(Arc::clone(&container));
-        Self { container, sessions }
+        let dream = DreamService::build(&container)?;
+        Ok(Self {
+            container,
+            sessions,
+            dream,
+        })
     }
 }
 
@@ -76,7 +90,26 @@ pub fn routes(state: AppState) -> Router {
         )
         .route("/api/import", post(handlers::import))
         .route("/api/resources", post(handlers::add_resource))
-        .route("/api/dream", post(handlers::dream))
+        // Dream scheduler: status, background trigger, and live settings.
+        // `POST` starts a cycle and returns 202 rather than blocking for the
+        // many minutes a full consolidation can take.
+        .route(
+            "/api/dream",
+            get(dream_routes::status).post(dream_routes::trigger),
+        )
+        .route(
+            "/api/dream/config",
+            axum::routing::put(dream_routes::update_config),
+        )
+        // LLM endpoint configuration + model discovery. Per-service on purpose:
+        // memory and code intelligence may want different backends.
+        .route("/api/llm/endpoints", get(llm::list_endpoints))
+        .route(
+            "/api/llm/endpoints/{name}",
+            axum::routing::put(llm::upsert_endpoint).delete(llm::delete_endpoint),
+        )
+        .route("/api/llm/active", post(llm::set_active))
+        .route("/api/llm/models", get(llm::models))
         // Allow a local native app (different origin) to call the API.
         .layer(CorsLayer::permissive())
         .with_state(state)
@@ -93,7 +126,15 @@ pub async fn serve(container: Container, port: u16, public: bool) -> Result<(), 
     // Mount the MCP streamable-HTTP service at /mcp on the same process, so one
     // `serve` gives a native app both the REST API and MCP over HTTP.
     let mcp = super::super::mcp::http_service(Arc::clone(&container));
-    let app = routes(AppState::new(container)).nest_service("/mcp", mcp);
+    let state = AppState::new(container)?;
+
+    // Run the dream scheduler alongside the server: it harvests finished
+    // sessions on a sweep and consolidates when a full cycle is due. Detached,
+    // so it lives as long as the process; the shared `DreamService` is what the
+    // status/trigger endpoints observe.
+    tokio::spawn(Arc::clone(&state.dream).run_scheduler());
+
+    let app = routes(state).nest_service("/mcp", mcp);
 
     let bind_addr: [u8; 4] = if public { [0, 0, 0, 0] } else { [127, 0, 0, 1] };
     let addr = SocketAddr::from((bind_addr, port));
@@ -129,7 +170,7 @@ mod tests {
             openai_endpoint: None,
         })
         .unwrap();
-        routes(AppState::new(Arc::new(container)))
+        routes(AppState::new(Arc::new(container)).unwrap())
     }
 
     async fn body_json(resp: axum::response::Response) -> serde_json::Value {

@@ -48,7 +48,14 @@ pub async fn index() -> Json<Value> {
             "DELETE /api/namespaces/{name}/projects/{project}",
             "POST /api/import  {path, force?}",
             "POST /api/resources  {source, name?}",
-            "POST /api/dream  {idle_minutes?}"
+            "GET  /api/dream",
+            "POST /api/dream",
+            "PUT  /api/dream/config  {dream_enabled?, dream_interval_hours?, session_idle_minutes?, auto_import?}",
+            "GET  /api/llm/endpoints",
+            "PUT  /api/llm/endpoints/{name}  {base_url, model?, embedding_model?, api_key?, set_active?}",
+            "DELETE /api/llm/endpoints/{name}",
+            "POST /api/llm/active  {name?, role?}",
+            "GET  /api/llm/models?endpoint=&base_url="
         ]
     }))
 }
@@ -295,27 +302,11 @@ pub async fn add_resource(
     })))
 }
 
-#[derive(Debug, Deserialize)]
-pub struct DreamBody {
-    #[serde(default)]
-    pub idle_minutes: Option<u64>,
-}
-
-/// `POST /api/dream` — run one dream cycle.
-pub async fn dream(
-    State(state): State<AppState>,
-    Json(body): Json<DreamBody>,
-) -> ApiResult<Json<Value>> {
-    let report = controller::dream(&state.container, body.idle_minutes.unwrap_or(60)).await?;
-    Ok(Json(json!({
-        "sessions_eligible": report.sessions_eligible,
-        "sessions_imported": report.sessions_imported,
-        "sessions_failed": report.sessions_failed,
-        "clusters_found": report.clusters_found,
-        "operations_applied": report.applied.len(),
-        "operations_skipped": report.skipped.len(),
-    })))
-}
+// `POST /api/dream` used to run a cycle synchronously here. It now lives in
+// `dream_routes`, which starts the cycle in the background and returns 202 — a
+// full consolidation is many minutes of LLM calls, far too long to hold an HTTP
+// connection open. The synchronous path is still the CLI's `memory-rs dream`,
+// which goes through `controller::dream` directly.
 
 // ── JSON helpers ─────────────────────────────────────────────────────────────
 

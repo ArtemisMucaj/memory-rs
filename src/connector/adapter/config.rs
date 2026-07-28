@@ -128,21 +128,58 @@ impl Default for EmbeddingConfig {
 }
 
 /// Dream-cycle settings. Every field is optional; the accessors apply defaults.
+///
+/// These drive the `serve`-mode scheduler (see the management adapter's
+/// `DreamService`), which runs two cadences from one loop: a frequent harvest
+/// sweep that imports finished sessions, and a full consolidation cycle every
+/// `dream_interval_hours`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DreamConfig {
     /// Minutes a session must be inactive before it counts as finished and is
     /// harvested (default 60).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_idle_minutes: Option<u64>,
+
+    /// Whether the scheduler runs full consolidation cycles (default true).
+    /// Turning this off leaves harvesting alone — see `auto_import`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dream_enabled: Option<bool>,
+
+    /// Hours between full consolidation cycles (default 4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dream_interval_hours: Option<u64>,
+
+    /// Whether finished sessions are imported automatically between cycles
+    /// (default true). Each import spends LLM extraction calls, so this is the
+    /// switch for "never import without me asking".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_import: Option<bool>,
 }
 
 impl DreamConfig {
     pub const DEFAULT_SESSION_IDLE_MINUTES: u64 = 60;
+    pub const DEFAULT_DREAM_INTERVAL_HOURS: u64 = 4;
 
     pub fn session_idle_minutes(&self) -> u64 {
         self.session_idle_minutes
             .filter(|m| *m > 0)
             .unwrap_or(Self::DEFAULT_SESSION_IDLE_MINUTES)
+    }
+
+    pub fn dream_enabled(&self) -> bool {
+        self.dream_enabled.unwrap_or(true)
+    }
+
+    /// Zero is treated as unset (rather than "dream constantly"), so a bad
+    /// hand-edit degrades to the default instead of pinning the CPU.
+    pub fn dream_interval_hours(&self) -> u64 {
+        self.dream_interval_hours
+            .filter(|h| *h > 0)
+            .unwrap_or(Self::DEFAULT_DREAM_INTERVAL_HOURS)
+    }
+
+    pub fn auto_import(&self) -> bool {
+        self.auto_import.unwrap_or(true)
     }
 }
 
