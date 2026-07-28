@@ -121,6 +121,98 @@ pub struct OpenAiConfig {
     /// Registered endpoints, keyed by a user-chosen name (e.g. `"lmstudio"`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub endpoints: BTreeMap<String, OpenAiEndpoint>,
+
+    /// Per-usage overrides, keyed by [`LlmUsage::as_str`].
+    ///
+    /// The roles above answer "which server", but the jobs this crate runs have
+    /// genuinely different needs: extraction wants a model that follows a JSON
+    /// schema, consolidation benefits from a stronger reasoner, summarization is
+    /// cheap and high-volume. A usage with no entry here inherits its role
+    /// (chat or embedding), so this stays empty until someone deliberately
+    /// splits one out.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub usages: BTreeMap<String, UsageBinding>,
+}
+
+/// One usage's chosen endpoint + model. Either half may be absent: naming only
+/// the model keeps the role's endpoint and swaps the model, which is the common
+/// case when one server hosts several models.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageBinding {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+/// A distinct LLM job this crate runs. Each can name its own endpoint + model;
+/// unset ones follow the shared role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmUsage {
+    /// Turning a session transcript into durable memory items.
+    ExtractMemories,
+    /// L0/L1 abstracts for session, resource and digest nodes.
+    Summarize,
+    /// The dream cycle's merge/prune pass over the whole store.
+    Consolidate,
+    /// Vector embeddings for semantic recall.
+    Embedding,
+}
+
+impl LlmUsage {
+    pub const ALL: [LlmUsage; 4] = [
+        LlmUsage::ExtractMemories,
+        LlmUsage::Summarize,
+        LlmUsage::Consolidate,
+        LlmUsage::Embedding,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LlmUsage::ExtractMemories => "extract_memories",
+            LlmUsage::Summarize => "summarize",
+            LlmUsage::Consolidate => "consolidate",
+            LlmUsage::Embedding => "embedding",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|u| u.as_str() == s)
+    }
+
+    /// Human-readable label for a settings screen.
+    pub fn label(&self) -> &'static str {
+        match self {
+            LlmUsage::ExtractMemories => "Extract memories",
+            LlmUsage::Summarize => "Summarize",
+            LlmUsage::Consolidate => "Consolidate",
+            LlmUsage::Embedding => "Embedding",
+        }
+    }
+
+    pub fn description(&self) -> &'static str {
+        match self {
+            LlmUsage::ExtractMemories => {
+                "Turn an imported session into durable memory items. Needs a model that follows a JSON schema."
+            }
+            LlmUsage::Summarize => {
+                "Write the L0 abstract and L1 overview for sessions, resources and the digest."
+            }
+            LlmUsage::Consolidate => {
+                "The dream cycle's merge-and-prune pass over the whole store. Benefits from a stronger reasoner."
+            }
+            LlmUsage::Embedding => {
+                "Vector embeddings for semantic recall. Must match the dimension the database is pinned to."
+            }
+        }
+    }
+
+    /// Whether this usage embeds rather than chats — it follows
+    /// `active_embedding` and only accepts an embedding-capable model.
+    pub fn is_embedding(&self) -> bool {
+        matches!(self, LlmUsage::Embedding)
+    }
 }
 
 /// One OpenAI-compatible server.
@@ -317,6 +409,36 @@ impl MemoryConfig {
             .or_else(|| role_active(openai))
             .or(openai.active.as_deref())?;
         openai.endpoints.get(name)
+    }
+
+    /// The binding a usage carries, if any.
+    pub fn usage_binding(&self, usage: LlmUsage) -> Option<&UsageBinding> {
+        self.openai.as_ref()?.usages.get(usage.as_str())
+    }
+
+    /// Resolve the chat endpoint for one **usage**: its own binding first, then
+    /// the shared chat role, then the environment.
+    ///
+    /// A binding may name only a model, which keeps the role's endpoint and
+    /// swaps the model — the common case when one server hosts several.
+    pub fn resolve_usage_chat_endpoint(&self, usage: LlmUsage) -> ResolvedChatEndpoint {
+        let binding = self.usage_binding(usage).cloned().unwrap_or_default();
+        // An endpoint named by the binding overrides the role's; otherwise the
+        // role resolves as before and only the model is swapped.
+        let mut resolved = self.resolve_chat_endpoint(binding.endpoint.as_deref());
+        if let Some(model) = binding.model {
+            resolved.model = Some(model);
+        }
+        resolved
+    }
+
+    /// Whether a usage is served by Copilot — either through its own binding or
+    /// by inheriting a chat role bound to the reserved name.
+    pub fn usage_uses_copilot(&self, usage: LlmUsage) -> bool {
+        match self.usage_binding(usage).and_then(|b| b.endpoint.as_deref()) {
+            Some(name) => name == COPILOT_ENDPOINT,
+            None => self.chat_uses_copilot(None),
+        }
     }
 
     /// Whether chat is bound to the reserved [`COPILOT_ENDPOINT`] name.

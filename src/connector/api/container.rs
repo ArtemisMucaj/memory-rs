@@ -9,6 +9,8 @@ use std::sync::{Arc, Mutex};
 
 use openai_rs::{ChatClient, Endpoint};
 
+use crate::connector::adapter::LlmUsage;
+
 use crate::application::interfaces::Embedder;
 use crate::application::{
     ImportSessionUseCase, MemoryBrowseUseCase, MemoryDreamUseCase, MemoryExtractionUseCase,
@@ -180,6 +182,39 @@ impl Container {
         )?)
     }
 
+    /// The chat client for one **usage**, honouring its per-usage override and
+    /// otherwise falling back to the shared chat role.
+    ///
+    /// Read from disk per call rather than resolved once at construction, so a
+    /// change made through the management API applies to the next import or
+    /// dream without restarting `serve`.
+    pub fn chat_client_for(&self, usage: LlmUsage) -> Result<Arc<dyn ChatClient>, DomainError> {
+        let file_config = MemoryConfig::load(&self.config.data_dir)?;
+        if file_config.usage_uses_copilot(usage) {
+            let mut copilot = file_config.copilot.clone().unwrap_or_default();
+            // A usage may pin a different Copilot model than the shared one.
+            if let Some(model) = file_config
+                .usage_binding(usage)
+                .and_then(|b| b.model.clone())
+            {
+                copilot.model = Some(model);
+            }
+            return crate::connector::adapter::copilot::chat_client(&copilot);
+        }
+
+        let ep = file_config.resolve_usage_chat_endpoint(usage);
+        let model = ep.model.clone().ok_or_else(|| {
+            DomainError::invalid_input(format!(
+                "no chat model for '{}'; set one on the usage, the endpoint, or OPENAI_MODEL",
+                usage.as_str()
+            ))
+        })?;
+        Ok(build_chat_client(
+            &endpoint_from_parts(&ep.base_url, &ep.api_key),
+            model,
+        )?)
+    }
+
     /// Open (or return the cached) memory repository. Pins a fresh store to the
     /// configured embedding model + dimensions; an existing store keeps its own.
     pub fn memory_repository(&self) -> Result<Arc<dyn MemoryRepository>, DomainError> {
@@ -189,16 +224,21 @@ impl Container {
     /// Session import + memory extraction + virtual-filesystem summarization,
     /// driven by the resolved chat model.
     pub fn memory_import_use_case(&self) -> Result<ImportSessionUseCase, DomainError> {
-        let chat_client = self.chat_client()?;
         let memory_repo = self.memory_repository()?;
         let embedder = self.embedder()?;
+        // Extraction and summarization are separate usages: extraction needs a
+        // model that holds a JSON schema, summarization is cheap and
+        // high-volume, so each resolves its own client.
         let extraction = MemoryExtractionUseCase::new(
-            Arc::clone(&chat_client),
+            self.chat_client_for(LlmUsage::ExtractMemories)?,
             Arc::clone(&memory_repo),
             Arc::new(embedder.clone()),
         );
-        let summary =
-            SummarizeMemoryUseCase::new(chat_client, Arc::clone(&memory_repo), Arc::new(embedder));
+        let summary = SummarizeMemoryUseCase::new(
+            self.chat_client_for(LlmUsage::Summarize)?,
+            Arc::clone(&memory_repo),
+            Arc::new(embedder),
+        );
         Ok(ImportSessionUseCase::new(memory_repo, extraction, summary))
     }
 
@@ -221,7 +261,7 @@ impl Container {
     /// resolved chat model. Used to add resources and regenerate the digest.
     pub fn memory_summary_use_case(&self) -> Result<SummarizeMemoryUseCase, DomainError> {
         Ok(SummarizeMemoryUseCase::new(
-            self.chat_client()?,
+            self.chat_client_for(LlmUsage::Summarize)?,
             self.memory_repository()?,
             Arc::new(self.embedder()?),
         ))
@@ -230,12 +270,14 @@ impl Container {
     /// The dream cycle (harvest finished sessions + consolidate the store),
     /// driven by the resolved chat model.
     pub fn memory_dream_use_case(&self) -> Result<MemoryDreamUseCase, DomainError> {
-        let chat_client = self.chat_client()?;
+        // The consolidation pass reasons over the whole store, so it gets its
+        // own usage; the summary pass it composes keeps Summarize's.
+        let chat_client = self.chat_client_for(LlmUsage::Consolidate)?;
         let memory_repo = self.memory_repository()?;
         let embedder = self.embedder()?;
         let import = self.memory_import_use_case()?;
         let summary = SummarizeMemoryUseCase::new(
-            Arc::clone(&chat_client),
+            self.chat_client_for(LlmUsage::Summarize)?,
             Arc::clone(&memory_repo),
             Arc::new(embedder.clone()),
         );

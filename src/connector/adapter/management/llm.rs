@@ -29,7 +29,9 @@ use serde_json::{json, Value};
 
 use super::error::{ApiError, ApiResult};
 use super::server::AppState;
-use crate::connector::adapter::{MemoryConfig, OpenAiConfig, OpenAiEndpoint, COPILOT_ENDPOINT};
+use crate::connector::adapter::{
+    LlmUsage, MemoryConfig, OpenAiConfig, OpenAiEndpoint, UsageBinding, COPILOT_ENDPOINT,
+};
 use crate::domain::DomainError;
 
 /// Which resolution slot an endpoint is being bound to.
@@ -286,6 +288,125 @@ pub async fn set_active(
     config.openai = Some(openai);
     save(&state, config.clone()).await?;
     Ok(Json(endpoints_json(&config)))
+}
+
+// ── Usages ───────────────────────────────────────────────────────────────────
+
+/// Render one usage: what it is, and which endpoint + model actually answers it.
+///
+/// `inherited` distinguishes "follows the shared role" from a deliberate
+/// per-usage choice — without it a settings screen can't tell the user whether
+/// changing the role will move this usage too.
+fn usage_json(config: &MemoryConfig, usage: LlmUsage) -> Value {
+    let binding = config.usage_binding(usage);
+    let (endpoint, model) = if usage.is_embedding() {
+        let ep = config.resolve_embedding_endpoint(
+            binding.and_then(|b| b.endpoint.as_deref()),
+            &config.embedding().model,
+        );
+        let name = binding
+            .and_then(|b| b.endpoint.clone())
+            .or_else(|| config.openai.as_ref().and_then(|o| o.active_embedding.clone()))
+            .or_else(|| config.openai.as_ref().and_then(|o| o.active.clone()));
+        let model = binding
+            .and_then(|b| b.model.clone())
+            .unwrap_or(ep.model);
+        (name, Some(model))
+    } else if config.usage_uses_copilot(usage) {
+        let model = binding
+            .and_then(|b| b.model.clone())
+            .or_else(|| config.copilot.as_ref().and_then(|c| c.model.clone()));
+        (Some(COPILOT_ENDPOINT.to_string()), model)
+    } else {
+        let ep = config.resolve_usage_chat_endpoint(usage);
+        let name = binding
+            .and_then(|b| b.endpoint.clone())
+            .or_else(|| config.openai.as_ref().and_then(|o| o.active_chat.clone()))
+            .or_else(|| config.openai.as_ref().and_then(|o| o.active.clone()));
+        (name, ep.model)
+    };
+
+    json!({
+        "id": usage.as_str(),
+        "label": usage.label(),
+        "description": usage.description(),
+        "kind": if usage.is_embedding() { "embedding" } else { "chat" },
+        "endpoint": endpoint,
+        "model": model,
+        "inherited": binding.is_none(),
+    })
+}
+
+/// `GET /api/llm/usages` — every LLM job this server runs and what answers it.
+pub async fn list_usages(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    let config = load(&state)?;
+    let usages: Vec<Value> = LlmUsage::ALL
+        .iter()
+        .map(|u| usage_json(&config, *u))
+        .collect();
+    Ok(Json(json!({ "usages": usages })))
+}
+
+/// Body for `PUT /api/llm/usages/{id}`. Both fields absent clears the override,
+/// so the usage falls back to its role.
+#[derive(Debug, Deserialize)]
+pub struct SetUsageBody {
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+/// `PUT /api/llm/usages/{id}` — bind one usage to an endpoint + model.
+pub async fn set_usage(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<SetUsageBody>,
+) -> ApiResult<Json<Value>> {
+    let usage = LlmUsage::parse(&id).ok_or_else(|| {
+        ApiError::from(DomainError::invalid_input(format!(
+            "unknown LLM usage '{id}'"
+        )))
+    })?;
+
+    let mut config = load(&state)?;
+    let mut openai = config.openai.take().unwrap_or_default();
+
+    // Refuse an endpoint that isn't registered: the resolver treats a dangling
+    // name as "unset" and silently falls back, which reads as the setting being
+    // ignored. `copilot` is reserved and never appears in `endpoints`.
+    if let Some(name) = body.endpoint.as_deref() {
+        if name != COPILOT_ENDPOINT && !openai.endpoints.contains_key(name) {
+            config.openai = Some(openai);
+            return Err(ApiError::from(DomainError::not_found(format!(
+                "no LLM endpoint named '{name}'"
+            ))));
+        }
+        // Copilot serves chat only — it has no embeddings endpoint, and this
+        // crate has no in-process embedder to fall back on.
+        if name == COPILOT_ENDPOINT && usage.is_embedding() {
+            config.openai = Some(openai);
+            return Err(ApiError::from(DomainError::invalid_input(
+                "GitHub Copilot does not serve embeddings; pick an OpenAI-compatible endpoint",
+            )));
+        }
+    }
+
+    if body.endpoint.is_none() && body.model.is_none() {
+        openai.usages.remove(usage.as_str());
+    } else {
+        openai.usages.insert(
+            usage.as_str().to_string(),
+            UsageBinding {
+                endpoint: body.endpoint,
+                model: body.model,
+            },
+        );
+    }
+
+    config.openai = Some(openai);
+    save(&state, config.clone()).await?;
+    Ok(Json(usage_json(&config, usage)))
 }
 
 // ── GitHub Copilot ───────────────────────────────────────────────────────────

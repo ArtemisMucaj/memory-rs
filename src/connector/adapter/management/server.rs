@@ -116,6 +116,13 @@ pub fn routes(state: AppState) -> Router {
         )
         .route("/api/llm/active", post(llm::set_active))
         .route("/api/llm/models", get(llm::models))
+        // Per-usage model selection: each LLM job this server runs can name its
+        // own endpoint + model, falling back to the shared role.
+        .route("/api/llm/usages", get(llm::list_usages))
+        .route(
+            "/api/llm/usages/{id}",
+            axum::routing::put(llm::set_usage),
+        )
         // GitHub Copilot device-flow login, so a GUI can authenticate without a
         // terminal command (the bundled binary isn't on the user's PATH).
         .route(
