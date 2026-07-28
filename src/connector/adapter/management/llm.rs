@@ -306,11 +306,14 @@ fn usage_json(config: &MemoryConfig, usage: LlmUsage) -> Value {
         );
         let name = binding
             .and_then(|b| b.endpoint.clone())
-            .or_else(|| config.openai.as_ref().and_then(|o| o.active_embedding.clone()))
+            .or_else(|| {
+                config
+                    .openai
+                    .as_ref()
+                    .and_then(|o| o.active_embedding.clone())
+            })
             .or_else(|| config.openai.as_ref().and_then(|o| o.active.clone()));
-        let model = binding
-            .and_then(|b| b.model.clone())
-            .unwrap_or(ep.model);
+        let model = binding.and_then(|b| b.model.clone()).unwrap_or(ep.model);
         (name, Some(model))
     } else if config.usage_uses_copilot(usage) {
         let model = binding
@@ -475,7 +478,9 @@ pub async fn models(
                 })
             })
             .collect();
-        return Ok(Json(json!({ "base_url": COPILOT_ENDPOINT, "models": list })));
+        return Ok(Json(
+            json!({ "base_url": COPILOT_ENDPOINT, "models": list }),
+        ));
     }
 
     let (base_url, api_key) = if let Some(raw) = params.base_url.as_deref() {
@@ -495,7 +500,9 @@ pub async fn models(
                     &std::env::var("OPENAI_BASE_URL")
                         .unwrap_or_else(|_| "http://localhost:1234".to_string()),
                 ),
-                std::env::var("OPENAI_API_KEY").ok().filter(|k| !k.is_empty()),
+                std::env::var("OPENAI_API_KEY")
+                    .ok()
+                    .filter(|k| !k.is_empty()),
             ),
         }
     };
@@ -528,15 +535,30 @@ mod tests {
 
     #[test]
     fn normalize_strips_v1_and_slashes() {
-        assert_eq!(normalize_base("http://localhost:1234/v1"), "http://localhost:1234");
-        assert_eq!(normalize_base("http://localhost:1234/v1/"), "http://localhost:1234");
-        assert_eq!(normalize_base("http://localhost:1234/"), "http://localhost:1234");
-        assert_eq!(normalize_base("  http://localhost:1234  "), "http://localhost:1234");
+        assert_eq!(
+            normalize_base("http://localhost:1234/v1"),
+            "http://localhost:1234"
+        );
+        assert_eq!(
+            normalize_base("http://localhost:1234/v1/"),
+            "http://localhost:1234"
+        );
+        assert_eq!(
+            normalize_base("http://localhost:1234/"),
+            "http://localhost:1234"
+        );
+        assert_eq!(
+            normalize_base("  http://localhost:1234  "),
+            "http://localhost:1234"
+        );
     }
 
     #[test]
     fn normalize_leaves_a_bare_base_alone() {
-        assert_eq!(normalize_base("https://api.openai.com"), "https://api.openai.com");
+        assert_eq!(
+            normalize_base("https://api.openai.com"),
+            "https://api.openai.com"
+        );
     }
 
     #[test]

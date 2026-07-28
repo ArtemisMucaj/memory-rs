@@ -49,7 +49,10 @@ pub async fn transcript(
     State(state): State<AppState>,
     Query(params): Query<SessionRef>,
 ) -> ApiResult<Json<Value>> {
-    let transcript = state.sessions.transcript(&params.source, &params.id).await?;
+    let transcript = state
+        .sessions
+        .transcript(&params.source, &params.id)
+        .await?;
     Ok(Json(json!({
         "id": transcript.id,
         "source": transcript.source,
@@ -90,5 +93,7 @@ pub async fn import(
 /// render `queued`/`importing`/`done`/`failed`/`already_imported`.
 pub async fn import_status(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     let statuses = state.sessions.statuses().await;
-    Ok(Json(json!({ "count": statuses.len(), "statuses": statuses })))
+    Ok(Json(
+        json!({ "count": statuses.len(), "statuses": statuses }),
+    ))
 }

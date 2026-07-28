@@ -40,8 +40,9 @@ pub fn chat_client(config: &CopilotConfig) -> Result<Arc<dyn ChatClient>, Domain
         .with_timeout(endpoint.timeout())
         .with_optional_api_key(endpoint.token().map(|t| t.expose().to_string()));
 
-    let transport = Transport::new(&openai_endpoint)
-        .map_err(|e| DomainError::internal(format!("failed to build the Copilot transport: {e}")))?;
+    let transport = Transport::new(&openai_endpoint).map_err(|e| {
+        DomainError::internal(format!("failed to build the Copilot transport: {e}"))
+    })?;
     let model = config.model.clone().unwrap_or_default();
     Ok(Arc::new(OpenAiChatClient::with_transport(transport, model)))
 }

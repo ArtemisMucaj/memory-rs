@@ -435,7 +435,10 @@ impl MemoryConfig {
     /// Whether a usage is served by Copilot — either through its own binding or
     /// by inheriting a chat role bound to the reserved name.
     pub fn usage_uses_copilot(&self, usage: LlmUsage) -> bool {
-        match self.usage_binding(usage).and_then(|b| b.endpoint.as_deref()) {
+        match self
+            .usage_binding(usage)
+            .and_then(|b| b.endpoint.as_deref())
+        {
             Some(name) => name == COPILOT_ENDPOINT,
             None => self.chat_uses_copilot(None),
         }
@@ -449,9 +452,10 @@ impl MemoryConfig {
     pub fn chat_uses_copilot(&self, name_override: Option<&str>) -> bool {
         let name = match name_override {
             Some(n) => Some(n),
-            None => self.openai.as_ref().and_then(|o| {
-                o.active_chat.as_deref().or(o.active.as_deref())
-            }),
+            None => self
+                .openai
+                .as_ref()
+                .and_then(|o| o.active_chat.as_deref().or(o.active.as_deref())),
         };
         name == Some(COPILOT_ENDPOINT)
     }

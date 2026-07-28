@@ -19,7 +19,11 @@ use super::error::ApiResult;
 use super::server::AppState;
 
 /// Render the scheduler's config + liveness as the status payload.
-fn status_json(state: &AppState, running: bool, last_run: Option<crate::domain::DreamRun>) -> Value {
+fn status_json(
+    state: &AppState,
+    running: bool,
+    last_run: Option<crate::domain::DreamRun>,
+) -> Value {
     let cfg = state.dream.config();
     json!({
         "enabled": cfg.dream_enabled(),
