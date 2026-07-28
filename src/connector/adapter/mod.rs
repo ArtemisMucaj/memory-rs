@@ -7,8 +7,10 @@
 //! - `fetch_resource` — URL/file fetch with HTML-to-Markdown cleaning
 //! - `build_chat_client` / `build_embedding_client` — OpenAI client builders
 //! - [`MemoryConfig`] — on-disk `config.json` (endpoints, embedding, dream)
+//! - `copilot` — GitHub Copilot as an alternative chat backend
 
 mod config;
+pub mod copilot;
 mod duckdb_memory_repository;
 mod embedding;
 pub mod management;

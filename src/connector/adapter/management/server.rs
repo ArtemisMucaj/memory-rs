@@ -12,6 +12,7 @@ use axum::routing::{delete, get, post};
 use axum::Router;
 use tower_http::cors::CorsLayer;
 
+use super::copilot_login::CopilotLoginService;
 use super::dream::DreamService;
 use super::session_import::SessionImportService;
 use super::{dream_routes, handlers, llm, sessions};
@@ -29,6 +30,9 @@ pub struct AppState {
     /// The dream scheduler. Shared so the background loop and the status/trigger
     /// endpoints observe the same `running` flag and live config.
     pub dream: Arc<DreamService>,
+    /// GitHub Copilot device-flow login. Shared so the background poll that
+    /// persists the token and the status endpoint see one session.
+    pub copilot_login: Arc<CopilotLoginService>,
 }
 
 impl AppState {
@@ -40,10 +44,12 @@ impl AppState {
     pub fn new(container: Arc<Container>) -> Result<Self, DomainError> {
         let sessions = SessionImportService::build(Arc::clone(&container));
         let dream = DreamService::build(&container)?;
+        let copilot_login = CopilotLoginService::new(container.data_dir().to_string());
         Ok(Self {
             container,
             sessions,
             dream,
+            copilot_login,
         })
     }
 }
@@ -110,6 +116,12 @@ pub fn routes(state: AppState) -> Router {
         )
         .route("/api/llm/active", post(llm::set_active))
         .route("/api/llm/models", get(llm::models))
+        // GitHub Copilot device-flow login, so a GUI can authenticate without a
+        // terminal command (the bundled binary isn't on the user's PATH).
+        .route(
+            "/api/llm/copilot/login",
+            get(llm::copilot_login_status).post(llm::copilot_login_start),
+        )
         // Allow a local native app (different origin) to call the API.
         .layer(CorsLayer::permissive())
         .with_state(state)

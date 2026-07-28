@@ -29,25 +29,20 @@ use serde_json::{json, Value};
 
 use super::error::{ApiError, ApiResult};
 use super::server::AppState;
-use crate::connector::adapter::config::{MemoryConfig, OpenAiConfig, OpenAiEndpoint};
+use crate::connector::adapter::{MemoryConfig, OpenAiConfig, OpenAiEndpoint, COPILOT_ENDPOINT};
 use crate::domain::DomainError;
 
 /// Which resolution slot an endpoint is being bound to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ActiveRole {
     /// The shared default used by whichever role has no override.
+    #[default]
     Shared,
     /// Extraction / summarization / dreaming.
     Chat,
     /// Semantic recall.
     Embedding,
-}
-
-impl Default for ActiveRole {
-    fn default() -> Self {
-        Self::Shared
-    }
 }
 
 /// Load the config document, or default when the file is absent.
@@ -95,6 +90,13 @@ fn endpoints_json(config: &MemoryConfig) -> Value {
             "model": e.model,
             "dimensions": e.dimensions,
         })),
+        // Copilot is bindable by its reserved name rather than being a
+        // registered endpoint, so it is reported separately.
+        "copilot": {
+            "endpoint_name": COPILOT_ENDPOINT,
+            "authenticated": config.copilot.as_ref().is_some_and(|c| c.is_authenticated()),
+            "model": config.copilot.as_ref().and_then(|c| c.model.clone()),
+        },
     })
 }
 
@@ -107,8 +109,10 @@ pub async fn list_endpoints(State(state): State<AppState>) -> ApiResult<Json<Val
 #[derive(Debug, Deserialize)]
 pub struct UpsertEndpointBody {
     /// Base URL with no `/v1` suffix — the clients append the version and route
-    /// themselves, so a trailing `/v1` here produces `/v1/v1/...`.
-    pub base_url: String,
+    /// themselves, so a trailing `/v1` here produces `/v1/v1/...`. Omitted for
+    /// the reserved `copilot` name, whose URL is fixed by the provider.
+    #[serde(default)]
+    pub base_url: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -148,7 +152,27 @@ pub async fn upsert_endpoint(
             "endpoint name must not be empty",
         )));
     }
-    let base_url = normalize_base(&body.base_url);
+
+    // `copilot` is reserved: it has no user-supplied base URL or key, so an
+    // upsert against that name only pins the model (and optionally binds a
+    // role) rather than registering an OpenAI endpoint.
+    if name == COPILOT_ENDPOINT {
+        let mut config = load(&state)?;
+        let mut copilot = config.copilot.take().unwrap_or_default();
+        if let Some(model) = body.model {
+            copilot.model = Some(model);
+        }
+        config.copilot = Some(copilot);
+        if let Some(role) = body.set_active {
+            let mut openai = config.openai.take().unwrap_or_default();
+            bind_active(&mut openai, role, Some(COPILOT_ENDPOINT.to_string()));
+            config.openai = Some(openai);
+        }
+        save(&state, config.clone()).await?;
+        return Ok(Json(endpoints_json(&config)));
+    }
+
+    let base_url = normalize_base(body.base_url.as_deref().unwrap_or_default());
     if base_url.is_empty() {
         return Err(ApiError::from(DomainError::invalid_input(
             "base_url must not be empty",
@@ -248,7 +272,9 @@ pub async fn set_active(
     // treats a dangling name as "unset" and silently falls back, which reads as
     // the setting having been ignored.
     if let Some(name) = body.name.as_deref() {
-        if !openai.endpoints.contains_key(name) {
+        // `copilot` is reserved and never appears in `endpoints`, but it IS a
+        // valid binding — the container resolves it to the Copilot backend.
+        if name != COPILOT_ENDPOINT && !openai.endpoints.contains_key(name) {
             config.openai = Some(openai);
             return Err(ApiError::from(DomainError::not_found(format!(
                 "no LLM endpoint named '{name}'"
@@ -262,10 +288,28 @@ pub async fn set_active(
     Ok(Json(endpoints_json(&config)))
 }
 
+// ── GitHub Copilot ───────────────────────────────────────────────────────────
+
+/// `POST /api/llm/copilot/login` — begin the OAuth device flow.
+///
+/// Returns immediately with the `user_code` + `verification_uri` to show the
+/// user; the server polls GitHub in the background and persists the token on
+/// success.
+pub async fn copilot_login_start(State(state): State<AppState>) -> Json<Value> {
+    Json(json!(state.copilot_login.start().await))
+}
+
+/// `GET /api/llm/copilot/login` — the current login status
+/// (`idle` / `pending` / `authorized` / `failed`).
+pub async fn copilot_login_status(State(state): State<AppState>) -> Json<Value> {
+    Json(json!(state.copilot_login.status().await))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ModelsParams {
     /// Registered endpoint to query. Defaults to the active chat endpoint, then
-    /// the shared default, then the `OPENAI_*` environment.
+    /// the shared default, then the `OPENAI_*` environment. Pass the reserved
+    /// name `copilot` to enumerate the Copilot subscription's models.
     #[serde(default)]
     pub endpoint: Option<String>,
     /// Query this base URL directly instead of a registered endpoint — lets a
@@ -292,6 +336,26 @@ pub async fn models(
 ) -> ApiResult<Json<Value>> {
     let config = load(&state)?;
     let openai = config.openai.clone().unwrap_or_default();
+
+    // Copilot has its own catalog with richer metadata, and no base URL to
+    // query — it's addressed by the reserved endpoint name.
+    if params.endpoint.as_deref() == Some(COPILOT_ENDPOINT) {
+        let models = crate::connector::adapter::copilot::list_models(
+            &config.copilot.clone().unwrap_or_default(),
+        )
+        .await?;
+        let list: Vec<Value> = models
+            .into_iter()
+            .map(|m| {
+                json!({
+                    "id": m.id,
+                    "vendor": m.vendor,
+                    "name": m.name,
+                })
+            })
+            .collect();
+        return Ok(Json(json!({ "base_url": COPILOT_ENDPOINT, "models": list })));
+    }
 
     let (base_url, api_key) = if let Some(raw) = params.base_url.as_deref() {
         (normalize_base(raw), None)

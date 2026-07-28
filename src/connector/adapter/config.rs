@@ -54,6 +54,42 @@ pub struct MemoryConfig {
     /// Dream-cycle settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dream: Option<DreamConfig>,
+
+    /// GitHub Copilot subscription, usable as the chat backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copilot: Option<CopilotConfig>,
+}
+
+/// The reserved endpoint name that selects the Copilot backend.
+///
+/// Copilot isn't an OpenAI-compatible endpoint the user registers — its base
+/// URL, headers and credential are fixed — so rather than adding a parallel
+/// "target" concept it occupies a reserved name in the same `active_chat` slot
+/// the registered endpoints use. Binding chat to `copilot` switches the backend;
+/// everything else about role resolution is unchanged.
+pub const COPILOT_ENDPOINT: &str = "copilot";
+
+/// GitHub Copilot credentials + model selection.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CopilotConfig {
+    /// GitHub OAuth token (`ghu_…`) captured during the device-flow login. Sent
+    /// as a `Bearer` credential on every Copilot API request. When absent,
+    /// requests are unauthenticated and fail — log in first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_token: Option<String>,
+
+    /// Model id selected in the picker (e.g. `"claude-sonnet-4.5"`). When
+    /// absent the Copilot API's default model is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+impl CopilotConfig {
+    /// Whether a token is stored. Not a guarantee it's still valid — the API
+    /// will 401 on an expired one — just that a login has happened.
+    pub fn is_authenticated(&self) -> bool {
+        self.github_token.as_ref().is_some_and(|t| !t.is_empty())
+    }
 }
 
 /// A set of named OpenAI-compatible endpoints plus which ones are active.
@@ -281,6 +317,21 @@ impl MemoryConfig {
             .or_else(|| role_active(openai))
             .or(openai.active.as_deref())?;
         openai.endpoints.get(name)
+    }
+
+    /// Whether chat is bound to the reserved [`COPILOT_ENDPOINT`] name.
+    ///
+    /// Checked before endpoint resolution: Copilot is not a registered
+    /// OpenAI-compatible endpoint, so `select_endpoint` would miss it and fall
+    /// through to the environment, silently ignoring the user's choice.
+    pub fn chat_uses_copilot(&self, name_override: Option<&str>) -> bool {
+        let name = match name_override {
+            Some(n) => Some(n),
+            None => self.openai.as_ref().and_then(|o| {
+                o.active_chat.as_deref().or(o.active.as_deref())
+            }),
+        };
+        name == Some(COPILOT_ENDPOINT)
     }
 
     /// Resolve the **chat** endpoint: the named config endpoint (override →

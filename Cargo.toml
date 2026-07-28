@@ -20,6 +20,10 @@ path = "src/main.rs"
 # sibling checkout a local `path` would need.
 openai-rs = { git = "https://github.com/ArtemisMucaj/openai-rs", branch = "main" }
 
+# GitHub Copilot subscription as a chat backend: the OAuth device flow and the
+# Copilot-specific endpoint/headers/model catalog.
+gh-copilot-rs = { git = "https://github.com/ArtemisMucaj/gh-copilot-rs", branch = "main" }
+
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
 async-trait = "0.1"

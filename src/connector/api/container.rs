@@ -56,6 +56,8 @@ pub struct Container {
     config: ContainerConfig,
     /// Resolved chat endpoint (extraction / summarization / dreaming).
     chat_endpoint: ResolvedChatEndpoint,
+    /// Set when chat is bound to the reserved Copilot endpoint.
+    copilot: Option<crate::connector::adapter::CopilotConfig>,
     /// Resolved embedding endpoint — its base URL / API key embed queries, and
     /// its model seeds a *fresh* store's pinned embedding model.
     embedding_endpoint: ResolvedEmbeddingEndpoint,
@@ -85,10 +87,19 @@ impl Container {
         let embedding_endpoint = file_config
             .resolve_embedding_endpoint(config.openai_endpoint.as_deref(), &embedding_cfg.model);
 
+        // Copilot is not an OpenAI-compatible endpoint the user registers, so
+        // it is resolved separately: `chat_uses_copilot` sees the reserved name
+        // in the same `active_chat` slot the registered endpoints use.
+        // Embeddings are unaffected — Copilot serves chat only.
+        let copilot = file_config
+            .chat_uses_copilot(config.openai_endpoint.as_deref())
+            .then(|| file_config.copilot.clone().unwrap_or_default());
+
         Ok(Self {
             config,
             chat_endpoint,
             embedding_endpoint,
+            copilot,
             opened: Mutex::new(None),
         })
     }
@@ -151,6 +162,12 @@ impl Container {
     /// names no chat model — the LLM-driven commands (`import`, `dream`, `add`)
     /// need one.
     pub fn chat_client(&self) -> Result<Arc<dyn ChatClient>, DomainError> {
+        // Copilot brings its own base URL, headers and credential, and its
+        // model may be unset (the API picks a default), so it bypasses the
+        // "endpoint must name a model" check below.
+        if let Some(copilot) = &self.copilot {
+            return crate::connector::adapter::copilot::chat_client(copilot);
+        }
         let ep = &self.chat_endpoint;
         let model = ep.model.clone().ok_or_else(|| {
             DomainError::invalid_input(
