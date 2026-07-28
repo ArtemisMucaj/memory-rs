@@ -20,8 +20,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
-use crate::application::use_cases::memory_support::unix_now;
-use crate::application::{MemoryDreamUseCase, MemoryRepository};
+use crate::application::use_cases::llm_json::unix_now;
+use crate::application::{MemoryDreamUseCase, NodeRepository};
 use crate::connector::adapter::config::{DreamConfig, MemoryConfig};
 use crate::connector::api::Container;
 use crate::domain::{DomainError, DreamRun};
@@ -33,7 +33,7 @@ const SWEEP_INTERVAL_SECS: u64 = 15 * 60;
 /// API's status/trigger endpoints both go through this.
 pub struct DreamService {
     use_case: Arc<MemoryDreamUseCase>,
-    memory_repo: Arc<dyn MemoryRepository>,
+    node_repo: Arc<dyn NodeRepository>,
     /// The scheduling config, behind a lock so a management-API write applies
     /// live: the scheduler reads a fresh snapshot each tick, so a changed
     /// interval / idle window / toggle takes effect on the next sweep without a
@@ -56,7 +56,7 @@ impl DreamService {
             .unwrap_or_default();
         Ok(Arc::new(Self {
             use_case: Arc::new(container.memory_dream_use_case()?),
-            memory_repo: container.memory_repository()?,
+            node_repo: container.node_repository()?,
             config: RwLock::new(config),
             data_dir: container.data_dir().to_string(),
             running: AtomicBool::new(false),
@@ -116,7 +116,7 @@ impl DreamService {
     }
 
     pub async fn last_run(&self) -> Option<DreamRun> {
-        match self.memory_repo.last_dream_run().await {
+        match self.node_repo.last_dream_run().await {
             Ok(run) => run,
             Err(e) => {
                 tracing::warn!("failed to read last dream run for status: {e}");
@@ -212,7 +212,7 @@ impl DreamService {
     /// finished more than the configured interval ago.
     async fn dream_due(&self) -> bool {
         let interval_secs = (self.config().dream_interval_hours() * 3_600) as i64;
-        match self.memory_repo.last_dream_run().await {
+        match self.node_repo.last_dream_run().await {
             Ok(Some(last)) => unix_now() - last.finished_at >= interval_secs,
             Ok(None) => true,
             Err(e) => {

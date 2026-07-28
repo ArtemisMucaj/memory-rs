@@ -4,7 +4,7 @@
 
 use tracing::warn;
 
-use crate::application::interfaces::{Embedder, MemoryRepository};
+use crate::application::interfaces::{Embedder, NodeRepository};
 use crate::domain::{DomainError, MemoryItem, MemoryKind};
 
 /// Outcome of embedding a memory item, distinguishing an intentional no-vector
@@ -46,7 +46,7 @@ pub(crate) async fn embed_memory_item(embedder: &Embedder, item: &MemoryItem) ->
 /// memory's scope — see [`WriteScope`] and [`resolve_scope`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn upsert_preserving_identity(
-    memory_repo: &dyn MemoryRepository,
+    node_repo: &dyn NodeRepository,
     embedder: &Embedder,
     kind: MemoryKind,
     name: &str,
@@ -60,7 +60,7 @@ pub(crate) async fn upsert_preserving_identity(
     // name)` may not exist both globally and under a project, so the write has
     // to see a same-named item at the other scope in order to reuse it rather
     // than add a sibling.
-    let candidates = memory_repo.find_items_named(kind, name).await?;
+    let candidates = node_repo.find_items_named(kind, name).await?;
     let resolved = resolve_scope(&candidates, project, writer);
     let project = resolved.project;
     let superseded = resolved.superseded;
@@ -99,9 +99,9 @@ pub(crate) async fn upsert_preserving_identity(
     let vector = match embed_memory_item(embedder, &item).await {
         ItemEmbedding::Ready(vector) => Some(vector),
         ItemEmbedding::Disabled => None,
-        ItemEmbedding::Failed => memory_repo.find_item_vector(item.id()).await?,
+        ItemEmbedding::Failed => node_repo.find_item_vector(item.id()).await?,
     };
-    memory_repo.upsert_item(&item, vector.as_deref()).await?;
+    node_repo.upsert_item(&item, vector.as_deref()).await?;
 
     // Folding project rows into a global one is only half the job: the rows
     // that were absorbed have to go, or the store ends up holding exactly the
@@ -109,7 +109,7 @@ pub(crate) async fn upsert_preserving_identity(
     // write so a failure mid-way leaves duplicates (recoverable) rather than a
     // hole where the memory used to be.
     for id in superseded {
-        memory_repo.delete_item_by_id(&id).await?;
+        node_repo.delete_item_by_id(&id).await?;
     }
     Ok(())
 }
@@ -256,14 +256,6 @@ fn resolve_scope<'a>(
             }
         }
     }
-}
-
-/// Current Unix time in seconds.
-pub(crate) fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

@@ -98,7 +98,7 @@ impl SessionImportService {
         // the wrong one as already-imported (the stored `source` is
         // heterogeneous — a `"zed:…"` tag, an `"opencode:…"` tag, or a Claude
         // file path — so it is normalized back to the source tag).
-        let repo = self.container.memory_repository()?;
+        let repo = self.container.node_repository()?;
         let imported: HashSet<SessionKey> = repo
             .list_sessions()
             .await?
@@ -212,12 +212,19 @@ impl SessionImportService {
         let outcome = use_case.execute(&transcript, force).await?;
         Ok(match outcome {
             ImportOutcome::Imported { report, .. } => {
-                let written = report.items_written();
-                format!(
-                    "{} memory item{} written",
+                let written = report.memories_written;
+                let mut summary = format!(
+                    "{} memory{} written",
                     written,
                     if written == 1 { "" } else { "s" }
-                )
+                );
+                if report.conflicts_recorded > 0 {
+                    summary.push_str(&format!(
+                        ", {} conflict(s) recorded",
+                        report.conflicts_recorded
+                    ));
+                }
+                summary
             }
             ImportOutcome::AlreadyImported { .. } => "already imported".to_string(),
         })

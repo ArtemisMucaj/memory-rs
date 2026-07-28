@@ -4,15 +4,17 @@
 //! return domain values. Every handler returns a `String` for `main` to print,
 //! or a [`DomainError`] to report.
 
-use crate::application::{DreamReport, ExtractionReport, ImportOutcome};
+use crate::application::{DreamReport, ImportOutcome, Recalled};
 use crate::cli::{Cli, Command, MemoryKindArg, NamespaceCommand, OutputFormat};
-use crate::connector::api::controller::{self, SearchOutcome, SearchScope};
+use crate::connector::api::controller::{
+    self, ForgetOutcome, MemorySearchOutcome, MemoryShowOutcome, SearchScope,
+};
 use crate::connector::api::Container;
 use crate::domain::{
-    DomainError, MemoryItem, MemoryKind, MemoryNode, MemoryOperation, SessionStatus,
+    DomainError, Memory, MemoryKind, MemoryNode, MemoryOperation, MemoryStatus, SessionStatus,
 };
 
-/// Characters of item/node content shown in list/search previews.
+/// Characters of node content shown in tree previews.
 const CONTENT_PREVIEW_CHARS: usize = 160;
 
 /// Dispatch a parsed CLI to the matching handler, returning the text to print.
@@ -27,7 +29,11 @@ pub async fn run(cli: Cli, container: &Container) -> Result<String, DomainError>
             namespace,
             format,
         } => search(container, query, num, kind, project, namespace, format).await,
-        Command::List { kind, format } => list(container, kind, format).await,
+        Command::List {
+            kind,
+            status,
+            format,
+        } => list(container, kind, status, format).await,
         Command::Show { id } => show(container, id).await,
         Command::Delete { id } => delete(container, id).await,
         Command::Sessions { format } => sessions(container, format).await,
@@ -35,6 +41,7 @@ pub async fn run(cli: Cli, container: &Container) -> Result<String, DomainError>
         Command::Dream { idle_minutes } => dream(container, idle_minutes).await,
         Command::Tree { uri, format } => tree(container, uri, format).await,
         Command::Stats { format } => stats(container, format).await,
+        Command::Conflicts { format } => conflicts(container, format).await,
         Command::Namespace { command } => namespace(container, command).await,
         // `tui` / `serve` / `mcp` are long-running commands dispatched by `main`
         // before the (text-returning) router runs; they never reach here.
@@ -67,9 +74,9 @@ async fn search(
         (None, None) => SearchScope::All,
     };
 
-    let results = match controller::search(container, &query, kind, &scope, num).await? {
-        SearchOutcome::Hits(hits) => hits,
-        SearchOutcome::EmptyNamespace(ns) => {
+    let results = match controller::recall_memories(container, &query, kind, &scope, num).await? {
+        MemorySearchOutcome::Hits(hits) => hits,
+        MemorySearchOutcome::EmptyNamespace(ns) => {
             return Ok(format!(
                 "Namespace '{ns}' has no projects (assign one with: memory-rs namespace assign \
                  {ns} <project>). Only global memories would match."
@@ -78,39 +85,44 @@ async fn search(
     };
 
     match format {
-        OutputFormat::Json => {
-            let items: Vec<serde_json::Value> = results
-                .iter()
-                .map(|(item, score)| {
-                    let mut value = serde_json::to_value(item).unwrap_or_default();
-                    if let Some(obj) = value.as_object_mut() {
-                        obj.insert("score".to_string(), serde_json::json!(score));
-                    }
-                    value
-                })
-                .collect();
-            to_json(&items)
-        }
+        OutputFormat::Json => to_json(&memories_with_scores(&results)),
         OutputFormat::Text => {
             if results.is_empty() {
-                return Ok("No memories found.".to_string());
+                return Ok("No memories matched.".to_string());
             }
-            let mut output = String::new();
-            for (item, score) in &results {
-                output.push_str(&format!(
-                    "[{:.3}] [{}] {}{} ({})\n",
-                    score,
-                    item.kind(),
-                    item.name(),
-                    project_tag(item),
-                    item.id()
-                ));
-                output.push_str(&format!(
-                    "    {}\n\n",
-                    preview(item.content(), CONTENT_PREVIEW_CHARS)
-                ));
+            Ok(render_memory_list(&results))
+        }
+    }
+}
+
+async fn conflicts(container: &Container, format: OutputFormat) -> Result<String, DomainError> {
+    let conflicts = controller::memory_conflicts(container).await?;
+    match format {
+        OutputFormat::Json => to_json(
+            &conflicts
+                .iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "recorded_at": c.recorded_at,
+                        "a": c.a,
+                        "b": c.b,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        ),
+        OutputFormat::Text => {
+            if conflicts.is_empty() {
+                return Ok("No unresolved disagreements.".to_string());
             }
-            Ok(output)
+            let mut out = format!(
+                "{} unresolved disagreement(s). Both sides still answer queries.\n\n",
+                conflicts.len()
+            );
+            for c in &conflicts {
+                out.push_str(&format!("  {}\n    {}\n", c.a.statement, c.a.id));
+                out.push_str(&format!("  vs\n  {}\n    {}\n\n", c.b.statement, c.b.id));
+            }
+            Ok(out.trim_end().to_string())
         }
     }
 }
@@ -195,33 +207,24 @@ async fn namespace(
 async fn list(
     container: &Container,
     kind: Option<MemoryKindArg>,
+    status: String,
     format: OutputFormat,
 ) -> Result<String, DomainError> {
-    let repo = container.memory_repository()?;
-    let items = repo.list_items(kind.map(MemoryKind::from)).await?;
+    let status = parse_status_arg(&status)?;
+    let memories = controller::list_memories(container, kind.map(MemoryKind::from), status).await?;
 
     match format {
-        OutputFormat::Json => to_json(&items),
+        OutputFormat::Json => to_json(&memories),
         OutputFormat::Text => {
-            if items.is_empty() {
+            if memories.is_empty() {
                 return Ok(
                     "No memories stored. Import a session with: memory-rs import <transcript.jsonl>"
                         .to_string(),
                 );
             }
-            let mut output = format!("{} memories:\n\n", items.len());
-            for item in &items {
-                output.push_str(&format!(
-                    "[{}] {}{} ({})\n",
-                    item.kind(),
-                    item.name(),
-                    project_tag(item),
-                    item.id()
-                ));
-                output.push_str(&format!(
-                    "    {}\n\n",
-                    preview(item.content(), CONTENT_PREVIEW_CHARS)
-                ));
+            let mut output = format!("{} memories:\n\n", memories.len());
+            for memory in &memories {
+                output.push_str(&render_memory(memory, None));
             }
             Ok(output)
         }
@@ -229,33 +232,50 @@ async fn list(
 }
 
 async fn show(container: &Container, id: String) -> Result<String, DomainError> {
-    match controller::show(container, &id).await? {
-        controller::ShowOutcome::Node(node) => Ok(render_node(&node)),
-        controller::ShowOutcome::Item(item) => Ok(render_item(&item)),
-        controller::ShowOutcome::Many(items) => Ok(render_many_matches(
-            &id,
-            &items,
-            "Show one with: memory-rs show",
-        )),
-        controller::ShowOutcome::NotFound => {
+    match controller::show_memory(container, &id).await? {
+        MemoryShowOutcome::Node(node) => Ok(render_node(&node)),
+        MemoryShowOutcome::Memory { memory, edges } => {
+            let mut out = render_memory(&memory, Some(&id));
+            if edges.is_empty() {
+                out.push_str("\nNo edges.\n");
+            } else {
+                out.push_str(&format!("\nEdges ({}):\n", edges.len()));
+                for edge in &edges {
+                    // Render direction explicitly: "supersedes X" and
+                    // "superseded by X" are opposite facts about this memory,
+                    // and an arrow alone leaves the reader to work out which.
+                    let (relation, other) = if edge.from_memory == memory.id {
+                        (edge.edge_type.as_str(), &edge.to_memory)
+                    } else {
+                        (edge.edge_type.as_str(), &edge.from_memory)
+                    };
+                    let direction = if edge.from_memory == memory.id {
+                        "->"
+                    } else {
+                        "<-"
+                    };
+                    out.push_str(&format!("  {direction} {relation} {other}\n"));
+                }
+            }
+            Ok(out)
+        }
+        MemoryShowOutcome::NotFound => {
             if id.starts_with("memory://") {
                 Ok(format!("No memory node found at '{id}'."))
             } else {
-                Ok(format!("No memory item found with ID '{id}'."))
+                Ok(format!("No memory found with ID '{id}'."))
             }
         }
     }
 }
 
 async fn delete(container: &Container, id: String) -> Result<String, DomainError> {
-    match controller::delete(container, &id).await? {
-        controller::DeleteOutcome::Deleted => Ok(format!("Deleted memory item '{id}'.")),
-        controller::DeleteOutcome::Ambiguous(items) => Ok(render_many_matches(
-            &id,
-            &items,
-            "Delete one by ID: memory-rs delete",
+    match controller::forget_memory(container, &id).await? {
+        ForgetOutcome::Retracted => Ok(format!(
+            "Retracted memory '{id}'. It stays in the log for provenance and \
+             will no longer be recalled."
         )),
-        controller::DeleteOutcome::NotFound => Ok(format!("No memory item found with ID '{id}'.")),
+        ForgetOutcome::NotFound => Ok(format!("No memory found with ID '{id}'.")),
     }
 }
 
@@ -347,12 +367,16 @@ async fn tree(
 
 async fn stats(container: &Container, format: OutputFormat) -> Result<String, DomainError> {
     let stats = controller::stats(container).await?;
+    let memories = controller::memory_stats(container).await?;
 
     match format {
         OutputFormat::Json => {
             let value = serde_json::json!({
-                "total_items": stats.total_items,
-                "items_by_kind": stats.items_by_kind,
+                "total_memories": memories.total_memories,
+                "memories_by_kind": memories.memories_by_kind,
+                "memories_by_status": memories.memories_by_status,
+                "total_entities": memories.total_entities,
+                "total_edges": memories.total_edges,
                 "total_sessions": stats.total_sessions,
                 "total_nodes": stats.total_nodes,
                 "nodes_by_kind": stats.nodes_by_kind,
@@ -361,10 +385,17 @@ async fn stats(container: &Container, format: OutputFormat) -> Result<String, Do
         }
         OutputFormat::Text => {
             let mut output = String::new();
-            output.push_str(&format!("Items:    {}\n", stats.total_items));
-            for (kind, count) in &stats.items_by_kind {
+            output.push_str(&format!("Memories:   {}\n", memories.total_memories));
+            for (kind, count) in &memories.memories_by_kind {
                 output.push_str(&format!("    {kind}: {count}\n"));
             }
+            for (status, count) in &memories.memories_by_status {
+                if status != "active" {
+                    output.push_str(&format!("    ({status}): {count}\n"));
+                }
+            }
+            output.push_str(&format!("Entities: {}\n", memories.total_entities));
+            output.push_str(&format!("Edges:    {}\n", memories.total_edges));
             output.push_str(&format!("Sessions: {}\n", stats.total_sessions));
             output.push_str(&format!("Nodes:    {}\n", stats.total_nodes));
             for (kind, count) in &stats.nodes_by_kind {
@@ -389,10 +420,33 @@ fn render_import_outcome(outcome: &ImportOutcome) -> String {
                 "Imported session '{}' ({} messages).\n",
                 session.id, session.message_count
             );
-            if report.applied.is_empty() {
+            if report.memories_written == 0 && report.memories_corroborated == 0 {
                 output.push_str("No memories extracted — nothing durable in this session.\n");
+            } else {
+                output.push_str(&format!(
+                    "  {} memory(s), {} entity(ies), {} edge(s).\n",
+                    report.memories_written, report.entities_created, report.edges_added
+                ));
+                if report.memories_corroborated > 0 {
+                    output.push_str(&format!(
+                        "  {} prior memory(s) corroborated instead of duplicated.\n",
+                        report.memories_corroborated
+                    ));
+                }
+                if report.memories_superseded > 0 {
+                    output.push_str(&format!(
+                        "  {} prior memory(s) superseded.\n",
+                        report.memories_superseded
+                    ));
+                }
+                if report.conflicts_recorded > 0 {
+                    output.push_str(&format!(
+                        "  {} contradiction(s) recorded — both sides stay recallable; \
+                         review with: memory-rs conflicts\n",
+                        report.conflicts_recorded
+                    ));
+                }
             }
-            output.push_str(&render_operations(report, "  "));
             output
         }
     }
@@ -425,10 +479,6 @@ fn render_operations_lists(
         out.push_str(&format!("{indent}~ [{kind}] {name} skipped: {reason}\n"));
     }
     out
-}
-
-fn render_operations(report: &ExtractionReport, indent: &str) -> String {
-    render_operations_lists(&report.applied, &report.skipped, indent)
 }
 
 fn render_dream_report(report: &DreamReport) -> String {
@@ -464,23 +514,6 @@ fn render_dream_report(report: &DreamReport) -> String {
     out
 }
 
-fn render_item(item: &MemoryItem) -> String {
-    let project = match item.project() {
-        Some(project) => format!(", project: {project}"),
-        None => ", project: global".to_string(),
-    };
-    format!(
-        "[{}] {} ({})\nupdated {} time(s), source session: {}{}\n\n{}\n",
-        item.kind(),
-        item.name(),
-        item.id(),
-        item.update_count(),
-        item.source_session_id().unwrap_or("(unknown)"),
-        project,
-        item.content()
-    )
-}
-
 /// Render a virtual-filesystem node with its L0 abstract, L1 overview, and L2
 /// detail (present only for nodes that store content).
 fn render_node(node: &MemoryNode) -> String {
@@ -501,31 +534,6 @@ fn render_node(node: &MemoryNode) -> String {
     out
 }
 
-/// One `<id> @project` line per match, with a hint on how to pick one.
-fn render_many_matches(reference: &str, items: &[MemoryItem], hint: &str) -> String {
-    let mut out = format!(
-        "'{reference}' matches {} memories in different projects:\n\n",
-        items.len()
-    );
-    for item in items {
-        out.push_str(&format!(
-            "  {} @{}\n",
-            item.id(),
-            item.project().unwrap_or("(global)")
-        ));
-    }
-    out.push_str(&format!("\n{hint} <id>\n"));
-    out
-}
-
-/// A compact ` @project` suffix for a project-specific memory, or empty.
-fn project_tag(item: &MemoryItem) -> String {
-    match item.project() {
-        Some(project) => format!(" @{project}"),
-        None => String::new(),
-    }
-}
-
 fn preview(content: &str, max_chars: usize) -> String {
     let single_line: String = content.split_whitespace().collect::<Vec<_>>().join(" ");
     if single_line.chars().count() <= max_chars {
@@ -536,6 +544,90 @@ fn preview(content: &str, max_chars: usize) -> String {
         .take(max_chars.saturating_sub(3))
         .collect();
     format!("{truncated}...")
+}
+
+/// A memory rendered for the terminal. `highlight_id` is passed when the reader
+/// asked for this specific memory, in which case the id is worth repeating back.
+fn render_memory(memory: &Memory, highlight_id: Option<&str>) -> String {
+    let mut out = format!("[{}] {}\n", memory.kind.as_str(), memory.statement);
+    out.push_str(&format!(
+        "    {} · confidence {:.2} · {} · {}\n",
+        memory.source_kind.as_str(),
+        memory.confidence,
+        memory.status.as_str(),
+        memory.project.as_deref().unwrap_or("global"),
+    ));
+    if highlight_id.is_some() {
+        out.push_str(&format!("    id: {}\n", memory.id));
+    }
+    out.push('\n');
+    out
+}
+
+fn render_memory_list(hits: &[Recalled]) -> String {
+    let mut out = String::new();
+    for hit in hits {
+        out.push_str(&format!("[{:.3}] ", hit.score));
+        out.push_str(&render_memory(&hit.memory, None));
+        // One line, only when there is something to say: a bare result should
+        // not grow a blank provenance line.
+        let p = &hit.provenance;
+        if !p.is_empty() {
+            let mut parts = Vec::new();
+            if !p.supersedes.is_empty() {
+                parts.push(format!(
+                    "replaced {}{}",
+                    p.supersedes.len(),
+                    if p.chain_truncated { "+" } else { "" }
+                ));
+            }
+            if p.corroborations > 0 {
+                parts.push(format!("corroborated {}x", p.corroborations));
+            }
+            if !p.contradicted_by.is_empty() {
+                parts.push(format!("contradicted by {}", p.contradicted_by.len()));
+            }
+            if !p.refinements.is_empty() {
+                parts.push(format!("refines {}", p.refinements.len()));
+            }
+            out.push_str(&format!("    ({})\n\n", parts.join(" · ")));
+        }
+    }
+    out
+}
+
+fn memories_with_scores(hits: &[Recalled]) -> Vec<serde_json::Value> {
+    hits.iter()
+        .map(|hit| {
+            let mut value = serde_json::to_value(&hit.memory).unwrap_or_default();
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("score".to_string(), serde_json::json!(hit.score));
+                obj.insert(
+                    "provenance".to_string(),
+                    serde_json::json!({
+                        "supersedes_count": hit.provenance.supersedes.len(),
+                        "chain_truncated": hit.provenance.chain_truncated,
+                        "corroborations": hit.provenance.corroborations,
+                        "contradicted_by": hit.provenance.contradicted_by.len(),
+                        "refinements_count": hit.provenance.refinements.len(),
+                    }),
+                );
+            }
+            value
+        })
+        .collect()
+}
+
+/// Absent/`active` is the default; `all` is the only way to reach history.
+fn parse_status_arg(status: &str) -> Result<Option<MemoryStatus>, DomainError> {
+    if status.eq_ignore_ascii_case("all") {
+        return Ok(None);
+    }
+    MemoryStatus::parse(status).map(Some).ok_or_else(|| {
+        DomainError::invalid_input(format!(
+            "unknown status '{status}' (expected active, superseded, retracted, or all)"
+        ))
+    })
 }
 
 fn to_json<T: serde::Serialize>(value: &T) -> Result<String, DomainError> {
