@@ -116,6 +116,171 @@ impl SourceKind {
     }
 }
 
+/// The relation in a memory's subject–predicate–object triple.
+///
+/// A **closed** vocabulary, on purpose. The predicate is half of the identity
+/// used to collapse duplicates, so a free-text field means `uses` / `Uses` /
+/// `utilises` / `depends_on` are four different relations and the same fact
+/// gets stored four times. Constraining it also lets a structured-output
+/// backend *enforce* the set rather than merely suggest it.
+///
+/// [`Predicate::RelatesTo`] is the deliberate escape hatch: a model that cannot
+/// express something with the other variants says so instead of inventing a
+/// word. That makes the gap **measurable** — a rising share of `relates_to` is
+/// the signal that this list is too small, and is the evidence to extend it on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Predicate {
+    // ── What the user is like ──
+    /// A durable taste or habit.
+    Prefers,
+    /// A durable dislike, or something deliberately not done.
+    Avoids,
+
+    // ── How things are built ──
+    /// Depends on, is built with, employs.
+    Uses,
+    /// A hard prerequisite, as opposed to a choice.
+    Requires,
+    /// Exposes or offers something to others.
+    Provides,
+    /// Realises a behaviour or contract.
+    Implements,
+    /// Structural containment — the whole names its parts.
+    Contains,
+    /// Modelled on, forked from, based on an existing thing.
+    DerivedFrom,
+    /// Sets up or parameterises something else.
+    Configures,
+
+    // ── How things behave and break ──
+    /// Leads to, triggers, is responsible for.
+    Causes,
+    /// Resolves a problem.
+    Fixes,
+    /// Stops a problem from occurring.
+    Prevents,
+
+    // ── Decisions and identity ──
+    /// A choice that was made, with its rationale in the statement.
+    Decided,
+    /// Type or category membership.
+    IsA,
+    /// A property or attribute.
+    Has,
+    /// A person's involvement with a project or area.
+    WorksOn,
+
+    /// Escape hatch — a genuine relation none of the above expresses. Keep an
+    /// eye on how often this fires; it is the metric for growing the list.
+    RelatesTo,
+}
+
+impl Predicate {
+    pub const ALL: [Predicate; 17] = [
+        Predicate::Prefers,
+        Predicate::Avoids,
+        Predicate::Uses,
+        Predicate::Requires,
+        Predicate::Provides,
+        Predicate::Implements,
+        Predicate::Contains,
+        Predicate::DerivedFrom,
+        Predicate::Configures,
+        Predicate::Causes,
+        Predicate::Fixes,
+        Predicate::Prevents,
+        Predicate::Decided,
+        Predicate::IsA,
+        Predicate::Has,
+        Predicate::WorksOn,
+        Predicate::RelatesTo,
+    ];
+
+    /// Stable identifier used in storage and in the extraction JSON protocol.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Predicate::Prefers => "prefers",
+            Predicate::Avoids => "avoids",
+            Predicate::Uses => "uses",
+            Predicate::Requires => "requires",
+            Predicate::Provides => "provides",
+            Predicate::Implements => "implements",
+            Predicate::Contains => "contains",
+            Predicate::DerivedFrom => "derived_from",
+            Predicate::Configures => "configures",
+            Predicate::Causes => "causes",
+            Predicate::Fixes => "fixes",
+            Predicate::Prevents => "prevents",
+            Predicate::Decided => "decided",
+            Predicate::IsA => "is_a",
+            Predicate::Has => "has",
+            Predicate::WorksOn => "works_on",
+            Predicate::RelatesTo => "relates_to",
+        }
+    }
+
+    /// One-line meaning, used in the extraction prompt so the model picks on
+    /// semantics rather than on which word looks closest.
+    pub fn meaning(&self) -> &'static str {
+        match self {
+            Predicate::Prefers => "a durable taste or habit of the user",
+            Predicate::Avoids => "a durable dislike, or something deliberately not done",
+            Predicate::Uses => "depends on, is built with, employs",
+            Predicate::Requires => "a hard prerequisite, not a choice",
+            Predicate::Provides => "exposes or offers something to others",
+            Predicate::Implements => "realises a behaviour or contract",
+            Predicate::Contains => "the whole names its parts — use this whenever a memory lists what something is made of",
+            Predicate::DerivedFrom => "modelled on, forked from, or based on an existing thing",
+            Predicate::Configures => "sets up or parameterises something else",
+            Predicate::Causes => "leads to, triggers, is responsible for",
+            Predicate::Fixes => "resolves a problem",
+            Predicate::Prevents => "stops a problem from occurring",
+            Predicate::Decided => "a choice that was made (put the rationale in the statement)",
+            Predicate::IsA => "type or category membership",
+            Predicate::Has => "a property or attribute",
+            Predicate::WorksOn => "a person's involvement with a project or area",
+            Predicate::RelatesTo => "none of the above fits — use only as a last resort",
+        }
+    }
+
+    /// Parse a stored or model-supplied value. Tolerant of case and surrounding
+    /// whitespace; a few near-misses the extraction model reaches for are
+    /// folded in rather than lost to the escape hatch.
+    pub fn parse(s: &str) -> Option<Predicate> {
+        match s
+            .trim()
+            .to_ascii_lowercase()
+            .replace([' ', '-'], "_")
+            .as_str()
+        {
+            "prefers" | "prefer" | "likes" => Some(Predicate::Prefers),
+            "avoids" | "avoid" | "dislikes" => Some(Predicate::Avoids),
+            "uses" | "use" | "used" | "utilises" | "utilizes" | "depends_on" => {
+                Some(Predicate::Uses)
+            }
+            "requires" | "require" | "needs" => Some(Predicate::Requires),
+            "provides" | "provide" | "exposes" | "offers" => Some(Predicate::Provides),
+            "implements" | "implement" => Some(Predicate::Implements),
+            "contains" | "contain" | "includes" | "consists_of" | "comprises" => {
+                Some(Predicate::Contains)
+            }
+            "derived_from" | "based_on" | "modelled_on" | "modeled_on" | "mirrors"
+            | "forked_from" | "copied_from" => Some(Predicate::DerivedFrom),
+            "configures" | "configure" | "sets_up" => Some(Predicate::Configures),
+            "causes" | "cause" | "triggers" => Some(Predicate::Causes),
+            "fixes" | "fix" | "fixed" | "resolves" => Some(Predicate::Fixes),
+            "prevents" | "prevent" | "avoids_issue" => Some(Predicate::Prevents),
+            "decided" | "decides" | "chose" | "chooses" => Some(Predicate::Decided),
+            "is_a" | "isa" | "is" | "type_of" => Some(Predicate::IsA),
+            "has" | "have" | "owns" => Some(Predicate::Has),
+            "works_on" | "worked_on" | "maintains" => Some(Predicate::WorksOn),
+            "relates_to" | "related_to" | "relates" => Some(Predicate::RelatesTo),
+            _ => None,
+        }
+    }
+}
+
 /// Lifecycle state of a memory. The current-truth projection is the set of
 /// [`MemoryStatus::Active`] memories.
 ///
@@ -233,7 +398,7 @@ impl EdgeOrigin {
 
 /// A resolved, canonical entity: the anchor a memory's subject/object points at.
 ///
-/// `aliases` are the surface forms that resolve to this entity (e.g. `"Alice"`,
+/// (superseded doc — see the struct doc above)
 /// `"my coworker Alice"`), kept separate from `canonical_name`. Entities are
 /// global (not project-scoped); the project scope lives on the [`Memory`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -242,7 +407,7 @@ pub struct Entity {
     /// Coarse type: `person`, `place`, `project`, `tool`, …
     pub entity_type: String,
     pub canonical_name: String,
-    pub aliases: Vec<String>,
+    pub names: Vec<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -265,9 +430,8 @@ pub struct Memory {
     pub kind: MemoryKind,
     /// Resolved subject — normally an [`EntityRef::Entity`].
     pub subject: EntityRef,
-    /// Predicate from a small controlled-ish vocabulary (e.g. `prefers`,
-    /// `lives_in`, `uses`).
-    pub predicate: String,
+    /// The relation, from a closed vocabulary — see [`Predicate`].
+    pub predicate: Predicate,
     pub object: EntityRef,
     /// Human-readable rendering of the triple, used for embedding and display.
     pub statement: String,

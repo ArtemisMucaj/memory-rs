@@ -45,6 +45,6 @@ pub use connector::{
 pub use domain::{
     cosine_similarity, DiscoveredSession, DomainError, DreamRun, EdgeOrigin, EdgeType, Entity,
     EntityRef, ImportedSession, Memory, MemoryEdge, MemoryItem, MemoryKind, MemoryNode,
-    MemoryOperation, MemoryStatus, MemoryStoreStats, NodeKind, SessionLocator, SessionMessage,
-    SessionSource, SessionStatus, SessionTranscript, SourceKind,
+    MemoryOperation, MemoryStatus, MemoryStoreStats, NodeKind, Predicate, SessionLocator,
+    SessionMessage, SessionSource, SessionStatus, SessionTranscript, SourceKind,
 };

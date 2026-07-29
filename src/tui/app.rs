@@ -282,7 +282,7 @@ pub async fn run(container: Container, logs: LogCapture) -> Result<(), DomainErr
 mod tests {
     use super::*;
     use crate::connector::api::ContainerConfig;
-    use crate::domain::MemoryKind;
+    use crate::domain::{MemoryKind, Predicate};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -326,16 +326,20 @@ mod tests {
         let container = temp_container(dir.path());
         // Seeded through the *memory* port — the projection import writes.
         let repo = container.memory_repository().unwrap();
-        for (id, statement) in [
-            ("m-1", "duckdb takes a file lock on the database"),
-            ("m-2", "the storage engine is columnar"),
+        for (id, predicate, statement) in [
+            (
+                "m-1",
+                "requires",
+                "duckdb takes a file lock on the database",
+            ),
+            ("m-2", "uses", "the storage engine is columnar"),
         ] {
             repo.append_memory(
                 &crate::domain::Memory {
                     id: id.into(),
                     kind: MemoryKind::Fact,
                     subject: crate::domain::EntityRef::Literal("the project".into()),
-                    predicate: "uses".into(),
+                    predicate: Predicate::parse(predicate).unwrap_or(Predicate::RelatesTo),
                     object: crate::domain::EntityRef::Literal("duckdb".into()),
                     statement: statement.into(),
                     project: None,
@@ -361,9 +365,16 @@ mod tests {
         let text = render_to_text(&mut app, 120, 24);
         assert!(text.contains("Memories"), "top group renders");
         assert!(text.contains("Facts"), "category subgroup renders");
+        // The row is the short title — subject plus predicate — not the whole
+        // statement. A list of self-contained sentences is unreadable.
         assert!(
-            text.contains("duckdb takes a file lock"),
+            text.contains("the project · requires · duckdb"),
             "leaf memory renders:\n{text}"
+        );
+        assert!(text.contains("the project · uses · duckdb"));
+        assert!(
+            !text.contains("duckdb takes a file lock on the database"),
+            "the full statement belongs in the detail pane, not the row"
         );
     }
 

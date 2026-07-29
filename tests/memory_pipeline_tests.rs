@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use memory_rs::application::interfaces::Embedder;
 use memory_rs::application::{MemoryIngestionUseCase, MemoryRecallUseCase, MemoryRepository};
+use memory_rs::Predicate;
 use memory_rs::{
     DuckdbStore, EdgeType, Entity, EntityRef, IngestionOutcome, Memory, MemoryKind, MemoryStatus,
     SessionMessage, SessionTranscript, SourceKind,
@@ -18,7 +19,10 @@ use memory_rs::{
 use openai_rs::ChatClient;
 
 mod common;
-use common::{embed_text, MockEmbeddingClient, ScriptedChatClient, DIMS};
+use common::{
+    ambiguous_seed_vector, embed_text, AmbiguousEmbeddingClient, ConstantEmbeddingClient,
+    MockEmbeddingClient, ScriptedChatClient, DIMS,
+};
 
 const PROJECT: &str = "owner/repo";
 
@@ -28,6 +32,12 @@ const SUBJECT: &str = "the user";
 struct Harness {
     repo: Arc<DuckdbStore>,
     chat: Arc<ScriptedChatClient>,
+    /// When set, every pair embeds identically so the attribution path runs
+    /// deterministically. The default hashing embedder cannot be aimed at a
+    /// cosine threshold.
+    constant_embeddings: bool,
+    /// When set, every pair lands in the ambiguous band, where tier 3 runs.
+    ambiguous_embeddings: bool,
 }
 
 impl Harness {
@@ -36,6 +46,8 @@ impl Harness {
         Self {
             repo,
             chat: Arc::new(ScriptedChatClient::new(responses)),
+            constant_embeddings: false,
+            ambiguous_embeddings: false,
         }
     }
 
@@ -44,7 +56,13 @@ impl Harness {
     }
 
     fn embedder(&self) -> Embedder {
-        Embedder::new(Arc::new(MockEmbeddingClient))
+        if self.ambiguous_embeddings {
+            Embedder::new(Arc::new(AmbiguousEmbeddingClient))
+        } else if self.constant_embeddings {
+            Embedder::new(Arc::new(ConstantEmbeddingClient))
+        } else {
+            Embedder::new(Arc::new(MockEmbeddingClient))
+        }
     }
 
     fn ingestion(&self) -> MemoryIngestionUseCase {
@@ -79,7 +97,7 @@ impl Harness {
                     id: entity_id.clone(),
                     entity_type: "person".to_string(),
                     canonical_name: entity_name.to_string(),
-                    aliases: Vec::new(),
+                    names: Vec::new(),
                     created_at: 100,
                     updated_at: 100,
                 },
@@ -93,7 +111,7 @@ impl Harness {
                     id: memory_id.to_string(),
                     kind: MemoryKind::Preference,
                     subject: EntityRef::Entity(entity_id.clone()),
-                    predicate: predicate.to_string(),
+                    predicate: Predicate::parse(predicate).unwrap_or(Predicate::RelatesTo),
                     object: EntityRef::Literal(object.to_string()),
                     statement: statement.to_string(),
                     project: Some(PROJECT.to_string()),
@@ -613,7 +631,7 @@ async fn the_same_subject_across_sessions_resolves_to_one_entity() {
     assert_eq!(
         entities.len(),
         1,
-        "alias resolution is case-insensitive, so 'The User' must reuse 'the user'",
+        "name resolution is case-insensitive, so 'The User' must reuse 'the user'",
     );
 
     let memories = h.memories().list_memories(None, None, None).await.unwrap();
@@ -882,7 +900,7 @@ async fn recall_scopes_across_several_projects_plus_globals() {
                     id: id.to_string(),
                     kind: MemoryKind::Fact,
                     subject: EntityRef::Literal("project".to_string()),
-                    predicate: "uses".to_string(),
+                    predicate: Predicate::Uses,
                     object: EntityRef::Literal("tabs".to_string()),
                     statement: statement.to_string(),
                     project: project.map(str::to_string),
@@ -1295,4 +1313,334 @@ async fn a_memory_with_no_history_has_empty_provenance() {
         .await
         .unwrap();
     assert!(hits[0].provenance.is_empty());
+}
+
+// ── Entity attribution ───────────────────────────────────────────────────
+
+/// The vector `ConstantEmbeddingClient` produces, for seeding entities that
+/// must match whatever ingestion embeds.
+fn constant_vector() -> Vec<f32> {
+    let mut v = vec![0.0f32; DIMS];
+    v[0] = 1.0;
+    v
+}
+
+/// A harness whose embedder scores every pair at 1.0, so the attribution path
+/// runs deterministically. The thresholds themselves are unit-tested; this
+/// covers the wiring — that a fuzzy hit reuses the entity and teaches it the
+/// surface form.
+fn attributing_harness(responses: Vec<&str>) -> Harness {
+    let mut h = Harness::new(responses);
+    h.constant_embeddings = true;
+    h
+}
+
+/// The fragmentation this prevents: without a fuzzy tier, every surface variant
+/// of one thing becomes a permanent separate anchor, and memories about one are
+/// invisible from the other.
+#[tokio::test]
+async fn a_variant_surface_form_is_attributed_to_the_existing_entity() {
+    let h = attributing_harness(vec![&response(
+        "the gateway-events service",
+        "uses",
+        "terraform",
+        "the gateway-events service uses terraform",
+        "user_stated",
+        0.9,
+        None,
+    )]);
+    h.memories()
+        .upsert_entity(
+            &Entity {
+                id: "entity-ge".into(),
+                entity_type: "person".into(),
+                canonical_name: "gateway-events".into(),
+                names: Vec::new(),
+                created_at: 1,
+                updated_at: 1,
+            },
+            Some(&constant_vector()),
+        )
+        .await
+        .unwrap();
+
+    let IngestionOutcome::Ingested(report) = h
+        .ingestion()
+        .execute(&transcript("session-1", "talk"), false)
+        .await
+        .unwrap()
+    else {
+        panic!("expected an ingest");
+    };
+
+    assert_eq!(
+        report.entities_attributed, 1,
+        "the variant should have resolved"
+    );
+    let entities = h.memories().list_entities().await.unwrap();
+    assert_eq!(
+        entities.len(),
+        1,
+        "one thing should mean one anchor, got {:?}",
+        entities
+            .iter()
+            .map(|e| &e.canonical_name)
+            .collect::<Vec<_>>()
+    );
+
+    // The half that compounds: the variant is written back, so the next
+    // sighting takes the free exact path instead of re-paying for a search.
+    let learned = h
+        .memories()
+        .find_entity("entity-ge")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        learned
+            .names
+            .iter()
+            .any(|a| a == "the gateway-events service"),
+        "attribution must teach the entity its new surface form, got {:?}",
+        learned.names,
+    );
+}
+
+/// A type conflict must survive even a perfect embedding match, because an
+/// entity has no supersession chain to undo a bad merge with.
+#[tokio::test]
+async fn attribution_refuses_to_cross_entity_types() {
+    let h = attributing_harness(vec![&response(
+        "gateway-events",
+        "uses",
+        "terraform",
+        "gateway-events uses terraform",
+        "user_stated",
+        0.9,
+        None,
+    )]);
+    // The extraction fixture types its subject `person`; seed a `tool` of the
+    // same name so the only thing keeping them apart is the type guard.
+    h.memories()
+        .upsert_entity(
+            &Entity {
+                id: "entity-tool".into(),
+                entity_type: "tool".into(),
+                canonical_name: "a completely different name".into(),
+                names: Vec::new(),
+                created_at: 1,
+                updated_at: 1,
+            },
+            Some(&constant_vector()),
+        )
+        .await
+        .unwrap();
+
+    let IngestionOutcome::Ingested(report) = h
+        .ingestion()
+        .execute(&transcript("session-1", "talk"), false)
+        .await
+        .unwrap()
+    else {
+        panic!("expected an ingest");
+    };
+    assert_eq!(
+        report.entities_attributed, 0,
+        "a type conflict must not attribute"
+    );
+    assert_eq!(h.memories().list_entities().await.unwrap().len(), 2);
+}
+
+/// The reverse direction: memories point at entities, so "what do we know about
+/// this thing" is a lookup back through both FK columns — subject *and* object.
+#[tokio::test]
+async fn memories_for_entity_finds_it_as_subject_and_as_object() {
+    let h = Harness::new(vec![]);
+    h.memories()
+        .upsert_entity(
+            &Entity {
+                id: "entity-x".into(),
+                entity_type: "tool".into(),
+                canonical_name: "Terraform".into(),
+                names: Vec::new(),
+                created_at: 1,
+                updated_at: 1,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    let mut as_subject = seeded_memory("m-subject", "Terraform provides state locking");
+    as_subject.subject = EntityRef::Entity("entity-x".into());
+    let mut as_object = seeded_memory("m-object", "the deployment uses Terraform");
+    as_object.object = EntityRef::Entity("entity-x".into());
+    for m in [&as_subject, &as_object] {
+        h.memories().append_memory(m, None).await.unwrap();
+    }
+
+    let found = h.memories().memories_for_entity("entity-x").await.unwrap();
+    let ids: std::collections::HashSet<&str> = found.iter().map(|m| m.id.as_str()).collect();
+    assert!(ids.contains("m-subject"), "missed the subject reference");
+    assert!(ids.contains("m-object"), "missed the object reference");
+}
+
+/// A bare memory for the reverse-lookup test, with no entity refs of its own.
+fn seeded_memory(id: &str, statement: &str) -> Memory {
+    Memory {
+        id: id.to_string(),
+        kind: MemoryKind::Fact,
+        subject: EntityRef::Literal("something".into()),
+        predicate: Predicate::Uses,
+        object: EntityRef::Literal("something else".into()),
+        statement: statement.to_string(),
+        project: None,
+        recorded_at: 100,
+        valid_from: 100,
+        valid_to: None,
+        source_session_id: Some("session-1".into()),
+        source_message_index: None,
+        source_kind: SourceKind::UserStated,
+        confidence: 0.9,
+        status: MemoryStatus::Active,
+        derived: false,
+        derived_from: Vec::new(),
+    }
+}
+
+// ── Ambiguous-band adjudication (tier 3) ─────────────────────────────────
+
+/// A name in the ambiguous band is settled by asking the model. This is the
+/// case thresholds cannot fix: real data produced `gateway-events package` vs
+/// `gateway-events service` at 0.907 — too close to call apart, too far to
+/// merge on the score, and lowering the threshold to catch it would start
+/// merging things that are genuinely distinct.
+#[tokio::test]
+async fn an_ambiguous_name_is_merged_when_adjudication_says_same() {
+    let extraction = response(
+        "gateway-events service",
+        "uses",
+        "terraform",
+        "the gateway-events service uses terraform",
+        "user_stated",
+        0.9,
+        None,
+    );
+    // Scripted responses are consumed in order: extraction, then adjudication.
+    let h = ambiguous_harness(vec![&extraction, r#"{"same": true}"#]);
+    seed_ambiguous_candidate(&h).await;
+
+    let IngestionOutcome::Ingested(report) = h
+        .ingestion()
+        .execute(&transcript("session-1", "talk"), false)
+        .await
+        .unwrap()
+    else {
+        panic!("expected an ingest");
+    };
+
+    assert_eq!(
+        report.entities_ambiguous, 1,
+        "the band should have been hit"
+    );
+    assert_eq!(report.entity_adjudications, 1, "and adjudicated");
+    assert_eq!(report.entities_adjudicated_same, 1);
+    assert_eq!(
+        h.memories().list_entities().await.unwrap().len(),
+        1,
+        "a `same` verdict must collapse the duplicate anchor"
+    );
+}
+
+/// A `false` verdict keeps them apart — related-but-distinct is the common case
+/// and the one a bare threshold gets wrong in the other direction.
+#[tokio::test]
+async fn an_ambiguous_name_stays_separate_when_adjudication_says_different() {
+    let extraction = response(
+        "gateway-events service",
+        "uses",
+        "terraform",
+        "the gateway-events service uses terraform",
+        "user_stated",
+        0.9,
+        None,
+    );
+    let h = ambiguous_harness(vec![&extraction, r#"{"same": false}"#]);
+    seed_ambiguous_candidate(&h).await;
+
+    let IngestionOutcome::Ingested(report) = h
+        .ingestion()
+        .execute(&transcript("session-1", "talk"), false)
+        .await
+        .unwrap()
+    else {
+        panic!("expected an ingest");
+    };
+    assert_eq!(report.entity_adjudications, 1);
+    assert_eq!(report.entities_adjudicated_same, 0);
+    assert_eq!(h.memories().list_entities().await.unwrap().len(), 2);
+}
+
+/// The failure that must never happen: an unreachable or broken model merging
+/// two entities by default. Merging cannot be undone — every memory anchored to
+/// either side silently becomes a memory about a thing that does not exist —
+/// so an absent answer has to mean "keep them apart".
+#[tokio::test]
+async fn a_failed_adjudication_never_merges() {
+    let extraction = response(
+        "gateway-events service",
+        "uses",
+        "terraform",
+        "the gateway-events service uses terraform",
+        "user_stated",
+        0.9,
+        None,
+    );
+    // No second scripted response: the adjudication call errors.
+    let h = ambiguous_harness(vec![&extraction]);
+    seed_ambiguous_candidate(&h).await;
+
+    let IngestionOutcome::Ingested(report) = h
+        .ingestion()
+        .execute(&transcript("session-1", "talk"), false)
+        .await
+        .unwrap()
+    else {
+        panic!("expected an ingest");
+    };
+    assert_eq!(
+        report.entity_adjudications, 1,
+        "the attempt is still counted"
+    );
+    assert_eq!(report.entities_adjudicated_same, 0);
+    assert_eq!(
+        h.memories().list_entities().await.unwrap().len(),
+        2,
+        "a failed adjudication must leave a recoverable duplicate, not a merge"
+    );
+}
+
+/// An embedder that places every pair inside the ambiguous band (0.85–0.95),
+/// which no hashing embedder can be aimed at.
+fn ambiguous_harness(responses: Vec<&str>) -> Harness {
+    let mut h = Harness::new(responses);
+    h.ambiguous_embeddings = true;
+    h
+}
+
+async fn seed_ambiguous_candidate(h: &Harness) {
+    h.memories()
+        .upsert_entity(
+            &Entity {
+                id: "entity-ge".into(),
+                entity_type: "person".into(),
+                canonical_name: "gateway-events package".into(),
+                names: Vec::new(),
+                created_at: 1,
+                updated_at: 1,
+            },
+            Some(&ambiguous_seed_vector()),
+        )
+        .await
+        .unwrap();
 }

@@ -16,7 +16,8 @@ use crate::application::{MemoryRef, Recalled};
 use crate::connector::api::controller::{
     self, ForgetOutcome, MemorySearchOutcome, MemoryShowOutcome, SearchScope,
 };
-use crate::domain::{MemoryKind, MemoryNode, MemoryStatus};
+use crate::domain::{Memory, MemoryKind, MemoryNode, MemoryStatus};
+use std::collections::HashMap;
 
 /// `GET /health` — liveness + version.
 pub async fn health() -> Json<Value> {
@@ -35,6 +36,8 @@ pub async fn index() -> Json<Value> {
             "GET  /api/memory/{id}  -> {type: memory, memory, edges} | {type: node, node}",
             "DELETE /api/memory/{id}  -> {retracted: true}",
             "GET  /api/conflicts",
+            "GET  /api/entities",
+            "GET  /api/entities/{id}",
             "GET  /api/tree?uri=",
             "GET  /api/sessions",
             "GET  /api/sessions/discover",
@@ -90,9 +93,16 @@ pub async fn search(
     let limit = params.limit.unwrap_or(10).min(100);
 
     match controller::recall_memories(&state.container, &params.q, kind, &scope, limit).await? {
-        MemorySearchOutcome::Hits(hits) => Ok(Json(json!({
-            "results": hits.iter().map(memory_with_score).collect::<Vec<_>>(),
-        }))),
+        MemorySearchOutcome::Hits(hits) => {
+            let found: Vec<Memory> = hits.iter().map(|h| h.memory.clone()).collect();
+            let labels = controller::entity_labels(&state.container, &found).await?;
+            Ok(Json(json!({
+                "results": hits
+                    .iter()
+                    .map(|h| memory_with_score(h, &labels))
+                    .collect::<Vec<_>>(),
+            })))
+        }
         MemorySearchOutcome::EmptyNamespace(ns) => Ok(Json(json!({
             "results": [],
             "note": format!("namespace '{ns}' has no member projects"),
@@ -123,7 +133,12 @@ pub async fn list_memories(
     let kind = parse_kind(params.kind.as_deref())?;
     let status = parse_status(params.status.as_deref())?;
     let memories = controller::list_memories(&state.container, kind, status).await?;
-    Ok(Json(json!({ "memories": memories })))
+    let labels = controller::entity_labels(&state.container, &memories).await?;
+    let rendered: Vec<Value> = memories
+        .iter()
+        .map(|m| memory_json(m, &labels, None))
+        .collect();
+    Ok(Json(json!({ "memories": rendered })))
 }
 
 /// `GET /api/memory/{id}` — show a memory with its edges, or a node URI.
@@ -132,11 +147,14 @@ pub async fn show(State(state): State<AppState>, Path(id): Path<String>) -> ApiR
         MemoryShowOutcome::Node(node) => {
             Ok(Json(json!({ "type": "node", "node": node_json(&node) })))
         }
-        MemoryShowOutcome::Memory { memory, edges } => Ok(Json(json!({
-            "type": "memory",
-            "memory": memory,
-            "edges": edges,
-        }))),
+        MemoryShowOutcome::Memory { memory, edges } => {
+            let labels = controller::entity_labels(&state.container, &[*memory.clone()]).await?;
+            Ok(Json(json!({
+                "type": "memory",
+                "memory": memory_json(&memory, &labels, None),
+                "edges": edges,
+            })))
+        }
         MemoryShowOutcome::NotFound => Err(ApiError::from(crate::domain::DomainError::not_found(
             format!("no memory matches '{id}'"),
         ))),
@@ -165,6 +183,55 @@ pub async fn delete(
 pub struct TreeParams {
     #[serde(default)]
     pub uri: Option<String>,
+}
+
+/// `GET /api/entities` — the resolved entities memories are anchored to.
+pub async fn entities(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    let entities = controller::list_entities(&state.container).await?;
+    let list: Vec<Value> = entities.iter().map(entity_json).collect();
+    Ok(Json(json!({ "entities": list })))
+}
+
+/// `GET /api/entities/{id}` — one entity with the memories referencing it.
+pub async fn entity(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    let Some((entity, memories)) = controller::show_entity(&state.container, &id).await? else {
+        return Err(ApiError::from(crate::domain::DomainError::not_found(
+            format!("no entity '{id}'"),
+        )));
+    };
+    let labels = controller::entity_labels(&state.container, &memories).await?;
+    Ok(Json(json!({
+        "entity": {
+            "id": entity.id,
+            "canonical_name": entity.canonical_name,
+            "entity_type": entity.entity_type,
+            "names": entity.names,
+            // Same shape as the list endpoint, deliberately. A client decoding
+            // both into one type would otherwise fail on the detail response
+            // for a field it never needed — and a lenient client would just
+            // render an empty pane instead.
+            "memory_count": memories.len(),
+            "created_at": entity.created_at,
+            "updated_at": entity.updated_at,
+        },
+        "memories": memories.iter().map(|m| memory_json(m, &labels, None)).collect::<Vec<_>>(),
+    })))
+}
+
+fn entity_json(summary: &controller::EntitySummary) -> Value {
+    json!({
+        "id": summary.entity.id,
+        "canonical_name": summary.entity.canonical_name,
+        "entity_type": summary.entity.entity_type,
+        // Every name the entity answers to, canonical included. Under "known
+        // as" that reads correctly, and it is also the honest picture of what
+        // the lookup index holds.
+        "names": summary.entity.names,
+        "memory_count": summary.memory_count,
+    })
 }
 
 /// `GET /api/conflicts` — unresolved disagreements, both sides still active.
@@ -357,10 +424,9 @@ pub async fn add_resource(
 /// the answers in their own history. Counts plus the live disagreements are
 /// enough for a client to badge a result; `GET /api/memory/{id}` carries the
 /// full path for the one the user then opens.
-fn memory_with_score(hit: &Recalled) -> Value {
-    let mut value = serde_json::to_value(&hit.memory).unwrap_or_default();
+fn memory_with_score(hit: &Recalled, labels: &HashMap<String, String>) -> Value {
+    let mut value = memory_json(&hit.memory, labels, Some(hit.score));
     if let Some(obj) = value.as_object_mut() {
-        obj.insert("score".to_string(), json!(hit.score));
         obj.insert(
             "provenance".to_string(),
             json!({
@@ -372,6 +438,29 @@ fn memory_with_score(hit: &Recalled) -> Value {
                 "refinements_count": hit.provenance.refinements.len(),
             }),
         );
+    }
+    value
+}
+
+/// A memory as JSON, with its subject/object entity ids resolved to their
+/// canonical names.
+///
+/// The raw `subject`/`object` fields are left exactly as the domain has them —
+/// a client that wants the id still gets it — and the readable form is added
+/// alongside. Replacing them would strip information a caller may need to
+/// follow the graph.
+fn memory_json(memory: &Memory, labels: &HashMap<String, String>, score: Option<f32>) -> Value {
+    let mut value = serde_json::to_value(memory).unwrap_or_default();
+    if let Some(obj) = value.as_object_mut() {
+        if let Some(label) = controller::entity_ref_label(&memory.subject, labels) {
+            obj.insert("subject_label".to_string(), json!(label));
+        }
+        if let Some(label) = controller::entity_ref_label(&memory.object, labels) {
+            obj.insert("object_label".to_string(), json!(label));
+        }
+        if let Some(score) = score {
+            obj.insert("score".to_string(), json!(score));
+        }
     }
     value
 }

@@ -19,6 +19,40 @@ use super::{home_dir, parse_iso8601_secs, tail_preview, truncate_chars};
 const MAX_TITLE_CHARS: usize = 80;
 const PREVIEW_MESSAGES: usize = 6;
 
+/// The workspace folder a thread was rooted in, if Zed recorded one.
+///
+/// `folder_paths` is newline-separated and `folder_paths_order` is a *single*
+/// comma-separated line of indices into it — an easy pair to get backwards.
+/// The first index in that ordering is the workspace's primary root.
+///
+/// Zed supports multi-root workspaces, and a memory can only carry one project,
+/// so a thread spanning several repos is attributed to its primary root. That
+/// is a guess, but a better one than the alternative: `None` means *global*,
+/// and a global memory surfaces in every project's recall rather than one. A
+/// genuinely multi-repo effort is what namespaces are for.
+///
+/// Threads started outside a project have no folders at all — those stay
+/// global, correctly.
+fn primary_folder(folder_paths: &str, folder_order: &str) -> Option<String> {
+    let paths: Vec<&str> = folder_paths
+        .split('\n')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
+    if paths.is_empty() {
+        return None;
+    }
+    let first = folder_order
+        .split(',')
+        .map(str::trim)
+        .find_map(|i| i.parse::<usize>().ok())
+        .and_then(|i| paths.get(i))
+        // A missing or unparseable ordering falls back to declaration order
+        // rather than dropping the folder entirely.
+        .or_else(|| paths.first())?;
+    Some((*first).to_string())
+}
+
 fn db_path() -> Result<std::path::PathBuf, DomainError> {
     Ok(home_dir()?.join("Library/Application Support/Zed/threads/threads.db"))
 }
@@ -34,8 +68,8 @@ pub fn discover() -> Result<Vec<DiscoveredSession>, DomainError> {
 
     let mut stmt = conn
         .prepare(
-            "SELECT id, summary, updated_at, data_type, data \
-             FROM threads ORDER BY updated_at DESC",
+            "SELECT id, summary, updated_at, data_type, data, folder_paths, \
+             folder_paths_order FROM threads ORDER BY updated_at DESC",
         )
         .map_err(|e| DomainError::storage(format!("Zed query prepare failed: {e}")))?;
 
@@ -47,13 +81,15 @@ pub fn discover() -> Result<Vec<DiscoveredSession>, DomainError> {
                 row.get::<_, String>(2).unwrap_or_default(),
                 row.get::<_, String>(3).unwrap_or_default(),
                 row.get::<_, Vec<u8>>(4)?,
+                row.get::<_, String>(5).unwrap_or_default(),
+                row.get::<_, String>(6).unwrap_or_default(),
             ))
         })
         .map_err(|e| DomainError::storage(format!("Zed query failed: {e}")))?;
 
     let mut sessions = Vec::new();
     for row in rows {
-        let (id, summary, updated_at, data_type, blob) =
+        let (id, summary, updated_at, data_type, blob, folder_paths, folder_order) =
             row.map_err(|e| DomainError::storage(format!("Zed row read failed: {e}")))?;
 
         let texts = match thread_texts(&blob, &data_type) {
@@ -78,7 +114,7 @@ pub fn discover() -> Result<Vec<DiscoveredSession>, DomainError> {
         sessions.push(DiscoveredSession {
             source: SessionSource::Zed,
             title: truncate_chars(summary.trim(), MAX_TITLE_CHARS),
-            cwd: None,
+            cwd: primary_folder(&folder_paths, &folder_order),
             updated_at: parse_iso8601_secs(&updated_at).unwrap_or(0),
             message_count: texts.len(),
             approx_tokens: approx_tokens_from_chars(SessionSource::Zed, total_chars),
@@ -232,5 +268,59 @@ mod tests {
         let compressed = zstd::stream::encode_all(&raw[..], 0).unwrap();
         let msgs = thread_messages(&compressed, "zstd").unwrap();
         assert_eq!(msgs[0].content, "compressed hi");
+    }
+}
+
+#[cfg(test)]
+mod folder_tests {
+    use super::primary_folder;
+
+    #[test]
+    fn a_single_root_thread_uses_its_only_folder() {
+        assert_eq!(
+            primary_folder("/home/me/svc-billing", "0").as_deref(),
+            Some("/home/me/svc-billing")
+        );
+    }
+
+    /// The two columns disagree on separator — paths are newline-delimited,
+    /// the ordering is one comma-separated line — which is exactly the kind of
+    /// pair that gets read backwards.
+    #[test]
+    fn a_multi_root_thread_takes_the_primary_root_not_the_first_line() {
+        let paths = "/home/me/svc-a\n/home/me/svc-b\n/home/me/svc-c";
+        assert_eq!(
+            primary_folder(paths, "2,0,1").as_deref(),
+            Some("/home/me/svc-c"),
+            "the ordering column decides which root is primary",
+        );
+        assert_eq!(
+            primary_folder(paths, "0,1,2").as_deref(),
+            Some("/home/me/svc-a"),
+        );
+    }
+
+    /// A thread started outside any project stays global — that is correct, not
+    /// a gap to paper over.
+    #[test]
+    fn a_thread_with_no_folders_is_global() {
+        assert_eq!(primary_folder("", "").as_deref(), None);
+        assert_eq!(primary_folder("   \n  ", "0").as_deref(), None);
+    }
+
+    /// A missing or nonsense ordering must not lose the folder entirely.
+    #[test]
+    fn an_unusable_ordering_falls_back_to_declaration_order() {
+        let paths = "/home/me/svc-a\n/home/me/svc-b";
+        assert_eq!(primary_folder(paths, "").as_deref(), Some("/home/me/svc-a"));
+        assert_eq!(
+            primary_folder(paths, "junk").as_deref(),
+            Some("/home/me/svc-a")
+        );
+        // An index past the end also falls back rather than dropping it.
+        assert_eq!(
+            primary_folder(paths, "9").as_deref(),
+            Some("/home/me/svc-a")
+        );
     }
 }

@@ -18,6 +18,7 @@
 use duckdb::Connection;
 use memory_rs::application::MemoryRepository;
 use memory_rs::domain::{EntityRef, Memory, MemoryKind, MemoryStatus, SourceKind};
+use memory_rs::Predicate;
 use memory_rs::{DuckdbStore, NodeRepository};
 
 const DIMS: usize = 4;
@@ -109,7 +110,7 @@ fn sample_memory(id: &str) -> Memory {
         id: id.to_string(),
         kind: MemoryKind::Fact,
         subject: EntityRef::Entity("entity-1".to_string()),
-        predicate: "uses".to_string(),
+        predicate: Predicate::Uses,
         object: EntityRef::Literal("svc-a".to_string()),
         statement: "the team uses svc-a".to_string(),
         project: Some("owner/repo".to_string()),

@@ -19,7 +19,7 @@ use ratatui::Frame;
 
 use crate::application::{MemoryLink, MemoryRow, RowTarget};
 use crate::connector::api::Container;
-use crate::domain::{EdgeType, EntityRef, NodeKind};
+use crate::domain::{EdgeType, NodeKind};
 use crate::tui::{markdown, theme};
 
 /// How many ranked hits a search shows.
@@ -400,7 +400,7 @@ impl MemoryScreen {
                 spans.push(Span::styled(
                     "• ",
                     Style::default()
-                        .fg(theme::kind_color(memory.kind.as_str()))
+                        .fg(theme::kind_color(memory.memory.kind.as_str()))
                         .bg(bg),
                 ));
                 spans.push(Span::styled(row.label.clone(), label_style(selected, bg)));
@@ -499,18 +499,6 @@ fn label_style(selected: bool, bg: ratatui::style::Color) -> Style {
     }
 }
 
-/// Build the styled detail for the selected row. Items show metadata + content;
-/// nodes show their L0/L1 and, when present, L2; groups/directories show a hint.
-/// `subject`/`object` for display: a resolved entity shows its id, a literal
-/// shows its value.
-fn entity_ref_label(r: &EntityRef) -> String {
-    match r {
-        EntityRef::Entity(id) => format!("@{id}"),
-        EntityRef::Literal(v) if v.is_empty() => "(empty)".to_string(),
-        EntityRef::Literal(v) => v.clone(),
-    }
-}
-
 /// Direction is spelled out rather than drawn, because "supersedes" and
 /// "superseded by" are opposite facts about the memory on screen.
 fn link_phrase(link: &MemoryLink) -> String {
@@ -561,21 +549,29 @@ fn detail_body(row: &MemoryRow) -> Vec<Line<'static>> {
         RowTarget::Memory { memory, links } => {
             let mut lines = vec![
                 Line::from(Span::styled(
-                    format!("[{}] {}", memory.kind.as_str(), memory.statement),
+                    format!(
+                        "[{}] {}",
+                        memory.memory.kind.as_str(),
+                        memory.memory.statement
+                    ),
                     Style::default()
-                        .fg(theme::kind_color(memory.kind.as_str()))
+                        .fg(theme::kind_color(memory.memory.kind.as_str()))
                         .add_modifier(Modifier::BOLD),
                 )),
                 meta_line(&format!(
                     "{}  ·  confidence {:.2}  ·  {}  ·  {}",
-                    memory.source_kind.as_str(),
-                    memory.confidence,
-                    memory.status.as_str(),
-                    memory.project.as_deref().unwrap_or("global"),
+                    memory.memory.source_kind.as_str(),
+                    memory.memory.confidence,
+                    memory.memory.status.as_str(),
+                    memory.memory.project.as_deref().unwrap_or("global"),
                 )),
                 meta_line(&format!(
                     "source: {}",
-                    memory.source_session_id.as_deref().unwrap_or("(unknown)")
+                    memory
+                        .memory
+                        .source_session_id
+                        .as_deref()
+                        .unwrap_or("(unknown)")
                 )),
                 Line::from(""),
                 // The triple behind the statement. Shown because it is what
@@ -583,9 +579,9 @@ fn detail_body(row: &MemoryRow) -> Vec<Line<'static>> {
                 // two memories look alike this is where the difference is.
                 meta_line(&format!(
                     "{} — {} → {}",
-                    entity_ref_label(&memory.subject),
-                    memory.predicate,
-                    entity_ref_label(&memory.object),
+                    memory.subject.as_deref().unwrap_or("?"),
+                    memory.memory.predicate.as_str(),
+                    memory.object.as_deref().unwrap_or("?"),
                 )),
             ];
 
@@ -673,7 +669,7 @@ impl Default for MemoryScreen {
 mod tests {
     use super::*;
     use crate::application::MemoryLink;
-    use crate::domain::MemoryKind;
+    use crate::domain::{EntityRef, MemoryKind, Predicate};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -703,24 +699,28 @@ mod tests {
             preview: None,
             score: None,
             target: RowTarget::Memory {
-                memory: crate::domain::Memory {
-                    id: statement.into(),
-                    kind: MemoryKind::Fact,
-                    subject: EntityRef::Literal("the user".into()),
-                    predicate: "prefers".into(),
-                    object: EntityRef::Literal("tabs".into()),
-                    statement: statement.into(),
-                    project: None,
-                    recorded_at: 1,
-                    valid_from: 1,
-                    valid_to: None,
-                    source_session_id: None,
-                    source_message_index: None,
-                    source_kind: crate::domain::SourceKind::UserStated,
-                    confidence: 0.9,
-                    status: crate::domain::MemoryStatus::Active,
-                    derived: false,
-                    derived_from: Vec::new(),
+                memory: crate::application::LabelledMemory {
+                    subject: Some("the user".into()),
+                    object: Some("tabs".into()),
+                    memory: crate::domain::Memory {
+                        id: statement.into(),
+                        kind: MemoryKind::Fact,
+                        subject: EntityRef::Literal("the user".into()),
+                        predicate: Predicate::Prefers,
+                        object: EntityRef::Literal("tabs".into()),
+                        statement: statement.into(),
+                        project: None,
+                        recorded_at: 1,
+                        valid_from: 1,
+                        valid_to: None,
+                        source_session_id: None,
+                        source_message_index: None,
+                        source_kind: crate::domain::SourceKind::UserStated,
+                        confidence: 0.9,
+                        status: crate::domain::MemoryStatus::Active,
+                        derived: false,
+                        derived_from: Vec::new(),
+                    },
                 },
                 links,
             },

@@ -19,7 +19,7 @@ use duckdb::{params, Row};
 use crate::application::MemoryRepository;
 use crate::domain::{
     DomainError, EdgeOrigin, EdgeType, Entity, EntityRef, Memory, MemoryEdge, MemoryKind,
-    MemoryStatus, MemoryStoreStats, SourceKind,
+    MemoryStatus, MemoryStoreStats, Predicate, SourceKind,
 };
 
 use super::duckdb_store::{
@@ -61,23 +61,26 @@ fn memory_from_row(row: &Row<'_>) -> Result<Memory, duckdb::Error> {
     let source_kind: String = row.get(14)?;
     let status: String = row.get(16)?;
     let derived_from: String = row.get(18)?;
+    let predicate: String = row.get(4)?;
     Ok(Memory {
         id: row.get(0)?,                                            // 0  id
         kind: MemoryKind::parse(&kind).unwrap_or(MemoryKind::Fact), // 1  kind
         subject: EntityRef::from_columns(row.get(2)?, row.get(3)?), // 2,3 subject
-        predicate: row.get(4)?,                                     // 4  predicate
-        object: EntityRef::from_columns(row.get(5)?, row.get(6)?),  // 5,6 object
-        statement: row.get(7)?,                                     // 7  statement
-        project: project_from_column(row.get::<_, String>(8)?),     // 8  project
-        recorded_at: row.get(9)?,                                   // 9  recorded_at
-        valid_from: row.get(10)?,                                   // 10 valid_from
-        valid_to: row.get(11)?,                                     // 11 valid_to
-        source_session_id: row.get(12)?,                            // 12 source_session_id
-        source_message_index: row.get(13)?,                         // 13 source_message_index
+        // Falls back to the escape hatch rather than failing the read: a row
+        // written by a build with a wider vocabulary must stay readable.
+        predicate: Predicate::parse(&predicate).unwrap_or(Predicate::RelatesTo), // 4 predicate
+        object: EntityRef::from_columns(row.get(5)?, row.get(6)?),               // 5,6 object
+        statement: row.get(7)?,                                                  // 7  statement
+        project: project_from_column(row.get::<_, String>(8)?),                  // 8  project
+        recorded_at: row.get(9)?,                                                // 9  recorded_at
+        valid_from: row.get(10)?,                                                // 10 valid_from
+        valid_to: row.get(11)?,                                                  // 11 valid_to
+        source_session_id: row.get(12)?,    // 12 source_session_id
+        source_message_index: row.get(13)?, // 13 source_message_index
         source_kind: SourceKind::parse(&source_kind).unwrap_or(SourceKind::AssistantInferred), // 14
-        confidence: row.get::<_, f64>(15)? as f32,                  // 15 confidence
+        confidence: row.get::<_, f64>(15)? as f32, // 15 confidence
         status: MemoryStatus::parse(&status).unwrap_or(MemoryStatus::Active), // 16 status
-        derived: row.get(17)?,                                      // 17 derived
+        derived: row.get(17)?,              // 17 derived
         derived_from: serde_json::from_str(&derived_from).unwrap_or_default(), // 18 derived_from
     })
 }
@@ -87,7 +90,7 @@ fn entity_from_row(row: &Row<'_>) -> Result<Entity, duckdb::Error> {
         id: row.get(0)?,
         entity_type: row.get(1)?,
         canonical_name: row.get(2)?,
-        aliases: Vec::new(), // filled by a second query; see `load_aliases`
+        names: Vec::new(), // filled by a second query; see `load_names`
         created_at: row.get(3)?,
         updated_at: row.get(4)?,
     })
@@ -139,16 +142,16 @@ fn scope_clause(column: &str, projects: Option<&[String]>) -> String {
 }
 
 impl DuckdbStore {
-    /// Aliases for one entity, ordered for stable output.
-    fn load_aliases(conn: &duckdb::Connection, id: &str) -> Result<Vec<String>, DomainError> {
+    /// Every name one entity goes by, ordered for stable output.
+    fn load_names(conn: &duckdb::Connection, id: &str) -> Result<Vec<String>, DomainError> {
         let mut stmt = conn
-            .prepare("SELECT alias FROM entity_aliases WHERE entity_id = ?1 ORDER BY alias")
-            .map_err(|e| DomainError::storage(format!("Failed to prepare alias query: {e}")))?;
+            .prepare("SELECT name FROM entity_names WHERE entity_id = ?1 ORDER BY name")
+            .map_err(|e| DomainError::storage(format!("Failed to prepare name query: {e}")))?;
         let rows = stmt
             .query_map(params![id], |row| row.get::<_, String>(0))
-            .map_err(|e| DomainError::storage(format!("Failed to query aliases: {e}")))?;
+            .map_err(|e| DomainError::storage(format!("Failed to query names: {e}")))?;
         rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| DomainError::storage(format!("Failed to read aliases: {e}")))
+            .map_err(|e| DomainError::storage(format!("Failed to read names: {e}")))
     }
 }
 
@@ -186,7 +189,7 @@ impl MemoryRepository for DuckdbStore {
                 memory.kind.as_str(),
                 memory.subject.entity_id(),
                 memory.subject.literal(),
-                memory.predicate,
+                memory.predicate.as_str(),
                 memory.object.entity_id(),
                 memory.object.literal(),
                 memory.statement,
@@ -470,10 +473,10 @@ impl MemoryRepository for DuckdbStore {
         )
         .map_err(|e| DomainError::storage(format!("Failed to clear entity vector: {e}")))?;
         conn.execute(
-            "DELETE FROM entity_aliases WHERE entity_id = ?1",
+            "DELETE FROM entity_names WHERE entity_id = ?1",
             params![entity.id],
         )
-        .map_err(|e| DomainError::storage(format!("Failed to clear entity aliases: {e}")))?;
+        .map_err(|e| DomainError::storage(format!("Failed to clear entity names: {e}")))?;
         conn.execute("DELETE FROM entities WHERE id = ?1", params![entity.id])
             .map_err(|e| DomainError::storage(format!("Failed to clear entity: {e}")))?;
 
@@ -489,19 +492,22 @@ impl MemoryRepository for DuckdbStore {
         )
         .map_err(|e| DomainError::storage(format!("Failed to insert entity: {e}")))?;
 
-        // The canonical name resolves like any other alias, and duplicates are
-        // folded away by the primary key rather than rejected.
+        // The canonical name is a name like any other — it is what makes the
+        // lookup one query instead of "the canonical column OR the names
+        // table". Duplicates fold away on the primary key rather than erroring.
         let mut seen = std::collections::HashSet::new();
-        for alias in std::iter::once(&entity.canonical_name).chain(entity.aliases.iter()) {
-            let alias = alias.trim();
-            if alias.is_empty() || !seen.insert(alias.to_lowercase()) {
+        for name in std::iter::once(&entity.canonical_name).chain(entity.names.iter()) {
+            let name = name.trim();
+            let key = name.to_lowercase();
+            if name.is_empty() || !seen.insert(key.clone()) {
                 continue;
             }
             conn.execute(
-                "INSERT OR IGNORE INTO entity_aliases (alias, entity_id) VALUES (?1, ?2)",
-                params![alias, entity.id],
+                "INSERT OR IGNORE INTO entity_names (name, name_key, entity_id) \
+                 VALUES (?1, ?2, ?3)",
+                params![name, key, entity.id],
             )
-            .map_err(|e| DomainError::storage(format!("Failed to insert entity alias: {e}")))?;
+            .map_err(|e| DomainError::storage(format!("Failed to insert entity name: {e}")))?;
         }
 
         if let Some(literal) = literal {
@@ -531,26 +537,28 @@ impl MemoryRepository for DuckdbStore {
             row.map_err(|e| DomainError::storage(format!("Failed to read entity: {e}")))?;
         drop(rows);
         drop(stmt);
-        entity.aliases = Self::load_aliases(&conn, id)?;
+        entity.names = Self::load_names(&conn, id)?;
         Ok(Some(entity))
     }
 
-    async fn find_entity_by_alias(&self, alias: &str) -> Result<Option<Entity>, DomainError> {
+    async fn find_entity_by_name(&self, name: &str) -> Result<Option<Entity>, DomainError> {
         let conn = self.conn.lock().await;
         let id: Option<String> = {
             let mut stmt = conn
                 .prepare(
-                    "SELECT entity_id FROM entity_aliases WHERE lower(alias) = lower(?1) LIMIT 1",
+                    // Matches the pre-lowercased key so the index is usable;
+                    // `lower(name)` here would force a scan.
+                    "SELECT entity_id FROM entity_names WHERE name_key = ?1 LIMIT 1",
                 )
-                .map_err(|e| {
-                    DomainError::storage(format!("Failed to prepare alias lookup: {e}"))
-                })?;
+                .map_err(|e| DomainError::storage(format!("Failed to prepare name lookup: {e}")))?;
             let mut rows = stmt
-                .query_map(params![alias], |row| row.get::<_, String>(0))
-                .map_err(|e| DomainError::storage(format!("Failed to query alias: {e}")))?;
+                .query_map(params![name.trim().to_lowercase()], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(|e| DomainError::storage(format!("Failed to query name: {e}")))?;
             match rows.next() {
                 Some(row) => Some(
-                    row.map_err(|e| DomainError::storage(format!("Failed to read alias: {e}")))?,
+                    row.map_err(|e| DomainError::storage(format!("Failed to read name: {e}")))?,
                 ),
                 None => None,
             }
@@ -560,6 +568,49 @@ impl MemoryRepository for DuckdbStore {
             Some(id) => self.find_entity(&id).await,
             None => Ok(None),
         }
+    }
+
+    async fn memories_for_entity(&self, entity_id: &str) -> Result<Vec<Memory>, DomainError> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {MEMORY_COLUMNS} FROM memories \
+                 WHERE subject_entity_id = ?1 OR object_entity_id = ?1 \
+                 ORDER BY recorded_at DESC"
+            ))
+            .map_err(|e| {
+                DomainError::storage(format!("Failed to prepare entity memory query: {e}"))
+            })?;
+        let rows = stmt
+            .query_map(params![entity_id], memory_from_row)
+            .map_err(|e| DomainError::storage(format!("Failed to query entity memories: {e}")))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| DomainError::storage(format!("Failed to read entity memories: {e}")))
+    }
+
+    async fn find_entities(&self, ids: &[String]) -> Result<Vec<Entity>, DomainError> {
+        let Some(in_list) = id_in_list(ids) else {
+            return Ok(Vec::new());
+        };
+        let conn = self.conn.lock().await;
+        let mut entities: Vec<Entity> = {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT {ENTITY_COLUMNS} FROM entities WHERE id IN ({in_list})"
+                ))
+                .map_err(|e| {
+                    DomainError::storage(format!("Failed to prepare entity batch: {e}"))
+                })?;
+            let rows = stmt
+                .query_map([], entity_from_row)
+                .map_err(|e| DomainError::storage(format!("Failed to query entity batch: {e}")))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| DomainError::storage(format!("Failed to read entity batch: {e}")))?
+        };
+        for entity in &mut entities {
+            entity.names = Self::load_names(&conn, &entity.id)?;
+        }
+        Ok(entities)
     }
 
     async fn list_entities(&self) -> Result<Vec<Entity>, DomainError> {
@@ -577,7 +628,7 @@ impl MemoryRepository for DuckdbStore {
                 .map_err(|e| DomainError::storage(format!("Failed to read entities: {e}")))?
         };
         for entity in &mut entities {
-            entity.aliases = Self::load_aliases(&conn, &entity.id)?;
+            entity.names = Self::load_names(&conn, &entity.id)?;
         }
         Ok(entities)
     }
@@ -615,7 +666,7 @@ impl MemoryRepository for DuckdbStore {
         let conn = self.conn.lock().await;
         let mut out = Vec::with_capacity(scored.len());
         for (mut entity, score) in scored {
-            entity.aliases = Self::load_aliases(&conn, &entity.id)?;
+            entity.names = Self::load_names(&conn, &entity.id)?;
             out.push((entity, score));
         }
         Ok(out)
@@ -648,11 +699,8 @@ impl MemoryRepository for DuckdbStore {
             params![id],
         )
         .map_err(|e| DomainError::storage(format!("Failed to delete entity vector: {e}")))?;
-        conn.execute(
-            "DELETE FROM entity_aliases WHERE entity_id = ?1",
-            params![id],
-        )
-        .map_err(|e| DomainError::storage(format!("Failed to delete entity aliases: {e}")))?;
+        conn.execute("DELETE FROM entity_names WHERE entity_id = ?1", params![id])
+            .map_err(|e| DomainError::storage(format!("Failed to delete entity names: {e}")))?;
         let deleted = conn
             .execute("DELETE FROM entities WHERE id = ?1", params![id])
             .map_err(|e| DomainError::storage(format!("Failed to delete entity: {e}")))?;

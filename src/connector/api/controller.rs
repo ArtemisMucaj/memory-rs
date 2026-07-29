@@ -15,8 +15,8 @@ use crate::application::{
 use crate::connector::adapter::{fetch_resource, parse_transcript_file};
 use crate::connector::api::Container;
 use crate::domain::{
-    DomainError, EdgeType, ImportedSession, Memory, MemoryEdge, MemoryItem, MemoryKind, MemoryNode,
-    MemoryStatus, MemoryStoreStats, NodeKind,
+    DomainError, EdgeType, Entity, ImportedSession, Memory, MemoryEdge, MemoryItem, MemoryKind,
+    MemoryNode, MemoryStatus, MemoryStoreStats, NodeKind,
 };
 
 /// How a memory should be scoped for a search.
@@ -129,6 +129,97 @@ pub async fn recall_memories(
         .execute(query, kind, projects.as_deref(), limit)
         .await?;
     Ok(MemorySearchOutcome::Hits(hits))
+}
+
+/// Canonical names for every entity referenced by `memories`, keyed by id.
+///
+/// A memory stores its subject and object as entity *ids*, which are UUIDs and
+/// mean nothing to a reader. This resolves them in one query so any surface can
+/// render "gateway-events deployment" where the row would otherwise say
+/// `@c95de38f-03e9-463e-…`. Ids with no entity are simply absent; callers fall
+/// back to whatever they had.
+pub async fn entity_labels(
+    container: &Container,
+    memories: &[Memory],
+) -> Result<std::collections::HashMap<String, String>, DomainError> {
+    let mut ids: Vec<String> = memories
+        .iter()
+        .flat_map(|m| [m.subject.entity_id(), m.object.entity_id()])
+        .flatten()
+        .map(str::to_string)
+        .collect();
+    ids.sort();
+    ids.dedup();
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    Ok(container
+        .memory_repository()?
+        .find_entities(&ids)
+        .await?
+        .into_iter()
+        .map(|e| (e.id, e.canonical_name))
+        .collect())
+}
+
+/// A memory's subject/object rendered for display: the entity's canonical name
+/// when it resolves, the literal value otherwise.
+pub fn entity_ref_label(
+    r: &crate::domain::EntityRef,
+    labels: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    match r {
+        crate::domain::EntityRef::Entity(id) => {
+            Some(labels.get(id).cloned().unwrap_or_else(|| id.clone()))
+        }
+        crate::domain::EntityRef::Literal(v) if v.is_empty() => None,
+        crate::domain::EntityRef::Literal(v) => Some(v.clone()),
+    }
+}
+
+/// One entity plus how much of the graph hangs off it.
+pub struct EntitySummary {
+    pub entity: Entity,
+    /// How many memories reference it as subject or object.
+    pub memory_count: usize,
+}
+
+/// Every entity, most-referenced first.
+///
+/// Entities are the graph's spine — two memories about the same thing share one
+/// anchor — but nothing has ever surfaced them, so a mistyped or fragmented
+/// entity was invisible until it caused a bad merge. Ordering by reference
+/// count puts the ones that matter at the top.
+pub async fn list_entities(container: &Container) -> Result<Vec<EntitySummary>, DomainError> {
+    let repo = container.memory_repository()?;
+    let entities = repo.list_entities().await?;
+    let mut out = Vec::with_capacity(entities.len());
+    for entity in entities {
+        let memory_count = repo.memories_for_entity(&entity.id).await?.len();
+        out.push(EntitySummary {
+            entity,
+            memory_count,
+        });
+    }
+    out.sort_by(|a, b| {
+        b.memory_count
+            .cmp(&a.memory_count)
+            .then_with(|| a.entity.canonical_name.cmp(&b.entity.canonical_name))
+    });
+    Ok(out)
+}
+
+/// One entity with the memories that reference it.
+pub async fn show_entity(
+    container: &Container,
+    id: &str,
+) -> Result<Option<(Entity, Vec<Memory>)>, DomainError> {
+    let repo = container.memory_repository()?;
+    let Some(entity) = repo.find_entity(id).await? else {
+        return Ok(None);
+    };
+    let memories = repo.memories_for_entity(id).await?;
+    Ok(Some((entity, memories)))
 }
 
 /// Aggregate memory-store statistics.

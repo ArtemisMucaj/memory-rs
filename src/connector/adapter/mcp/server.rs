@@ -146,18 +146,23 @@ impl MemoryMcpServer {
         .await
         .map_err(internal)?
         {
-            MemorySearchOutcome::Hits(hits) => json!(hits
-                .iter()
-                .map(|hit| {
-                    let mut value = memory_json(&hit.memory, Some(hit.score));
-                    // Compact provenance: enough for the assistant to say "this
-                    // replaced an older answer" or "this is disputed" without
-                    // reading a whole history per result. The full path comes
-                    // back from `read_memory`.
-                    let p = &hit.provenance;
-                    if !p.is_empty() {
-                        if let Some(obj) = value.as_object_mut() {
-                            obj.insert(
+            MemorySearchOutcome::Hits(hits) => {
+                let found: Vec<Memory> = hits.iter().map(|h| h.memory.clone()).collect();
+                let labels = controller::entity_labels(&self.container, &found)
+                    .await
+                    .map_err(internal)?;
+                json!(hits
+                    .iter()
+                    .map(|hit| {
+                        let mut value = memory_json(&hit.memory, &labels, Some(hit.score));
+                        // Compact provenance: enough for the assistant to say "this
+                        // replaced an older answer" or "this is disputed" without
+                        // reading a whole history per result. The full path comes
+                        // back from `read_memory`.
+                        let p = &hit.provenance;
+                        if !p.is_empty() {
+                            if let Some(obj) = value.as_object_mut() {
+                                obj.insert(
                                 "provenance".to_string(),
                                 json!({
                                     "replaced": p.supersedes.len(),
@@ -170,11 +175,12 @@ impl MemoryMcpServer {
                                         .collect::<Vec<_>>(),
                                 }),
                             );
+                            }
                         }
-                    }
-                    value
-                })
-                .collect::<Vec<_>>()),
+                        value
+                    })
+                    .collect::<Vec<_>>())
+            }
             MemorySearchOutcome::EmptyNamespace(ns) => {
                 json!({ "note": format!("namespace '{ns}' has no member projects"), "results": [] })
             }
@@ -195,9 +201,12 @@ impl MemoryMcpServer {
         let memories = controller::list_memories(&self.container, kind, status)
             .await
             .map_err(internal)?;
+        let labels = controller::entity_labels(&self.container, &memories)
+            .await
+            .map_err(internal)?;
         ok_json(&json!(memories
             .iter()
-            .map(|memory| memory_json(memory, None))
+            .map(|memory| memory_json(memory, &labels, None))
             .collect::<Vec<_>>()))
     }
 
@@ -212,7 +221,10 @@ impl MemoryMcpServer {
             .map_err(internal)?
         {
             MemoryShowOutcome::Memory { memory, edges } => {
-                let mut value = memory_json(&memory, None);
+                let labels = controller::entity_labels(&self.container, &[*memory.clone()])
+                    .await
+                    .map_err(internal)?;
+                let mut value = memory_json(&memory, &labels, None);
                 if let Some(obj) = value.as_object_mut() {
                     obj.insert("type".to_string(), json!("memory"));
                     obj.insert(
@@ -370,11 +382,20 @@ impl ServerHandler for MemoryMcpServer {
 /// and an assistant consuming this wants a sentence, not a tuple to reassemble.
 /// `status` is included even though only active memories are ever returned, so a
 /// caller reading a specific id can see why one it expected is missing.
-fn memory_json(memory: &Memory, score: Option<f32>) -> serde_json::Value {
+fn memory_json(
+    memory: &Memory,
+    labels: &std::collections::HashMap<String, String>,
+    score: Option<f32>,
+) -> serde_json::Value {
     let mut value = json!({
         "id": memory.id,
         "kind": memory.kind.as_str(),
         "statement": memory.statement,
+        // The readable subject — an entity id would be meaningless to a model
+        // deciding whether this memory answers the question.
+        "subject": controller::entity_ref_label(&memory.subject, labels),
+        "predicate": memory.predicate,
+        "object": controller::entity_ref_label(&memory.object, labels),
         "project": memory.project,
         "status": memory.status.as_str(),
         "source_kind": memory.source_kind.as_str(),

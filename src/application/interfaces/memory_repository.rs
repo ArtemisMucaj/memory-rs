@@ -147,8 +147,8 @@ pub trait MemoryRepository: Send + Sync {
 
     // ── Entities ─────────────────────────────────────────────────────────
 
-    /// Insert or replace an entity (and its aliases), keyed by id, with its
-    /// optional name embedding.
+    /// Insert or replace an entity (and every name it goes by), keyed by id,
+    /// with its optional name embedding.
     async fn upsert_entity(
         &self,
         entity: &Entity,
@@ -158,9 +158,30 @@ pub trait MemoryRepository: Send + Sync {
     /// Fetch an entity by id.
     async fn find_entity(&self, id: &str) -> Result<Option<Entity>, DomainError>;
 
-    /// Resolve an entity by an exact (case-insensitive) match on its canonical
-    /// name or any alias. The cheap first leg of entity resolution.
-    async fn find_entity_by_alias(&self, alias: &str) -> Result<Option<Entity>, DomainError>;
+    /// Resolve an entity by an exact (case-insensitive) match on any name it
+    /// goes by, canonical or learned.
+    ///
+    /// The cheap leg of entity resolution, and the one that short-circuits
+    /// *before* the embedding call — which is why it stays even though
+    /// similarity search would also find an exact match. It is also the only
+    /// leg that works when embeddings are disabled.
+    async fn find_entity_by_name(&self, name: &str) -> Result<Option<Entity>, DomainError>;
+
+    /// Memories referencing `entity_id` as subject or object, newest first.
+    ///
+    /// The FK points memory → entity, so this is the reverse direction and the
+    /// only way to answer "what do we know about this thing". Both columns are
+    /// searched because an entity is as often the object of a memory as the
+    /// subject.
+    async fn memories_for_entity(&self, entity_id: &str) -> Result<Vec<Memory>, DomainError>;
+
+    /// Fetch many entities by id in one query. Unknown ids are skipped.
+    ///
+    /// Every surface renders a memory's subject and object, and a raw entity id
+    /// is meaningless to a reader — the canonical name is the short, humane
+    /// label the graph already holds. Resolving those one at a time would be an
+    /// N+1 per rendered list.
+    async fn find_entities(&self, ids: &[String]) -> Result<Vec<Entity>, DomainError>;
 
     /// List all entities, newest first.
     async fn list_entities(&self) -> Result<Vec<Entity>, DomainError>;
@@ -182,7 +203,7 @@ pub trait MemoryRepository: Send + Sync {
     /// behaviour — is untouched, and only an internal foreign key is repaired.
     async fn repoint_entity(&self, from: &str, to: &str) -> Result<usize, DomainError>;
 
-    /// Delete an entity along with its aliases and vector. Only safe once
+    /// Delete an entity along with its names and vector. Only safe once
     /// [`Self::repoint_entity`] has moved its memories elsewhere.
     async fn delete_entity(&self, id: &str) -> Result<bool, DomainError>;
 

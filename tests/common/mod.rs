@@ -1,5 +1,9 @@
 //! Shared test doubles for the LLM and embedding backends.
 //!
+//! `#![allow(dead_code)]` because this module is compiled *into each test
+//! binary separately* — anything one file does not happen to use is dead code
+//! from that binary's point of view, even though another file relies on it.
+//!
 //! These implement the [`openai_rs`] ports directly, so the use cases under
 //! test are wired exactly as production wires them — only the far side of the
 //! network boundary is replaced. Everything below the use case (the DuckDB
@@ -7,6 +11,8 @@
 //!
 //! Lives in `tests/common/` because both the item pipeline and the memory
 //! pipeline need the same two doubles, and a second copy would drift.
+
+#![allow(dead_code)]
 
 use async_trait::async_trait;
 use tokio::sync::Mutex;
@@ -44,6 +50,60 @@ pub fn embed_text(text: &str) -> Vec<f32> {
         *x /= norm;
     }
     v
+}
+
+/// An embedding client that returns the *same* vector for every input.
+///
+/// Every pair therefore scores 1.0, which is the only way to exercise the
+/// attribution path deterministically: [`MockEmbeddingClient`] hashes bytes, so
+/// the cosine between two arbitrary strings is whatever the hash happens to
+/// produce and cannot be aimed at a threshold. The threshold logic itself is
+/// unit-tested separately; this double exists to drive the *wiring*.
+pub struct ConstantEmbeddingClient;
+
+#[async_trait]
+impl EmbeddingClient for ConstantEmbeddingClient {
+    async fn embed_batch(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>, OpenAiError> {
+        let mut unit = vec![0.0f32; DIMS];
+        unit[0] = 1.0;
+        Ok(inputs.iter().map(|_| unit.clone()).collect())
+    }
+
+    fn model(&self) -> &str {
+        "constant-embedding"
+    }
+}
+
+/// An embedding client whose vectors land every pair inside the *ambiguous*
+/// band (0.85–0.95) — the only region where the adjudication tier runs.
+///
+/// It returns a fixed unit vector tilted slightly off-axis, so the cosine
+/// against [`ambiguous_seed_vector`] is ~0.906: close to the real 0.907 that
+/// `gateway-events package` and `gateway-events service` produced, and a value
+/// no hashing embedder could be aimed at.
+pub struct AmbiguousEmbeddingClient;
+
+/// The vector to seed a candidate entity with so it sits in the band relative
+/// to whatever [`AmbiguousEmbeddingClient`] produces.
+pub fn ambiguous_seed_vector() -> Vec<f32> {
+    let mut v = vec![0.0f32; DIMS];
+    v[0] = 1.0;
+    v
+}
+
+#[async_trait]
+impl EmbeddingClient for AmbiguousEmbeddingClient {
+    async fn embed_batch(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>, OpenAiError> {
+        // cos = 1/sqrt(1 + 0.44^2) ≈ 0.915 against the unit seed vector.
+        let mut v = vec![0.0f32; DIMS];
+        v[0] = 1.0;
+        v[1] = 0.44;
+        Ok(inputs.iter().map(|_| v.clone()).collect())
+    }
+
+    fn model(&self) -> &str {
+        "ambiguous-embedding"
+    }
 }
 
 const SUMMARY_REPLY: &str = r#"{"abstract": "Test session summary.", "overview": "- did a thing"}"#;

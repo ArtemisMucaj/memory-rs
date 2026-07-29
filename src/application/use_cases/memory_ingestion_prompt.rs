@@ -17,7 +17,7 @@
 //! *atomic* memories, which are individually smaller and therefore easier for a
 //! model to emit thoughtlessly in bulk.
 
-use crate::domain::{Memory, MemoryKind, SessionTranscript};
+use crate::domain::{Memory, MemoryKind, Predicate, SessionTranscript};
 
 /// Maximum characters of conversation text sent to the extraction model.
 ///
@@ -35,21 +35,57 @@ const MAX_PRIOR_MEMORY_CHARS: usize = 400;
 /// System prompt: what a memory is, which kinds exist, and when to relate a new
 /// memory to a prior one.
 pub fn system_prompt() -> String {
+    let relations = Predicate::ALL
+        .iter()
+        .map(|p| format!("- `{}` — {}", p.as_str(), p.meaning()))
+        .collect::<Vec<_>>()
+        .join("\n");
     r#"You extract what is worth remembering from a finished coding-assistant session, as atomic MEMORIES.
 
 A memory is ONE subject–predicate–object fact worth remembering across sessions. Keep it atomic: one fact per memory. If a sentence contains two facts, emit two memories.
 
 ## Memory shape
 
-- `subject` — what the memory is about (usually a person, project, or tool). `subject_is_entity` is almost always true.
+- `subject` — what the memory is about. Set `subject_is_entity` true only when it is an entity by the test under "Entities" below.
 - `subject_type` — one of: person, project, tool, place, organization, concept, unknown. Use `unknown` only when genuinely unclear; a wrong guess is worse than `unknown`, because entities of differing types are never merged.
-- `predicate` — a short snake_case relation: prefers, uses, decided, lives_in, requires, avoids.
-- `object` — the value. Set `object_is_entity` true when it names a distinct entity (a project, tool, person), false when it is a literal value ("tabs", "4", "2025-01-01").
+- `predicate` — the relation, chosen from the CLOSED list under "Relations" below. You must use one of those exact values and nothing else.
+- `object` — the value. Set `object_is_entity` true only when it names a distinct entity by that same test; false for a literal value ("tabs", "4", "2025-01-01", a file path, an error message).
 - `object_type` — same vocabulary as `subject_type`. Ignored when `object_is_entity` is false.
 - `statement` — a short, self-contained sentence rendering the triple. This is what gets embedded and shown to a human, so it must read on its own without the subject/predicate/object fields.
 - `kind` — see below.
 - `source_kind` — `user_stated` if the USER asserted it directly, `assistant_inferred` if you concluded it from context. Be honest: this field decides who wins a future contradiction, and inflating it lets a guess overwrite something the user actually said.
 - `confidence` — 0..1.
+
+## Entities
+
+An entity is a **durable thing that recurs across sessions** — a person, a repository or service, a tool, a team, a place, a standing concept. It is an *anchor*: every memory about the same thing must point at the same entity, and that is the only reason the store is a graph rather than a list.
+
+Apply this test: **would this still be referred to by name in six months, in a different conversation?**
+
+These are **not** entities. Mark them `is_entity: false` and let them be plain values:
+- a file, path, directory, function, class, variable or symbol
+- a commit, branch, pull request or ticket
+- a version number, error message, log line or environment variable
+- anything that exists only inside the change you are discussing
+
+If a memory's natural subject is a specific file or symbol, the memory is almost always really about the **component, service or repository that file belongs to**. Use that as the subject and put the specific detail in the statement. "src/auth/token.rs validates JWTs" is better recorded as the auth service validating JWTs.
+
+Getting this wrong is expensive in a way that is not obvious: a file promoted to an entity becomes a permanent anchor that nothing will ever reference again, and it is typed wrongly too — there is no file type in the list, so it lands as `project` and blocks that name from ever merging with the real project.
+
+## Relations
+
+`predicate` must be **exactly one** of these. Pick on meaning, not on which word looks closest to the sentence — the relation is half of how two memories are recognised as the same fact, so an invented synonym silently stores the same thing twice.
+
+{{RELATIONS}}
+
+Before reaching for `relates_to`, **read the list again**. It is the last resort, not the default — a memory that lands there is one the store cannot group with anything, so it is close to useless. In practice it is almost always wrong:
+
+- "X involves A and B", "X consists of A and B", "X has parts A and B" → `contains`
+- "X was built to mirror Y", "X is based on Y" → `derived_from`
+- "X needs Y to work" → `requires`
+- "X sets up Y" → `configures`
+
+Use `relates_to` only when you have checked every entry and none of them expresses the relation. Do not invent a relation and do not stretch one that nearly fits.
 
 ## Kinds
 
@@ -71,6 +107,7 @@ The bar is HIGH. Prefer FEWER, higher-value memories. An empty list is better th
 Before emitting a memory, apply the "still useful in 3 months?" test. If it is a snapshot of what this session did, DROP it:
 - DO store: an architectural decision and why; a stable tooling choice; a durable user habit.
 - Do NOT store: a version number being bumped to, which files a change touched, "the current failure is caused by X", or any in-flight state. These are session logs, not durable memories.
+- In particular, an edit to a document or file — "the section about X was removed", "a paragraph was added" — is a change record, not a fact. The durable version, if there is one, is what the code or the decision now *is*.
 
 User-authored messages are the source of truth for preferences and for facts about the user; assistant and tool activity is the source for experiences and skills. Never invent anything the transcript does not support.
 
@@ -89,10 +126,11 @@ Only set `relation` when you are confident about the target id; omit it otherwis
 
 Respond with ONLY a JSON object — no prose, no markdown fence:
 
-{"memories": [{"subject": "...", "subject_is_entity": true, "subject_type": "person", "predicate": "...", "object": "...", "object_is_entity": false, "object_type": "unknown", "statement": "...", "kind": "preference", "source_kind": "user_stated", "confidence": 0.9}]}
+{"memories": [{"subject": "...", "subject_is_entity": true, "subject_type": "person", "predicate": "uses", "object": "...", "object_is_entity": false, "object_type": "unknown", "statement": "...", "kind": "preference", "source_kind": "user_stated", "confidence": 0.9}]}
 
 Return `{"memories": []}` when the session contains nothing worth remembering."#
         .to_string()
+        .replace("{{RELATIONS}}", &relations)
 }
 
 /// User prompt: prior memories (with ids) followed by the conversation.
@@ -220,6 +258,38 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
     format!("{truncated}...")
 }
 
+/// System prompt for entity adjudication — the tier that runs *only* in the
+/// ambiguous similarity band, where two names are too close to call apart and
+/// too far to merge outright.
+pub fn entity_adjudication_system_prompt() -> String {
+    "You decide whether two names refer to the same thing.\n\n     You are given two names that a similarity search found close but not      identical, with the kind of thing each is believed to be and an example of      how each was used.\n\n     Answer `true` only if a reader would consider them the *same* thing under      two names — a service and its abbreviation, a repository and its full path,      a person and their handle.\n\n     Answer `false` when they are related but distinct: a package and the service      that consumes it, a project and one of its components, two services sharing      a prefix. Being about the same area is not being the same thing.\n\n     When genuinely unsure, answer `false`. Merging two distinct entities cannot      be undone — every memory anchored to either one silently becomes a memory      about a thing that does not exist — whereas leaving a duplicate merely means      a later pass can still merge it.\n\n     Respond with ONLY a JSON object: {\"same\": true|false}"
+        .to_string()
+}
+
+/// User prompt for one adjudication.
+pub fn entity_adjudication_user_prompt(
+    a_name: &str,
+    a_type: &str,
+    a_example: &str,
+    b_name: &str,
+    b_type: &str,
+    b_example: &str,
+) -> String {
+    format!(
+        "A: {a_name}\n  kind: {a_type}\n  seen in: {a_example}\n\n         B: {b_name}\n  kind: {b_type}\n  seen in: {b_example}\n\n         Are A and B the same thing?"
+    )
+}
+
+/// JSON Schema for the adjudication answer.
+pub fn entity_adjudication_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": { "same": { "type": "boolean" } },
+        "required": ["same"],
+        "additionalProperties": false
+    })
+}
+
 /// JSON Schema for the extraction output, kept flat for structured-output
 /// backends. Mirrors the `RawIngestion` / `RawMemory` / `RawRelation` structs in
 /// [`memory_ingestion`](super::memory_ingestion).
@@ -245,7 +315,10 @@ pub fn schema() -> serde_json::Value {
                         "subject": { "type": "string" },
                         "subject_is_entity": { "type": "boolean" },
                         "subject_type": { "type": "string", "enum": entity_types },
-                        "predicate": { "type": "string" },
+                        "predicate": {
+                            "type": "string",
+                            "enum": Predicate::ALL.iter().map(|p| p.as_str()).collect::<Vec<_>>()
+                        },
                         "object": { "type": "string" },
                         "object_is_entity": { "type": "boolean" },
                         "object_type": { "type": "string", "enum": entity_types },
@@ -396,7 +469,7 @@ mod tests {
             id: "memory-1".to_string(),
             kind: MemoryKind::Preference,
             subject: crate::domain::EntityRef::Entity("entity-1".to_string()),
-            predicate: "prefers".to_string(),
+            predicate: Predicate::Prefers,
             object: crate::domain::EntityRef::Literal("tabs".to_string()),
             statement: "the user prefers tabs".to_string(),
             project: None,
@@ -416,6 +489,42 @@ mod tests {
 
         let none = user_prompt(&transcript(vec![message("user", "hi")]), &[]);
         assert!(none.contains("PRIOR MEMORIES: (none)"));
+    }
+
+    /// The prompt and the schema must offer the *same* closed set. If they ever
+    /// drift, a structured-output backend rejects a value the prompt asked for
+    /// — or worse, a lenient backend lets through a value the prompt never
+    /// mentioned and every one of those memories lands on `relates_to`.
+    #[test]
+    fn relations_block_lists_every_predicate_and_matches_the_schema() {
+        let prompt = system_prompt();
+        for p in Predicate::ALL {
+            assert!(
+                prompt.contains(&format!("`{}`", p.as_str())),
+                "predicate '{}' missing from the prompt's Relations list",
+                p.as_str(),
+            );
+            assert!(
+                prompt.contains(p.meaning()),
+                "predicate '{}' has no meaning in the prompt",
+                p.as_str(),
+            );
+        }
+        assert!(
+            !prompt.contains("{{RELATIONS}}"),
+            "placeholder not substituted"
+        );
+
+        let schema = schema();
+        let enumerated: Vec<&str> = schema["properties"]["memories"]["items"]["properties"]
+            ["predicate"]["enum"]
+            .as_array()
+            .expect("predicate must be an enum in the schema")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        let expected: Vec<&str> = Predicate::ALL.iter().map(|p| p.as_str()).collect();
+        assert_eq!(enumerated, expected);
     }
 
     #[test]
@@ -450,5 +559,23 @@ mod tests {
             .map(|v| v.as_str().unwrap())
             .collect();
         assert_eq!(kinds, ["preference", "experience", "skill", "fact"]);
+    }
+}
+
+#[cfg(test)]
+mod entity_guidance {
+    use super::*;
+    /// The failure this guards: the prompt used to say `subject_is_entity` is
+    /// "almost always true", which promoted files and symbols to permanent
+    /// anchors that nothing ever references again — and, with no file type in
+    /// the list, typed them `project`, blocking the real project from merging.
+    #[test]
+    fn the_prompt_says_what_is_not_an_entity() {
+        let p = system_prompt();
+        assert!(p.contains("## Entities"));
+        assert!(!p.contains("almost always true"));
+        for excluded in ["file", "commit", "version number", "symbol"] {
+            assert!(p.contains(excluded), "entity guidance omits {excluded:?}");
+        }
     }
 }

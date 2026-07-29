@@ -67,6 +67,8 @@ pub fn routes(state: AppState) -> Router {
             get(handlers::show).delete(handlers::delete),
         )
         .route("/api/conflicts", get(handlers::conflicts))
+        .route("/api/entities", get(handlers::entities))
+        .route("/api/entities/{id}", get(handlers::entity))
         .route("/api/tree", get(handlers::tree))
         .route("/api/sessions", get(handlers::sessions))
         .route("/api/stats", get(handlers::stats))

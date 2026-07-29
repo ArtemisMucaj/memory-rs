@@ -58,12 +58,12 @@ use openai_rs::ChatClient;
 
 use crate::application::interfaces::{Embedder, MemoryRepository};
 use crate::application::use_cases::llm_json::{
-    extract_json_object, normalize_name, repair_json_string_escapes, unix_now,
+    extract_json_object, repair_json_string_escapes, unix_now,
 };
 use crate::application::use_cases::memory_ingestion_prompt as prompt;
 use crate::domain::{
     DomainError, EdgeOrigin, EdgeType, Entity, EntityRef, Memory, MemoryEdge, MemoryKind,
-    MemoryStatus, SessionTranscript, SourceKind,
+    MemoryStatus, Predicate, SessionTranscript, SourceKind,
 };
 
 /// How many prior memories are prefetched into the extraction context.
@@ -82,6 +82,70 @@ const MAX_MEMORIES_PER_RUN: usize = 32;
 /// [`CONFIDENCE_MARGIN`]: crate::domain::CONFIDENCE_MARGIN
 const CORROBORATION_BUMP: f32 = 0.05;
 
+/// How many entity candidates the similarity search considers. Only the best
+/// is ever used; the rest exist so a type conflict on the top hit does not hide
+/// a correct second one from the logs.
+const ENTITY_CANDIDATES: usize = 5;
+
+/// Cosine similarity at or above which a surface form is attributed to an
+/// existing entity outright.
+///
+/// Deliberately high. A wrong attribution silently merges two distinct things
+/// and there is no supersession chain to undo it with — unlike a memory, an
+/// entity has no history. Missing a match merely leaves a duplicate for the
+/// consolidation pass to merge later, which is the cheaper mistake.
+const ATTRIBUTE_THRESHOLD: f32 = 0.95;
+
+/// Below [`ATTRIBUTE_THRESHOLD`] but at or above this, a match is close enough
+/// that a human might call it the same entity. Nothing is done — the case is
+/// only counted, as evidence for whether an adjudication step is worth adding.
+const AMBIGUOUS_THRESHOLD: f32 = 0.85;
+
+/// What the similarity search's best candidate warrants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Attribution {
+    /// Confident enough: reuse the entity and teach it this surface form.
+    Attribute,
+    /// Close enough to be arguable, not close enough to act on. Counted, so the
+    /// size of this band is the evidence for whether an adjudication step would
+    /// earn its cost.
+    Ambiguous,
+    /// Different things.
+    Distinct,
+}
+
+/// Decide what a candidate match warrants. Pure, so the thresholds and the type
+/// guard can be tested exhaustively without a store or an embedder — which
+/// matters because a hash-based test embedder cannot produce a meaningful
+/// cosine score near the boundary.
+pub(crate) fn attribution_for(score: f32, existing_type: &str, new_type: &str) -> Attribution {
+    // Never attribute across two entities the model typed differently. A wrong
+    // merge is unrecoverable — an entity carries no supersession chain the way
+    // a memory does — so this errs toward keeping them apart. `unknown` matches
+    // anything, because it asserts nothing.
+    let types_conflict = existing_type != new_type
+        && existing_type != UNKNOWN_ENTITY_TYPE
+        && new_type != UNKNOWN_ENTITY_TYPE;
+    if types_conflict {
+        return Attribution::Distinct;
+    }
+    if score >= ATTRIBUTE_THRESHOLD {
+        Attribution::Attribute
+    } else if score >= AMBIGUOUS_THRESHOLD {
+        Attribution::Ambiguous
+    } else {
+        Attribution::Distinct
+    }
+}
+
+/// Most adjudication calls one ingestion will make.
+///
+/// Each is a model round-trip on the write path, so the band that reaches this
+/// tier has to stay small. Beyond the cap the run falls back to treating the
+/// remaining ambiguities as distinct — a duplicate entity a later pass can
+/// merge, which is the recoverable failure.
+const MAX_ADJUDICATIONS_PER_RUN: usize = 8;
+
 /// Default entity type when the model does not supply a usable one.
 ///
 /// `unknown` is load-bearing rather than a null: consolidation refuses to merge
@@ -96,6 +160,21 @@ pub struct IngestionReport {
     pub memories_written: usize,
     pub entities_created: usize,
     pub edges_added: usize,
+    /// Surface forms attributed to an existing entity by similarity rather than
+    /// by an exact name match — the fragmentation this prevented.
+    pub entities_attributed: usize,
+    /// Near-misses: close enough to be arguable, not close enough to attribute
+    /// on the score alone. Each one reaching the cap becomes an adjudication.
+    pub entities_ambiguous: usize,
+    /// Adjudication calls made — the cost this tier actually incurred.
+    pub entity_adjudications: usize,
+    /// Adjudications that came back "same thing", so a duplicate anchor was
+    /// avoided. The ratio against `entity_adjudications` says whether the
+    /// ambiguous band is worth calling a model over at all.
+    pub entities_adjudicated_same: usize,
+    /// Memories whose predicate fell outside the closed vocabulary and landed
+    /// on `relates_to`. The metric for whether [`Predicate`] needs extending.
+    pub predicates_out_of_vocabulary: usize,
     /// Contradictions recorded. Both sides stay active and keep answering; the
     /// disagreement is consolidation's to reconcile.
     pub conflicts_recorded: usize,
@@ -247,7 +326,10 @@ fn duplicate_key(memory: &Memory) -> String {
     format!(
         "{}|{}|{}|{}",
         part(&memory.subject),
-        normalize_name(&memory.predicate).unwrap_or_default(),
+        // No normalization needed any more: the predicate is a closed enum, so
+        // its stored form is already canonical. That is the whole point of
+        // constraining it — surface drift can no longer split one fact in two.
+        memory.predicate.as_str(),
         part(&memory.object),
         memory.project.as_deref().unwrap_or(""),
     )
@@ -398,18 +480,34 @@ impl MemoryIngestionUseCase {
                 break;
             }
             let statement = raw_memory.statement.trim();
-            if statement.is_empty() || raw_memory.predicate.trim().is_empty() {
+            if statement.is_empty() {
                 continue;
             }
+            // A predicate outside the vocabulary falls back to the escape hatch
+            // rather than dropping the memory — losing a real fact over a word
+            // choice is the worse failure — but it is counted, because a rising
+            // share of these is the evidence that the list needs extending.
+            let predicate = match Predicate::parse(&raw_memory.predicate) {
+                Some(p) => p,
+                None => {
+                    report.predicates_out_of_vocabulary += 1;
+                    debug!(
+                        "predicate '{}' is outside the vocabulary; recorded as relates_to",
+                        raw_memory.predicate.trim()
+                    );
+                    Predicate::RelatesTo
+                }
+            };
 
             let subject = self
                 .resolve_ref(
                     &raw_memory.subject,
                     raw_memory.subject_is_entity,
                     &raw_memory.subject_type,
+                    statement,
                     now,
                     &mut entity_cache,
-                    &mut report.entities_created,
+                    &mut report,
                 )
                 .await?;
             let object = self
@@ -417,9 +515,10 @@ impl MemoryIngestionUseCase {
                     &raw_memory.object,
                     raw_memory.object_is_entity,
                     &raw_memory.object_type,
+                    statement,
                     now,
                     &mut entity_cache,
-                    &mut report.entities_created,
+                    &mut report,
                 )
                 .await?;
 
@@ -427,7 +526,7 @@ impl MemoryIngestionUseCase {
                 id: Uuid::new_v4().to_string(),
                 kind: MemoryKind::parse(&raw_memory.kind).unwrap_or(MemoryKind::Fact),
                 subject,
-                predicate: raw_memory.predicate.trim().to_string(),
+                predicate,
                 object,
                 statement: statement.to_string(),
                 project: transcript.project.clone(),
@@ -561,17 +660,36 @@ impl MemoryIngestionUseCase {
         Ok(())
     }
 
-    /// Resolve a subject/object surface form to an [`EntityRef`]. Literals pass
-    /// through; entity references resolve against existing aliases and are
-    /// created (and embedded) on first sight, cached within the run.
+    /// Resolve a subject/object surface form to an [`EntityRef`].
+    ///
+    /// Literals pass through. Entity references climb a ladder, cheapest first:
+    ///
+    /// 1. the in-run cache,
+    /// 2. an exact (case-insensitive) match on a name the entity goes by,
+    /// 3. a cosine search over entity-name embeddings,
+    /// 4. otherwise a new entity.
+    ///
+    /// Step 3 is what stops the graph fragmenting. Without it, "gateway-events",
+    /// "the gateway-events service" and "gateway events" are three permanent
+    /// anchors that never connect, because step 2 only ever matches a string
+    /// somebody already wrote down.
+    ///
+    /// And when step 3 hits, the surface form is **recorded as a name**. That
+    /// is the half that compounds: the variant costs one vector search once,
+    /// and every later sighting is a free exact match. An attribution mechanism
+    /// that does not remember its own decisions re-pays for them forever.
+    #[allow(clippy::too_many_arguments)]
     async fn resolve_ref(
         &self,
         surface: &str,
         is_entity: bool,
         entity_type: &str,
+        // The statement this mention appears in — context for adjudication,
+        // which needs to see how a name is *used*, not just how it is spelled.
+        statement: &str,
         now: i64,
         cache: &mut HashMap<String, String>,
-        created: &mut usize,
+        report: &mut IngestionReport,
     ) -> Result<EntityRef, DomainError> {
         let trimmed = surface.trim();
         if !is_entity || trimmed.is_empty() {
@@ -581,29 +699,163 @@ impl MemoryIngestionUseCase {
         if let Some(id) = cache.get(&key) {
             return Ok(EntityRef::Entity(id.clone()));
         }
-        if let Some(existing) = self.memory_repo.find_entity_by_alias(trimmed).await? {
+        if let Some(existing) = self.memory_repo.find_entity_by_name(trimmed).await? {
             cache.insert(key, existing.id.clone());
             return Ok(EntityRef::Entity(existing.id));
         }
+
         let entity_type = match entity_type.trim() {
             "" => UNKNOWN_ENTITY_TYPE.to_string(),
             t => t.to_lowercase(),
         };
+
+        // The embedding covers name *and* type, so "gateway-events (project)"
+        // and "gateway-events (tool)" do not collapse into each other.
+        let embedding_text = format!("{trimmed} ({entity_type})");
+        let vector = self.embed_opt(&embedding_text).await;
+
+        if let Some(vector) = vector.as_deref() {
+            if let Some(existing) = self
+                .attribute_by_similarity(trimmed, &entity_type, statement, vector, report)
+                .await?
+            {
+                cache.insert(key, existing.clone());
+                return Ok(EntityRef::Entity(existing));
+            }
+        }
+
         let entity = Entity {
             id: Uuid::new_v4().to_string(),
             entity_type,
             canonical_name: trimmed.to_string(),
-            aliases: Vec::new(),
+            names: Vec::new(),
             created_at: now,
             updated_at: now,
         };
-        let vector = self.embed_opt(&entity.canonical_name).await;
         self.memory_repo
             .upsert_entity(&entity, vector.as_deref())
             .await?;
-        *created += 1;
+        report.entities_created += 1;
         cache.insert(key, entity.id.clone());
         Ok(EntityRef::Entity(entity.id))
+    }
+
+    /// Attribute `surface` to an existing entity by embedding similarity,
+    /// returning its id and teaching it the new name.
+    ///
+    /// Only a confident match attributes. The band below
+    /// [`ATTRIBUTE_THRESHOLD`] but above [`AMBIGUOUS_THRESHOLD`] is where a
+    /// human — or a model with more context than this path has — would have to
+    /// decide, so nothing is done except *count* it. That count is the evidence
+    /// for whether an adjudication step is worth adding: if the band is empty
+    /// in practice, an LLM tier here would be cost with no benefit.
+    #[allow(clippy::too_many_arguments)]
+    async fn attribute_by_similarity(
+        &self,
+        surface: &str,
+        entity_type: &str,
+        statement: &str,
+        vector: &[f32],
+        report: &mut IngestionReport,
+    ) -> Result<Option<String>, DomainError> {
+        let candidates = self
+            .memory_repo
+            .search_entities_semantic(vector, ENTITY_CANDIDATES)
+            .await?;
+        let Some((entity, score)) = candidates.into_iter().next() else {
+            return Ok(None);
+        };
+        match attribution_for(score, &entity.entity_type, entity_type) {
+            Attribution::Attribute => {}
+            Attribution::Ambiguous => {
+                report.entities_ambiguous += 1;
+                // Too close to call from the score alone. This is the one place
+                // a model call earns its cost: the alternative is a permanent
+                // duplicate anchor, and the answer gets memoized as a name, so
+                // a given variant is adjudicated once ever — not once a session.
+                if report.entity_adjudications >= MAX_ADJUDICATIONS_PER_RUN {
+                    debug!("adjudication cap reached; '{surface}' recorded separately");
+                    return Ok(None);
+                }
+                report.entity_adjudications += 1;
+                if !self
+                    .adjudicate_same_entity(surface, entity_type, &entity, statement)
+                    .await
+                {
+                    return Ok(None);
+                }
+                report.entities_adjudicated_same += 1;
+            }
+            Attribution::Distinct => return Ok(None),
+        }
+
+        // Teach the entity the surface form that just resolved to it, so the
+        // next sighting takes the free exact path.
+        let mut learned = entity.clone();
+        if !learned
+            .names
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case(surface))
+            && !learned.canonical_name.eq_ignore_ascii_case(surface)
+        {
+            learned.names.push(surface.to_string());
+        }
+        // `upsert_entity` replaces the row and its vector, so the vector is
+        // re-supplied: passing `None` would silently drop this entity out of
+        // the very search that just found it.
+        let existing_vector = self
+            .embed_opt(&format!(
+                "{} ({})",
+                learned.canonical_name, learned.entity_type
+            ))
+            .await;
+        self.memory_repo
+            .upsert_entity(&learned, existing_vector.as_deref())
+            .await?;
+        report.entities_attributed += 1;
+        Ok(Some(entity.id))
+    }
+
+    /// Ask the model whether two close-but-not-identical names are the same
+    /// thing. Errors and unparseable answers resolve to **no**: an unavailable
+    /// model must leave a recoverable duplicate, never merge on a guess.
+    async fn adjudicate_same_entity(
+        &self,
+        surface: &str,
+        surface_type: &str,
+        candidate: &Entity,
+        example: &str,
+    ) -> bool {
+        let system = prompt::entity_adjudication_system_prompt();
+        let user = prompt::entity_adjudication_user_prompt(
+            surface,
+            surface_type,
+            example,
+            &candidate.canonical_name,
+            &candidate.entity_type,
+            "an earlier memory",
+        );
+        let schema = prompt::entity_adjudication_schema();
+        let Ok(response) = self
+            .chat_client
+            .complete_json(&system, &user, "entity_adjudication", &schema)
+            .await
+        else {
+            warn!("entity adjudication call failed; keeping '{surface}' separate");
+            return false;
+        };
+        let Some(json) = extract_json_object(&response) else {
+            return false;
+        };
+        let same = serde_json::from_str::<serde_json::Value>(json)
+            .ok()
+            .and_then(|v| v.get("same").and_then(serde_json::Value::as_bool))
+            .unwrap_or(false);
+        debug!(
+            "adjudicated '{surface}' vs '{}': same={same}",
+            candidate.canonical_name
+        );
+        same
     }
 
     /// Embed `text`, returning `None` when embeddings are disabled or the call
@@ -646,7 +898,7 @@ mod tests {
             id: id.to_string(),
             kind: MemoryKind::Fact,
             subject: EntityRef::Entity("entity-1".to_string()),
-            predicate: "uses".to_string(),
+            predicate: Predicate::Uses,
             object: EntityRef::Literal("svc-a".to_string()),
             statement: "the team uses svc-a".to_string(),
             project: Some("owner/repo".to_string()),
@@ -757,14 +1009,96 @@ mod tests {
         }
     }
 
+    // ── Entity attribution ───────────────────────────────────────────────
+
+    /// The thresholds, exhaustively. A hash-based test embedder cannot produce
+    /// a controlled cosine score, so the boundary is pinned here rather than
+    /// through the store.
+    #[test]
+    fn attribution_thresholds() {
+        // Confident: reuse.
+        assert_eq!(
+            attribution_for(1.0, "project", "project"),
+            Attribution::Attribute
+        );
+        assert_eq!(
+            attribution_for(ATTRIBUTE_THRESHOLD, "project", "project"),
+            Attribution::Attribute,
+            "the threshold is inclusive",
+        );
+        // Arguable: counted, not acted on.
+        assert_eq!(
+            attribution_for(ATTRIBUTE_THRESHOLD - 0.01, "project", "project"),
+            Attribution::Ambiguous,
+        );
+        assert_eq!(
+            attribution_for(AMBIGUOUS_THRESHOLD, "project", "project"),
+            Attribution::Ambiguous,
+        );
+        // Unrelated.
+        assert_eq!(
+            attribution_for(AMBIGUOUS_THRESHOLD - 0.01, "project", "project"),
+            Attribution::Distinct,
+        );
+        assert_eq!(
+            attribution_for(0.0, "project", "project"),
+            Attribution::Distinct
+        );
+    }
+
+    /// A type conflict outranks any score. Merging two differently-typed
+    /// entities cannot be undone — there is no supersession chain for an
+    /// entity — so even a perfect name match must not do it.
+    #[test]
+    fn a_type_conflict_beats_a_perfect_score() {
+        assert_eq!(
+            attribution_for(1.0, "project", "tool"),
+            Attribution::Distinct
+        );
+        assert_eq!(
+            attribution_for(1.0, "person", "project"),
+            Attribution::Distinct
+        );
+    }
+
+    /// `unknown` asserts nothing, so it must not block a match in either
+    /// direction — otherwise the model's uncertainty would permanently
+    /// fragment the graph.
+    #[test]
+    fn unknown_type_matches_anything() {
+        assert_eq!(
+            attribution_for(1.0, UNKNOWN_ENTITY_TYPE, "project"),
+            Attribution::Attribute,
+        );
+        assert_eq!(
+            attribution_for(1.0, "project", UNKNOWN_ENTITY_TYPE),
+            Attribution::Attribute,
+        );
+    }
+
     // ── Duplicate identity ───────────────────────────────────────────────
 
+    /// Predicate spelling can no longer split a duplicate: the vocabulary is
+    /// closed, so `Uses`, `utilises` and `depends_on` all *parse* to the same
+    /// variant long before the key is built.
     #[test]
-    fn duplicate_key_ignores_predicate_spelling_and_literal_case() {
+    fn predicate_synonyms_resolve_to_one_variant() {
+        for spelling in ["uses", "Uses", "  USES ", "utilises", "depends_on", "used"] {
+            assert_eq!(
+                Predicate::parse(spelling),
+                Some(Predicate::Uses),
+                "{spelling:?} should fold into `uses`",
+            );
+        }
+        assert_eq!(Predicate::parse("frobnicates"), None);
+    }
+
+    #[test]
+    fn duplicate_key_ignores_literal_case() {
         let mut a = memory_with("a", SourceKind::UserStated, 0.5);
         let mut b = memory_with("b", SourceKind::Derived, 0.9);
-        a.predicate = "uses".to_string();
-        b.predicate = "  Uses  ".to_string();
+        a.predicate = Predicate::Uses;
+        b.predicate = Predicate::Uses;
         a.object = EntityRef::Literal("Svc-A".to_string());
         b.object = EntityRef::Literal("svc-a".to_string());
         assert_eq!(duplicate_key(&a), duplicate_key(&b));

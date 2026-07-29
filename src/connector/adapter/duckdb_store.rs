@@ -165,11 +165,18 @@ impl DuckdbStore {
                 created_at BIGINT NOT NULL,
                 updated_at BIGINT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS entity_aliases (
-                alias TEXT NOT NULL,
+            CREATE TABLE IF NOT EXISTS entity_names (
+                -- As written, for display.
+                name TEXT NOT NULL,
+                -- Lowercased, for lookup. A separate column because the query
+                -- used to be `WHERE lower(name) = lower(?)`, and wrapping the
+                -- column in a function makes the index unusable — the one path
+                -- that exists to be cheap was doing a full scan.
+                name_key TEXT NOT NULL,
                 entity_id TEXT NOT NULL,
-                PRIMARY KEY (alias, entity_id)
+                PRIMARY KEY (name_key, entity_id)
             );
+            CREATE INDEX IF NOT EXISTS entity_names_key_idx ON entity_names (name_key);
             CREATE TABLE IF NOT EXISTS entity_vectors (
                 entity_id TEXT PRIMARY KEY,
                 vector FLOAT[{dimensions}] NOT NULL

@@ -11,6 +11,7 @@
 
 use std::sync::Arc;
 
+use memory_rs::Predicate;
 use memory_rs::{
     DuckdbStore, EdgeOrigin, EdgeType, Entity, EntityRef, ImportedSession, Memory, MemoryEdge,
     MemoryKind, MemoryNode, MemoryRepository, MemoryStatus, NodeKind, NodeRepository,
@@ -30,7 +31,7 @@ fn memory(id: &str, statement: &str) -> Memory {
         id: id.to_string(),
         kind: MemoryKind::Fact,
         subject: EntityRef::Entity("entity-team".to_string()),
-        predicate: "uses".to_string(),
+        predicate: Predicate::Uses,
         object: EntityRef::Literal("tabs".to_string()),
         statement: statement.to_string(),
         project: None,
@@ -47,12 +48,12 @@ fn memory(id: &str, statement: &str) -> Memory {
     }
 }
 
-fn entity(id: &str, canonical_name: &str, aliases: &[&str]) -> Entity {
+fn entity(id: &str, canonical_name: &str, names: &[&str]) -> Entity {
     Entity {
         id: id.to_string(),
         entity_type: "project".to_string(),
         canonical_name: canonical_name.to_string(),
-        aliases: aliases.iter().map(|a| a.to_string()).collect(),
+        names: names.iter().map(|a| a.to_string()).collect(),
         created_at: 10,
         updated_at: 20,
     }
@@ -540,10 +541,10 @@ async fn edges_from_and_edges_to_do_not_leak_the_other_direction() {
 // ── Entities ─────────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn entity_round_trips_with_canonical_name_and_folded_aliases() {
+async fn entity_round_trips_with_canonical_name_and_folded_names() {
     let repo = repo();
     // "Payments" only differs from "payments" by case, "  payments-svc  " by
-    // whitespace, and the canonical name must itself resolve as an alias.
+    // whitespace, and the canonical name must itself resolve as a name.
     let e = entity(
         "entity-1",
         "Payments Service",
@@ -552,7 +553,7 @@ async fn entity_round_trips_with_canonical_name_and_folded_aliases() {
     repo.upsert_entity(&e, None).await.unwrap();
 
     let mut want = e.clone();
-    want.aliases = vec![
+    want.names = vec![
         "Payments Service".to_string(),
         "payments".to_string(),
         "payments-svc".to_string(),
@@ -564,7 +565,7 @@ async fn entity_round_trips_with_canonical_name_and_folded_aliases() {
 }
 
 #[tokio::test]
-async fn find_entity_by_alias_is_case_insensitive() {
+async fn find_entity_by_name_is_case_insensitive() {
     let repo = repo();
     repo.upsert_entity(
         &entity("entity-1", "Payments Service", &["payments-svc"]),
@@ -573,18 +574,18 @@ async fn find_entity_by_alias_is_case_insensitive() {
     .await
     .unwrap();
 
-    for alias in ["PAYMENTS-SVC", "payments-svc", "payments service"] {
+    for name in ["PAYMENTS-SVC", "payments-svc", "payments service"] {
         assert_eq!(
-            repo.find_entity_by_alias(alias)
+            repo.find_entity_by_name(name)
                 .await
                 .unwrap()
-                .expect("alias should resolve")
+                .expect("name should resolve")
                 .id,
             "entity-1",
-            "alias lookup must be case-insensitive: {alias}",
+            "name lookup must be case-insensitive: {name}",
         );
     }
-    assert!(repo.find_entity_by_alias("ledger").await.unwrap().is_none());
+    assert!(repo.find_entity_by_name("ledger").await.unwrap().is_none());
 }
 
 /// A merge has to move *both* reference columns. One entity is the subject of
@@ -648,7 +649,7 @@ async fn repoint_entity_moves_subject_and_object_references() {
 }
 
 #[tokio::test]
-async fn delete_entity_removes_its_aliases_and_vector() {
+async fn delete_entity_removes_its_names_and_vector() {
     let repo = repo();
     repo.upsert_entity(
         &entity("entity-1", "Payments Service", &["payments-svc"]),
@@ -660,7 +661,7 @@ async fn delete_entity_removes_its_aliases_and_vector() {
     assert!(repo.delete_entity("entity-1").await.unwrap());
     assert!(repo.find_entity("entity-1").await.unwrap().is_none());
     assert!(repo
-        .find_entity_by_alias("payments-svc")
+        .find_entity_by_name("payments-svc")
         .await
         .unwrap()
         .is_none());
@@ -676,7 +677,7 @@ async fn delete_entity_removes_its_aliases_and_vector() {
 }
 
 #[tokio::test]
-async fn entity_semantic_search_ranks_by_cosine_distance_and_carries_aliases() {
+async fn entity_semantic_search_ranks_by_cosine_distance_and_carries_names() {
     let repo = repo();
     repo.upsert_entity(
         &entity("entity-near", "Payments Service", &["payments-svc"]),
@@ -699,9 +700,9 @@ async fn entity_semantic_search_ranks_by_cosine_distance_and_carries_aliases() {
     assert_eq!(hits[0].0.id, "entity-near", "closest vector ranks first");
     assert!(hits[0].1 > hits[1].1, "{} !> {}", hits[0].1, hits[1].1);
     assert_eq!(
-        hits[0].0.aliases,
+        hits[0].0.names,
         vec!["Payments Service".to_string(), "payments-svc".to_string()],
-        "search hits are hydrated with aliases, like a direct fetch"
+        "search hits are hydrated with names, like a direct fetch"
     );
 }
 
