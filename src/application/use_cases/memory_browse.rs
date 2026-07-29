@@ -94,7 +94,7 @@ pub enum RowTarget {
     },
 }
 
-/// A memory plus its display labels, so a row can show "gateway-events" rather
+/// A memory plus its display labels, so a row can show "orders-events" rather
 /// than the entity UUID the memory actually stores.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LabelledMemory {

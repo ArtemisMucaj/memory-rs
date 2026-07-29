@@ -18,8 +18,8 @@ use duckdb::{params, Row};
 
 use crate::application::MemoryRepository;
 use crate::domain::{
-    DomainError, EdgeOrigin, EdgeType, Entity, EntityRef, Memory, MemoryEdge, MemoryKind,
-    MemoryStatus, MemoryStoreStats, Predicate, SourceKind,
+    entity_name_key, DomainError, EdgeOrigin, EdgeType, Entity, EntityRef, Memory, MemoryEdge,
+    MemoryKind, MemoryStatus, MemoryStoreStats, Predicate, SourceKind,
 };
 
 use super::duckdb_store::{
@@ -498,7 +498,7 @@ impl MemoryRepository for DuckdbStore {
         let mut seen = std::collections::HashSet::new();
         for name in std::iter::once(&entity.canonical_name).chain(entity.names.iter()) {
             let name = name.trim();
-            let key = name.to_lowercase();
+            let key = entity_name_key(name);
             if name.is_empty() || !seen.insert(key.clone()) {
                 continue;
             }
@@ -541,33 +541,36 @@ impl MemoryRepository for DuckdbStore {
         Ok(Some(entity))
     }
 
-    async fn find_entity_by_name(&self, name: &str) -> Result<Option<Entity>, DomainError> {
+    async fn find_entities_by_name(&self, name: &str) -> Result<Vec<Entity>, DomainError> {
         let conn = self.conn.lock().await;
-        let id: Option<String> = {
+        let ids: Vec<String> = {
             let mut stmt = conn
                 .prepare(
-                    // Matches the pre-lowercased key so the index is usable;
-                    // `lower(name)` here would force a scan.
-                    "SELECT entity_id FROM entity_names WHERE name_key = ?1 LIMIT 1",
+                    // Matches the pre-normalized key so the index is usable;
+                    // normalizing the column here would force a scan.
+                    "SELECT entity_id FROM entity_names WHERE name_key = ?1",
                 )
                 .map_err(|e| DomainError::storage(format!("Failed to prepare name lookup: {e}")))?;
-            let mut rows = stmt
-                .query_map(params![name.trim().to_lowercase()], |row| {
+            let rows = stmt
+                .query_map(params![entity_name_key(name)], |row| {
                     row.get::<_, String>(0)
                 })
                 .map_err(|e| DomainError::storage(format!("Failed to query name: {e}")))?;
-            match rows.next() {
-                Some(row) => Some(
-                    row.map_err(|e| DomainError::storage(format!("Failed to read name: {e}")))?,
-                ),
-                None => None,
-            }
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| DomainError::storage(format!("Failed to read name: {e}")))?
         };
         drop(conn);
-        match id {
-            Some(id) => self.find_entity(&id).await,
-            None => Ok(None),
+        // Every id, not the first: the key is normalized, so one key can front
+        // two entities of different types ("foo" the tool, "foo" the project).
+        // Picking arbitrarily here would hand the caller the wrong-typed one
+        // and it would create a third entity behind the same key, forever.
+        let mut entities = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(entity) = self.find_entity(&id).await? {
+                entities.push(entity);
+            }
         }
+        Ok(entities)
     }
 
     async fn memories_for_entity(&self, entity_id: &str) -> Result<Vec<Memory>, DomainError> {

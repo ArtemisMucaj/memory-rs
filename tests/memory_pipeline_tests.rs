@@ -1338,13 +1338,18 @@ fn attributing_harness(responses: Vec<&str>) -> Harness {
 /// The fragmentation this prevents: without a fuzzy tier, every surface variant
 /// of one thing becomes a permanent separate anchor, and memories about one are
 /// invisible from the other.
+///
+/// The variant here is an abbreviation on purpose. Role-word variants ("the
+/// orders-events service") no longer reach this tier at all — the normalized
+/// name key settles them for free — so testing one here would prove nothing
+/// about the fuzzy path.
 #[tokio::test]
 async fn a_variant_surface_form_is_attributed_to_the_existing_entity() {
     let h = attributing_harness(vec![&response(
-        "the gateway-events service",
+        "ord-events",
         "uses",
         "terraform",
-        "the gateway-events service uses terraform",
+        "ord-events uses terraform",
         "user_stated",
         0.9,
         None,
@@ -1354,7 +1359,7 @@ async fn a_variant_surface_form_is_attributed_to_the_existing_entity() {
             &Entity {
                 id: "entity-ge".into(),
                 entity_type: "person".into(),
-                canonical_name: "gateway-events".into(),
+                canonical_name: "orders-events".into(),
                 names: Vec::new(),
                 created_at: 1,
                 updated_at: 1,
@@ -1397,12 +1402,70 @@ async fn a_variant_surface_form_is_attributed_to_the_existing_entity() {
         .unwrap()
         .unwrap();
     assert!(
-        learned
-            .names
-            .iter()
-            .any(|a| a == "the gateway-events service"),
+        learned.names.iter().any(|a| a == "ord-events"),
         "attribution must teach the entity its new surface form, got {:?}",
         learned.names,
+    );
+}
+
+/// The duplicate this prevents, taken from a real store: one session recorded
+/// the same service as "orders-events package" and "orders-events service"
+/// and produced two anchors. Neither of the other tiers could catch it — the
+/// names are not equal, and at 0.907 cosine the pair sits below the attribute
+/// threshold, so the decision fell to a small local model that said "different".
+///
+/// It is settled here for free, before any embedding or model call: both names
+/// normalize to the same key.
+#[tokio::test]
+async fn a_role_word_variant_resolves_on_the_name_tier_without_a_model_call() {
+    // No fuzzy help: this must pass on the name key alone.
+    let h = Harness::new(vec![&response(
+        "orders-events package",
+        "uses",
+        "terraform",
+        "the orders-events package uses terraform",
+        "user_stated",
+        0.9,
+        None,
+    )]);
+    h.memories()
+        .upsert_entity(
+            &Entity {
+                id: "entity-ge".into(),
+                entity_type: "person".into(),
+                canonical_name: "the orders-events service".into(),
+                names: Vec::new(),
+                created_at: 1,
+                updated_at: 1,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    let IngestionOutcome::Ingested(report) = h
+        .ingestion()
+        .execute(&transcript("session-1", "talk"), false)
+        .await
+        .unwrap()
+    else {
+        panic!("expected an ingest");
+    };
+
+    let entities = h.memories().list_entities().await.unwrap();
+    assert_eq!(
+        entities.len(),
+        1,
+        "one service, one anchor — got {:?}",
+        entities
+            .iter()
+            .map(|e| &e.canonical_name)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(report.entities_created, 0, "no second anchor was minted");
+    assert_eq!(
+        report.entity_adjudications, 0,
+        "the name tier must settle this, not the model",
     );
 }
 
@@ -1411,10 +1474,10 @@ async fn a_variant_surface_form_is_attributed_to_the_existing_entity() {
 #[tokio::test]
 async fn attribution_refuses_to_cross_entity_types() {
     let h = attributing_harness(vec![&response(
-        "gateway-events",
+        "orders-events",
         "uses",
         "terraform",
-        "gateway-events uses terraform",
+        "orders-events uses terraform",
         "user_stated",
         0.9,
         None,
@@ -1511,17 +1574,17 @@ fn seeded_memory(id: &str, statement: &str) -> Memory {
 // ── Ambiguous-band adjudication (tier 3) ─────────────────────────────────
 
 /// A name in the ambiguous band is settled by asking the model. This is the
-/// case thresholds cannot fix: real data produced `gateway-events package` vs
-/// `gateway-events service` at 0.907 — too close to call apart, too far to
-/// merge on the score, and lowering the threshold to catch it would start
-/// merging things that are genuinely distinct.
+/// case neither of the cheaper tiers can fix: an abbreviation shares no
+/// normalized key with the name it abbreviates, and it lands too far below the
+/// attribute threshold to merge on the score — while lowering that threshold
+/// would start merging things that are genuinely distinct.
 #[tokio::test]
 async fn an_ambiguous_name_is_merged_when_adjudication_says_same() {
     let extraction = response(
-        "gateway-events service",
+        "orders-service",
         "uses",
         "terraform",
-        "the gateway-events service uses terraform",
+        "the orders-service uses terraform",
         "user_stated",
         0.9,
         None,
@@ -1557,10 +1620,10 @@ async fn an_ambiguous_name_is_merged_when_adjudication_says_same() {
 #[tokio::test]
 async fn an_ambiguous_name_stays_separate_when_adjudication_says_different() {
     let extraction = response(
-        "gateway-events service",
+        "orders-service",
         "uses",
         "terraform",
-        "the gateway-events service uses terraform",
+        "the orders-service uses terraform",
         "user_stated",
         0.9,
         None,
@@ -1588,10 +1651,10 @@ async fn an_ambiguous_name_stays_separate_when_adjudication_says_different() {
 #[tokio::test]
 async fn a_failed_adjudication_never_merges() {
     let extraction = response(
-        "gateway-events service",
+        "orders-service",
         "uses",
         "terraform",
-        "the gateway-events service uses terraform",
+        "the orders-service uses terraform",
         "user_stated",
         0.9,
         None,
@@ -1634,7 +1697,7 @@ async fn seed_ambiguous_candidate(h: &Harness) {
             &Entity {
                 id: "entity-ge".into(),
                 entity_type: "person".into(),
-                canonical_name: "gateway-events package".into(),
+                canonical_name: "orders-svc".into(),
                 names: Vec::new(),
                 created_at: 1,
                 updated_at: 1,

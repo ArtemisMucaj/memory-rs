@@ -158,14 +158,20 @@ pub trait MemoryRepository: Send + Sync {
     /// Fetch an entity by id.
     async fn find_entity(&self, id: &str) -> Result<Option<Entity>, DomainError>;
 
-    /// Resolve an entity by an exact (case-insensitive) match on any name it
-    /// goes by, canonical or learned.
+    /// Every entity reachable from `name` under
+    /// [`entity_name_key`](crate::domain::entity_name_key) — an exact match on
+    /// any name it goes by, canonical or learned, once both sides are
+    /// normalized.
     ///
     /// The cheap leg of entity resolution, and the one that short-circuits
     /// *before* the embedding call — which is why it stays even though
     /// similarity search would also find an exact match. It is also the only
     /// leg that works when embeddings are disabled.
-    async fn find_entity_by_name(&self, name: &str) -> Result<Option<Entity>, DomainError>;
+    ///
+    /// Returns a list rather than the first hit because the key is deliberately
+    /// broader than the name: two entities of different types can share one, and
+    /// the caller is what decides which (if either) the mention means.
+    async fn find_entities_by_name(&self, name: &str) -> Result<Vec<Entity>, DomainError>;
 
     /// Memories referencing `entity_id` as subject or object, newest first.
     ///

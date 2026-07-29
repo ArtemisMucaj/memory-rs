@@ -412,6 +412,89 @@ pub struct Entity {
     pub updated_at: i64,
 }
 
+/// Words that say what an entity *is* rather than name it. A name differing
+/// only by one of these is the same thing described two ways: "orders-events",
+/// "the orders-events service" and "orders-events package" are one anchor.
+///
+/// Only trailing occurrences are stripped, and never the whole name — "service"
+/// alone is a name, not a role word.
+const ROLE_WORDS: &[&str] = &[
+    "service",
+    "services",
+    "package",
+    "packages",
+    "repo",
+    "repos",
+    "repository",
+    "library",
+    "lib",
+    "crate",
+    "module",
+    "app",
+    "application",
+    "project",
+    "server",
+    "daemon",
+    "binary",
+    "cli",
+    "sdk",
+    "api",
+];
+
+/// The lookup key two surface forms share when they name the same entity.
+///
+/// Entity resolution has three tiers — exact name, embedding similarity, then a
+/// model adjudication — and only the first is free, deterministic and available
+/// with embeddings switched off. Matching on the raw lowercased name made it
+/// the weakest tier instead of the strongest: every spelling variant fell
+/// through to a cosine score, and the variants that matter score *below* the
+/// attribute threshold ("orders-events" vs "orders-events service" measures
+/// 0.95 on nomic-embed-text; "orders-events package" vs "…service", 0.91), so
+/// the decision landed on a small local model that reliably called them
+/// different things. Two anchors for one service, permanently.
+///
+/// Normalizing here moves that whole class of variant back to the exact tier:
+/// lowercase, drop a leading article, unify separators, and strip trailing role
+/// words.
+///
+/// This deliberately makes the key *broader* than the name. Two genuinely
+/// distinct things whose names differ only by a role word — a `foo` package and
+/// a separate `foo` service — now share a key. The type guard in entity
+/// resolution is what keeps those apart when their types differ; when they are
+/// both `project`, they merge, which is the trade this key is making on
+/// purpose.
+pub fn entity_name_key(name: &str) -> String {
+    let lowered = name.trim().to_lowercase();
+    // Punctuation that only ever wraps a name in prose or markdown.
+    let stripped = lowered.trim_matches(|c: char| {
+        matches!(
+            c,
+            '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '.' | ',' | ':'
+        )
+    });
+    let stripped = stripped.strip_prefix("the ").unwrap_or(stripped);
+
+    // Separators unify: "orders events", "orders_events" and "orders-events"
+    // are the same name typed three ways.
+    let mut words: Vec<&str> = stripped
+        .split(|c: char| c.is_whitespace() || c == '-' || c == '_' || c == '/')
+        .filter(|w| !w.is_empty())
+        .collect();
+
+    // Strip trailing role words, but never all of them — a name made only of
+    // role words ("the service") is a name.
+    while words.len() > 1 && ROLE_WORDS.contains(words.last().unwrap()) {
+        words.pop();
+    }
+
+    let key = words.join("-");
+    if key.is_empty() {
+        lowered
+    } else {
+        key
+    }
+}
+
 /// A single immutable memory in the append-only log.
 ///
 /// Fields are public because a memory is a record-like value (as with
@@ -500,6 +583,48 @@ mod tests {
         SourceKind::AssistantInferred,
         SourceKind::Derived,
     ];
+
+    /// The failure this guards, observed in a real store: one session produced
+    /// both a "orders-events package" entity and a "orders-events service"
+    /// entity for the same service, because neither the name tier (raw string
+    /// compare) nor the similarity tier (0.91, under the attribute threshold)
+    /// could see they were the same.
+    #[test]
+    fn one_name_key_covers_a_name_and_its_role_word_variants() {
+        let key = entity_name_key("orders-events");
+        for variant in [
+            "orders-events",
+            "Orders-Events",
+            "the orders-events service",
+            "orders-events package",
+            "orders events",
+            "orders_events",
+            "`orders-events`",
+            "orders-events repository",
+            "the orders-events service.",
+        ] {
+            assert_eq!(entity_name_key(variant), key, "variant {variant:?}");
+        }
+    }
+
+    #[test]
+    fn distinct_names_keep_distinct_keys() {
+        assert_ne!(
+            entity_name_key("payments-core"),
+            entity_name_key("orders-events")
+        );
+        assert_ne!(entity_name_key("auth-api"), entity_name_key("auth-gateway"));
+    }
+
+    /// A name made only of role words is a name: stripping it to nothing would
+    /// make every such entity collide with every other.
+    #[test]
+    fn a_name_that_is_only_role_words_survives() {
+        assert_eq!(entity_name_key("service"), "service");
+        assert_eq!(entity_name_key("the API"), "api");
+        // "package service" is two role words, so only the last one goes.
+        assert_eq!(entity_name_key("package service"), "package");
+    }
 
     /// `trust_rank` gates nothing today — consolidation is its only future
     /// caller — but the ordering it encodes is the thing that pass will lean

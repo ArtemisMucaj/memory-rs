@@ -553,11 +553,11 @@ async fn entity_round_trips_with_canonical_name_and_folded_names() {
     repo.upsert_entity(&e, None).await.unwrap();
 
     let mut want = e.clone();
-    want.names = vec![
-        "Payments Service".to_string(),
-        "payments".to_string(),
-        "payments-svc".to_string(),
-    ];
+    // Names fold on the *normalized* key, so "payments" is not stored beside
+    // "Payments Service" — they are the same key, and the whole point of the
+    // key is that either spelling resolves. The first form written wins the
+    // display row; the rest would be noise in a name list.
+    want.names = vec!["Payments Service".to_string(), "payments-svc".to_string()];
     assert_eq!(repo.find_entity("entity-1").await.unwrap().unwrap(), want);
     assert_eq!(repo.list_entities().await.unwrap(), vec![want]);
 
@@ -565,7 +565,7 @@ async fn entity_round_trips_with_canonical_name_and_folded_names() {
 }
 
 #[tokio::test]
-async fn find_entity_by_name_is_case_insensitive() {
+async fn find_entities_by_name_matches_case_and_role_word_variants() {
     let repo = repo();
     repo.upsert_entity(
         &entity("entity-1", "Payments Service", &["payments-svc"]),
@@ -574,18 +574,53 @@ async fn find_entity_by_name_is_case_insensitive() {
     .await
     .unwrap();
 
-    for name in ["PAYMENTS-SVC", "payments-svc", "payments service"] {
+    // The last three are the point: the lookup key is normalized, so a name
+    // nobody wrote down still lands on the entity instead of minting a second.
+    for name in [
+        "PAYMENTS-SVC",
+        "payments-svc",
+        "payments service",
+        "payments",
+        "the payments package",
+        "Payments",
+    ] {
+        let found = repo.find_entities_by_name(name).await.unwrap();
         assert_eq!(
-            repo.find_entity_by_name(name)
-                .await
-                .unwrap()
-                .expect("name should resolve")
-                .id,
-            "entity-1",
-            "name lookup must be case-insensitive: {name}",
+            found.first().map(|e| e.id.as_str()),
+            Some("entity-1"),
+            "name should resolve: {name}",
         );
     }
-    assert!(repo.find_entity_by_name("ledger").await.unwrap().is_none());
+    assert!(repo
+        .find_entities_by_name("ledger")
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+/// One normalized key can front two entities — "foo" the tool and "foo" the
+/// project are not the same thing. The lookup returns both and lets the caller
+/// apply the type guard; returning only the first would hand back the wrong one
+/// half the time.
+#[tokio::test]
+async fn find_entities_by_name_returns_every_entity_sharing_a_key() {
+    let repo = repo();
+    let mut tool = entity("entity-tool", "octo", &[]);
+    tool.entity_type = "tool".to_string();
+    let mut project = entity("entity-project", "the octo repository", &[]);
+    project.entity_type = "project".to_string();
+    repo.upsert_entity(&tool, None).await.unwrap();
+    repo.upsert_entity(&project, None).await.unwrap();
+
+    let mut ids: Vec<String> = repo
+        .find_entities_by_name("octo")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.id)
+        .collect();
+    ids.sort();
+    assert_eq!(ids, ["entity-project", "entity-tool"]);
 }
 
 /// A merge has to move *both* reference columns. One entity is the subject of
@@ -661,10 +696,10 @@ async fn delete_entity_removes_its_names_and_vector() {
     assert!(repo.delete_entity("entity-1").await.unwrap());
     assert!(repo.find_entity("entity-1").await.unwrap().is_none());
     assert!(repo
-        .find_entity_by_name("payments-svc")
+        .find_entities_by_name("payments-svc")
         .await
         .unwrap()
-        .is_none());
+        .is_empty());
     assert!(
         repo.search_entities_semantic(&[1.0, 0.0, 0.0, 0.0], 10)
             .await

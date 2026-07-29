@@ -72,6 +72,20 @@ If a memory's natural subject is a specific file or symbol, the memory is almost
 
 Getting this wrong is expensive in a way that is not obvious: a file promoted to an entity becomes a permanent anchor that nothing will ever reference again, and it is typed wrongly too — there is no file type in the list, so it lands as `project` and blocks that name from ever merging with the real project.
 
+**Name an entity the way it is written down**, not the way the sentence refers to it: the repository name, the package name, the person's name. Strip the article and the role word — write `orders-events`, never "the orders-events service" or "orders-events package". Put the role in the statement, where it belongs ("orders-events is the service that…"). Two spellings of one name become two anchors, and nothing later can tell they were the same thing.
+
+### Picking the type
+
+The type is part of an entity's identity — two entities typed differently are **never** merged — so a careless type is as permanent as a careless name. The line that matters is who owns the thing:
+
+- `project` — something the user works ON: their repository, service, package or app. If it lives in their codebase, it is a project.
+- `tool` — third-party software they work WITH: Kafka, Terraform, Postgres, DuckDB, Docker, a language, a framework, a CLI. You do not own it, you use it.
+- `person`, `organization`, `place` — as they sound. A team is an organization.
+- `concept` — a standing idea with no artefact behind it ("event sourcing", "the release process").
+- `unknown` — genuinely unclear. Prefer it to a guess.
+
+Typing a tool as a project is the common mistake, and it costs twice: it is wrong, and the next session that types it correctly gets a second anchor for the same thing.
+
 ## Relations
 
 `predicate` must be **exactly one** of these. Pick on meaning, not on which word looks closest to the sentence — the relation is half of how two memories are recognised as the same fact, so an invented synonym silently stores the same thing twice.
@@ -94,11 +108,19 @@ Every memory is EXACTLY ONE kind. The same insight must never appear under two k
 - `preference` — a durable taste or habit of the USER ("prefers tabs over spaces", "wants tool-call arguments shown"). A LASTING habit that holds across many future sessions, not a one-off goal for this session. "The user is upgrading X to v2" is a goal, not a preference.
 - `fact` — a durable, declarative truth about the PROJECT or environment, WITH its rationale where known ("logging goes to stderr in MCP mode because stdout carries the protocol").
 - `experience` — a reusable lesson about how something breaks and how it was fixed. Generalize it: strip specific ids, paths and raw text so the lesson applies beyond the instance that produced it.
-- `skill` — a repeatable multi-step PROCEDURE an agent would run again from scratch, independent of any one bug (a release flow, a debugging recipe).
+- `skill` — INSTRUCTIONS someone could follow. The statement must tell a reader what to DO, in order: "to cut a release, bump the version, merge the release PR, then verify the tag". A release flow, a debugging recipe, a setup procedure.
 
-The two boundaries that get confused most:
+`skill` is the kind that gets over-used, so apply this test before choosing it: **could a reader follow the statement and perform the procedure?** If the statement merely *describes* something — what a system does, what a component is responsible for, how a pipeline is wired — it is a FACT, no matter how many steps it mentions.
+
+- "The X service reads the queue, validates each message, writes it to the database and emits a metric" — describes what X does. That is a **fact**.
+- "To add a message type, register it in the catalog, add a decoder, then run the codegen" — tells you what to do. That is a **skill**.
+
+A statement whose subject is a system and whose verb is "implements", "handles", "does" or "consists of" is a fact about that system. Naming a procedure is not the same as giving one.
+
+The boundaries that get confused most:
 - preference vs fact — a statement about what the USER likes is a preference; a statement about how the CODE is built is a fact. "The user set the default model to X" is a preference; "the project's default model is X" is a fact. Pick ONE, never both.
 - experience vs skill — a one-off fix or debugging lesson is an EXPERIENCE only. A generic procedure you would run again from scratch is a SKILL only. Implementing a feature once is an experience. If in doubt, it is an experience.
+- fact vs skill — describing a system is a FACT; instructing a reader is a SKILL. If in doubt, it is a fact.
 
 ## The bar for emitting anything
 
@@ -262,7 +284,31 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 /// ambiguous similarity band, where two names are too close to call apart and
 /// too far to merge outright.
 pub fn entity_adjudication_system_prompt() -> String {
-    "You decide whether two names refer to the same thing.\n\n     You are given two names that a similarity search found close but not      identical, with the kind of thing each is believed to be and an example of      how each was used.\n\n     Answer `true` only if a reader would consider them the *same* thing under      two names — a service and its abbreviation, a repository and its full path,      a person and their handle.\n\n     Answer `false` when they are related but distinct: a package and the service      that consumes it, a project and one of its components, two services sharing      a prefix. Being about the same area is not being the same thing.\n\n     When genuinely unsure, answer `false`. Merging two distinct entities cannot      be undone — every memory anchored to either one silently becomes a memory      about a thing that does not exist — whereas leaving a duplicate merely means      a later pass can still merge it.\n\n     Respond with ONLY a JSON object: {\"same\": true|false}"
+    // The "package vs the service that consumes it" example this used to give
+    // was the exact shape of the case it most needed to get right: shown
+    // "orders-events package" and "orders-events service" — one service,
+    // written down twice — a small model matched the example and answered
+    // false, minting a permanent duplicate anchor. Same base name is now
+    // called out as evidence *for* sameness; the distinctness examples are the
+    // ones where the names themselves differ.
+    "You decide whether two names refer to the same thing.\n\n\
+     You are given two names that a similarity search found close but not \
+     identical, with the kind of thing each is believed to be and an example of \
+     how each was used.\n\n\
+     Answer `true` if a reader would consider them the *same* thing under two \
+     names — a service and its abbreviation, a repository and its full path, a \
+     person and their handle. In particular, answer `true` when the names share \
+     a base and differ only by a describing word (`orders` / `orders service` / \
+     `the orders package` / `orders repo`): that is one thing written down two \
+     ways, which is the most common way a duplicate is created.\n\n\
+     Answer `false` when the names themselves differ — two siblings sharing a \
+     prefix (`auth-api` and `auth-worker`), a project and a component of it that \
+     has its own name, two people with the same first name. Being about the same \
+     area is not being the same thing.\n\n\
+     When genuinely unsure, answer `false`. Merging two distinct entities cannot \
+     be undone — every memory anchored to either one silently becomes a memory \
+     about a thing that does not exist.\n\n\
+     Respond with ONLY a JSON object: {\"same\": true|false}"
         .to_string()
 }
 
@@ -577,5 +623,52 @@ mod entity_guidance {
         for excluded in ["file", "commit", "version number", "symbol"] {
             assert!(p.contains(excluded), "entity guidance omits {excluded:?}");
         }
+    }
+
+    /// The failure this guards: one session named the same service "the
+    /// orders-events service" once and "orders-events package" once, and the
+    /// store ended up with two anchors for it. Normalization catches most of
+    /// that downstream, but only the prompt can stop the role word being
+    /// written into the name in the first place.
+    #[test]
+    fn the_prompt_tells_the_model_to_drop_role_words_from_names() {
+        let p = system_prompt();
+        assert!(p.contains("Strip the article and the role word"));
+    }
+
+    /// The failure this guards: a statement describing what a service does was
+    /// stored as a `skill`, which is meant to be a procedure an agent can
+    /// follow. The kind list alone did not discriminate — the describing
+    /// statement mentioned several steps, so it looked procedural.
+    #[test]
+    fn the_prompt_separates_describing_a_system_from_instructing_a_reader() {
+        let p = system_prompt();
+        assert!(p.contains("could a reader follow the statement and perform the procedure?"));
+        assert!(p.contains("fact vs skill"));
+    }
+
+    /// The failure this guards: `Kafka` and `Terraform` were both stored as
+    /// `project`. The field listed its vocabulary but never said what the words
+    /// meant, so everything software-shaped landed on the first plausible one.
+    /// A wrong type is permanent — the guard that keeps a `tool` and a
+    /// `project` apart is the same one that stops the correction merging.
+    #[test]
+    fn the_prompt_says_what_each_entity_type_means() {
+        let p = system_prompt();
+        assert!(p.contains("### Picking the type"));
+        assert!(p.contains("something the user works ON"));
+        assert!(p.contains("third-party software they work WITH"));
+    }
+
+    /// The adjudicator's job is to catch exactly the "same base name, different
+    /// role word" case; it used to carry an example that taught the opposite.
+    #[test]
+    fn adjudication_treats_a_shared_base_name_as_evidence_of_sameness() {
+        let p = entity_adjudication_system_prompt();
+        assert!(p.contains("differ only by a describing word"));
+        assert!(
+            !p.contains("a package and the service that consumes it"),
+            "the example that produced the duplicate is back",
+        );
     }
 }

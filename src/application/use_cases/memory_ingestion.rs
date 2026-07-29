@@ -62,8 +62,8 @@ use crate::application::use_cases::llm_json::{
 };
 use crate::application::use_cases::memory_ingestion_prompt as prompt;
 use crate::domain::{
-    DomainError, EdgeOrigin, EdgeType, Entity, EntityRef, Memory, MemoryEdge, MemoryKind,
-    MemoryStatus, Predicate, SessionTranscript, SourceKind,
+    entity_name_key, DomainError, EdgeOrigin, EdgeType, Entity, EntityRef, Memory, MemoryEdge,
+    MemoryKind, MemoryStatus, Predicate, SessionTranscript, SourceKind,
 };
 
 /// How many prior memories are prefetched into the extraction context.
@@ -118,15 +118,25 @@ pub(crate) enum Attribution {
 /// guard can be tested exhaustively without a store or an embedder — which
 /// matters because a hash-based test embedder cannot produce a meaningful
 /// cosine score near the boundary.
-pub(crate) fn attribution_for(score: f32, existing_type: &str, new_type: &str) -> Attribution {
-    // Never attribute across two entities the model typed differently. A wrong
-    // merge is unrecoverable — an entity carries no supersession chain the way
-    // a memory does — so this errs toward keeping them apart. `unknown` matches
-    // anything, because it asserts nothing.
-    let types_conflict = existing_type != new_type
+/// Whether two entity types are different enough that the entities must be
+/// kept apart.
+///
+/// Never merge across two entities the model typed differently. A wrong merge
+/// is unrecoverable — an entity carries no supersession chain the way a memory
+/// does — so this errs toward keeping them apart. `unknown` matches anything,
+/// because it asserts nothing.
+///
+/// Shared by both resolution tiers: the name tier needs it because
+/// [`entity_name_key`] is broader than the name it came from, and the
+/// similarity tier because a close cosine score says nothing about type.
+pub(crate) fn types_conflict(existing_type: &str, new_type: &str) -> bool {
+    existing_type != new_type
         && existing_type != UNKNOWN_ENTITY_TYPE
-        && new_type != UNKNOWN_ENTITY_TYPE;
-    if types_conflict {
+        && new_type != UNKNOWN_ENTITY_TYPE
+}
+
+pub(crate) fn attribution_for(score: f32, existing_type: &str, new_type: &str) -> Attribution {
+    if types_conflict(existing_type, new_type) {
         return Attribution::Distinct;
     }
     if score >= ATTRIBUTE_THRESHOLD {
@@ -669,8 +679,8 @@ impl MemoryIngestionUseCase {
     /// 3. a cosine search over entity-name embeddings,
     /// 4. otherwise a new entity.
     ///
-    /// Step 3 is what stops the graph fragmenting. Without it, "gateway-events",
-    /// "the gateway-events service" and "gateway events" are three permanent
+    /// Step 3 is what stops the graph fragmenting. Without it, "orders-events",
+    /// "the orders-events service" and "orders events" are three permanent
     /// anchors that never connect, because step 2 only ever matches a string
     /// somebody already wrote down.
     ///
@@ -695,22 +705,32 @@ impl MemoryIngestionUseCase {
         if !is_entity || trimmed.is_empty() {
             return Ok(EntityRef::Literal(trimmed.to_string()));
         }
-        let key = trimmed.to_lowercase();
-        if let Some(id) = cache.get(&key) {
-            return Ok(EntityRef::Entity(id.clone()));
-        }
-        if let Some(existing) = self.memory_repo.find_entity_by_name(trimmed).await? {
-            cache.insert(key, existing.id.clone());
-            return Ok(EntityRef::Entity(existing.id));
-        }
-
         let entity_type = match entity_type.trim() {
             "" => UNKNOWN_ENTITY_TYPE.to_string(),
             t => t.to_lowercase(),
         };
+        // Keyed by the same normalization the store uses, so the two surface
+        // forms one session produces for one thing ("orders-events package",
+        // "the orders-events service") share a cache slot too — not just a row.
+        let key = format!("{}\u{0}{entity_type}", entity_name_key(trimmed));
+        if let Some(id) = cache.get(&key) {
+            return Ok(EntityRef::Entity(id.clone()));
+        }
+        // The key is broader than the name, so a hit can be a differently-typed
+        // entity that merely shares it. Take the first the type guard accepts —
+        // the same rule the similarity tier applies, so both tiers agree on what
+        // "the same thing" means.
+        let named = self.memory_repo.find_entities_by_name(trimmed).await?;
+        if let Some(existing) = named
+            .into_iter()
+            .find(|e| !types_conflict(&e.entity_type, &entity_type))
+        {
+            cache.insert(key, existing.id.clone());
+            return Ok(EntityRef::Entity(existing.id));
+        }
 
-        // The embedding covers name *and* type, so "gateway-events (project)"
-        // and "gateway-events (tool)" do not collapse into each other.
+        // The embedding covers name *and* type, so "orders-events (project)"
+        // and "orders-events (tool)" do not collapse into each other.
         let embedding_text = format!("{trimmed} ({entity_type})");
         let vector = self.embed_opt(&embedding_text).await;
 
