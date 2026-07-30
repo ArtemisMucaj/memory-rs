@@ -17,8 +17,9 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::application::DEFAULT_SESSION_LIMIT;
 use crate::connector::api::controller::{
-    self, ForgetOutcome, MemorySearchOutcome, MemoryShowOutcome, SearchScope,
+    self, ForgetOutcome, MemorySearchOutcome, MemoryShowOutcome, ResumeOutcome, SearchScope,
 };
 use crate::connector::api::Container;
 use crate::domain::{Memory, MemoryKind, MemoryStatus};
@@ -28,6 +29,26 @@ const MAX_LIMIT: usize = 100;
 
 fn default_limit() -> usize {
     10
+}
+
+fn default_session_limit() -> usize {
+    DEFAULT_SESSION_LIMIT
+}
+
+/// One scope, built the same way for every tool that takes one. `project` and
+/// `namespace` are mutually exclusive; passing both is a caller error rather
+/// than a silent preference for one, because the two answer different questions
+/// and quietly dropping either returns a plausible wrong set.
+fn scope_from(project: Option<String>, namespace: Option<String>) -> Result<SearchScope, McpError> {
+    match (namespace, project) {
+        (Some(_), Some(_)) => Err(McpError::invalid_params(
+            "pass either `project` or `namespace`, not both",
+            None,
+        )),
+        (Some(ns), None) => Ok(SearchScope::Namespace(ns)),
+        (None, Some(p)) => Ok(SearchScope::Project(p)),
+        (None, None) => Ok(SearchScope::All),
+    }
 }
 
 /// The MCP server: holds the shared container.
@@ -76,6 +97,20 @@ pub struct ListInput {
     /// `all`. Only active memories answer queries; the rest are history.
     #[serde(default)]
     pub status: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ResumeInput {
+    /// Scope to the project you are about to work in (its sessions only).
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Scope to a namespace — sessions across its member projects. Mutually
+    /// exclusive with `project`.
+    #[serde(default)]
+    pub namespace: Option<String>,
+    /// How many sessions to cover, newest first (default 5, server cap 50).
+    #[serde(default = "default_session_limit")]
+    pub limit: usize,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -129,11 +164,7 @@ impl MemoryMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let input = params.0;
         let kind = parse_kind(input.kind.as_deref())?;
-        let scope = match (input.namespace, input.project) {
-            (Some(ns), _) => SearchScope::Namespace(ns),
-            (None, Some(p)) => SearchScope::Project(p),
-            (None, None) => SearchScope::All,
-        };
+        let scope = scope_from(input.project, input.namespace)?;
         let limit = input.limit.min(MAX_LIMIT);
 
         let value = match controller::recall_memories(
@@ -208,6 +239,55 @@ impl MemoryMcpServer {
             .iter()
             .map(|memory| memory_json(memory, &labels, None))
             .collect::<Vec<_>>()))
+    }
+
+    /// Catch up on recent work before doing anything else in a project: the
+    /// latest sessions, what each was about and how it went, and the durable
+    /// memories they produced. Call this at the start of a session so the user
+    /// does not have to re-explain what they were doing. Scope it with
+    /// `project` (or `namespace`) to the work you are about to continue.
+    #[tool(name = "resume_work")]
+    async fn resume_work(
+        &self,
+        params: Parameters<ResumeInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let input = params.0;
+        let scope = scope_from(input.project, input.namespace)?;
+        let briefing = match controller::resume(&self.container, &scope, input.limit)
+            .await
+            .map_err(internal)?
+        {
+            ResumeOutcome::Briefing(b) => b,
+            ResumeOutcome::EmptyNamespace(ns) => {
+                return ok_json(&json!({ "empty_namespace": ns, "sessions": [] }));
+            }
+        };
+
+        let mut sessions = Vec::with_capacity(briefing.sessions.len());
+        for recap in &briefing.sessions {
+            let labels = controller::entity_labels(&self.container, &recap.memories)
+                .await
+                .map_err(internal)?;
+            sessions.push(json!({
+                "id": recap.session.id,
+                "source": recap.session.source,
+                "project": recap.session.project,
+                "imported_at": recap.session.imported_at,
+                "message_count": recap.session.message_count,
+                "summary": recap.summary,
+                "overview": recap.overview,
+                "memories": recap
+                    .memories
+                    .iter()
+                    .map(|m| memory_json(m, &labels, None))
+                    .collect::<Vec<_>>(),
+            }));
+        }
+        ok_json(&json!({
+            "projects": briefing.projects,
+            "more": briefing.more,
+            "sessions": sessions,
+        }))
     }
 
     /// Read one memory by id — with its typed edges, so the surrounding context
@@ -360,6 +440,7 @@ impl ServerHandler for MemoryMcpServer {
                  memory that supersedes an old one rather than an overwrite. Only current \
                  memories are ever returned.\n\
                  Tools:\n\
+                 • resume_work — catch up on recent sessions before starting work in a project\n\
                  • search_memories — recall memories by natural language (scope to a project or namespace)\n\
                  • list_memories — list memories, optionally by kind or lifecycle status\n\
                  • read_memory — read one memory with its edges, or a memory:// node\n\

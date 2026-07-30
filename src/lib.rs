@@ -32,9 +32,10 @@ pub use application::{
     resource_slug, DreamReport, ExtractionReport, HarvestReport, ImportOutcome,
     ImportSessionUseCase, IngestionOutcome, IngestionReport, MemoryBrowseUseCase,
     MemoryDreamUseCase, MemoryExtractionUseCase, MemoryIngestionUseCase, MemoryLevel,
-    MemoryRecallUseCase, MemoryRepository, MemoryRow, MemorySearchUseCase, NodeRepository,
-    NodeStats, RowTarget, SessionDiscovery, SummarizeMemoryUseCase, MEMORY_ROOT_URI,
-    PROJECTS_ROOT_URI, RESOURCES_ROOT_URI, SESSIONS_ROOT_URI,
+    MemoryRecallUseCase, MemoryRepository, MemoryResumeUseCase, MemoryRow, MemorySearchUseCase,
+    NodeRepository, NodeStats, ResumeBriefing, RowTarget, SessionDiscovery, SessionRecap,
+    SummarizeMemoryUseCase, DEFAULT_SESSION_LIMIT, MEMORY_ROOT_URI, PROJECTS_ROOT_URI,
+    RESOURCES_ROOT_URI, SESSIONS_ROOT_URI,
 };
 
 pub use connector::{

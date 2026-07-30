@@ -79,7 +79,7 @@ impl EmbeddingClient for ConstantEmbeddingClient {
 ///
 /// It returns a fixed unit vector tilted slightly off-axis, so the cosine
 /// against [`ambiguous_seed_vector`] is ~0.906: close to the real 0.907 that
-/// `gateway-events package` and `gateway-events service` produced, and a value
+/// `orders-events package` and `orders-events service` produced, and a value
 /// no hashing embedder could be aimed at.
 pub struct AmbiguousEmbeddingClient;
 

@@ -12,9 +12,9 @@ use serde_json::{json, Value};
 
 use super::error::{ApiError, ApiResult};
 use super::server::AppState;
-use crate::application::{MemoryRef, Recalled};
+use crate::application::{MemoryRef, Recalled, DEFAULT_SESSION_LIMIT};
 use crate::connector::api::controller::{
-    self, ForgetOutcome, MemorySearchOutcome, MemoryShowOutcome, SearchScope,
+    self, ForgetOutcome, MemorySearchOutcome, MemoryShowOutcome, ResumeOutcome, SearchScope,
 };
 use crate::domain::{Memory, MemoryKind, MemoryNode, MemoryStatus};
 use std::collections::HashMap;
@@ -40,6 +40,7 @@ pub async fn index() -> Json<Value> {
             "GET  /api/entities/{id}",
             "GET  /api/tree?uri=",
             "GET  /api/sessions",
+            "GET  /api/resume?project=&namespace=&limit=",
             "GET  /api/sessions/discover",
             "GET  /api/sessions/transcript?source=&id=",
             "POST /api/sessions/import  {source, id, force?}",
@@ -259,6 +260,62 @@ pub async fn tree(
 pub async fn sessions(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     let sessions = controller::sessions(&state.container).await?;
     Ok(Json(json!({ "sessions": sessions })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResumeParams {
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub namespace: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// `GET /api/resume` — recent work in scope: the latest sessions, what each was
+/// about, and the memories it produced.
+pub async fn resume(
+    State(state): State<AppState>,
+    Query(params): Query<ResumeParams>,
+) -> ApiResult<Json<Value>> {
+    let scope = match (params.namespace, params.project) {
+        (Some(ns), _) => SearchScope::Namespace(ns),
+        (None, Some(p)) => SearchScope::Project(p),
+        (None, None) => SearchScope::All,
+    };
+    let limit = params.limit.unwrap_or(DEFAULT_SESSION_LIMIT);
+
+    match controller::resume(&state.container, &scope, limit).await? {
+        ResumeOutcome::Briefing(briefing) => {
+            let mut sessions = Vec::with_capacity(briefing.sessions.len());
+            for recap in &briefing.sessions {
+                let labels = controller::entity_labels(&state.container, &recap.memories).await?;
+                sessions.push(json!({
+                    "id": recap.session.id,
+                    "source": recap.session.source,
+                    "project": recap.session.project,
+                    "imported_at": recap.session.imported_at,
+                    "message_count": recap.session.message_count,
+                    "summary": recap.summary,
+                    "overview": recap.overview,
+                    "memories": recap
+                        .memories
+                        .iter()
+                        .map(|m| memory_json(m, &labels, None))
+                        .collect::<Vec<_>>(),
+                }));
+            }
+            Ok(Json(json!({
+                "projects": briefing.projects,
+                "more": briefing.more,
+                "sessions": sessions,
+            })))
+        }
+        ResumeOutcome::EmptyNamespace(ns) => Ok(Json(json!({
+            "sessions": [],
+            "note": format!("namespace '{ns}' has no member projects"),
+        }))),
+    }
 }
 
 /// `GET /api/stats` — store statistics.

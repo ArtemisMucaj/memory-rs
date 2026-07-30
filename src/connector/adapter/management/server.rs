@@ -71,6 +71,7 @@ pub fn routes(state: AppState) -> Router {
         .route("/api/entities/{id}", get(handlers::entity))
         .route("/api/tree", get(handlers::tree))
         .route("/api/sessions", get(handlers::sessions))
+        .route("/api/resume", get(handlers::resume))
         .route("/api/stats", get(handlers::stats))
         .route(
             "/api/namespaces",

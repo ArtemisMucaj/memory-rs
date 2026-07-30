@@ -4,10 +4,10 @@
 //! return domain values. Every handler returns a `String` for `main` to print,
 //! or a [`DomainError`] to report.
 
-use crate::application::{DreamReport, ImportOutcome, Recalled};
+use crate::application::{DreamReport, ImportOutcome, Recalled, ResumeBriefing};
 use crate::cli::{Cli, Command, MemoryKindArg, NamespaceCommand, OutputFormat};
 use crate::connector::api::controller::{
-    self, ForgetOutcome, MemorySearchOutcome, MemoryShowOutcome, SearchScope,
+    self, ForgetOutcome, MemorySearchOutcome, MemoryShowOutcome, ResumeOutcome, SearchScope,
 };
 use crate::connector::api::Container;
 use crate::domain::{
@@ -37,6 +37,12 @@ pub async fn run(cli: Cli, container: &Container) -> Result<String, DomainError>
         Command::Show { id } => show(container, id).await,
         Command::Delete { id } => delete(container, id).await,
         Command::Sessions { format } => sessions(container, format).await,
+        Command::Resume {
+            project,
+            namespace,
+            limit,
+            format,
+        } => resume(container, project, namespace, limit, format).await,
         Command::Add { source, name } => add_resource(container, source, name).await,
         Command::Dream { idle_minutes } => dream(container, idle_minutes).await,
         Command::Tree { uri, format } => tree(container, uri, format).await,
@@ -277,6 +283,159 @@ async fn delete(container: &Container, id: String) -> Result<String, DomainError
         )),
         ForgetOutcome::NotFound => Ok(format!("No memory found with ID '{id}'.")),
     }
+}
+
+/// `resume` — the briefing, rendered so it can be read top-to-bottom as the
+/// answer to "where was I".
+async fn resume(
+    container: &Container,
+    project: Option<String>,
+    namespace: Option<String>,
+    limit: usize,
+    format: OutputFormat,
+) -> Result<String, DomainError> {
+    // The CLI makes --project and --namespace mutually exclusive.
+    let scope = match (namespace, project) {
+        (Some(ns), _) => SearchScope::Namespace(ns),
+        (None, Some(p)) => SearchScope::Project(p),
+        (None, None) => SearchScope::All,
+    };
+
+    let briefing = match controller::resume(container, &scope, limit).await? {
+        ResumeOutcome::Briefing(b) => b,
+        ResumeOutcome::EmptyNamespace(ns) => {
+            return Ok(format!(
+                "Namespace '{ns}' has no projects (assign one with: memory-rs namespace assign \
+                 {ns} <project>)."
+            ));
+        }
+    };
+
+    match format {
+        OutputFormat::Json => to_json(&resume_json(&briefing)),
+        OutputFormat::Text => Ok(render_briefing(&briefing)),
+    }
+}
+
+fn render_briefing(briefing: &ResumeBriefing) -> String {
+    if briefing.is_empty() {
+        // Say which of the two reasons it is: an empty store and a scope with no
+        // sessions look identical otherwise, and the fixes are different.
+        return if briefing.projects.is_empty() {
+            "No sessions imported yet. Import one with: memory-rs import <transcript>".to_string()
+        } else {
+            format!(
+                "No sessions recorded for {}. Sessions imported before projects were \
+                 tracked have none, and only appear unscoped.",
+                briefing.projects.join(", ")
+            )
+        };
+    }
+
+    let mut out = String::new();
+    let scope = if briefing.projects.is_empty() {
+        "all projects".to_string()
+    } else {
+        briefing.projects.join(", ")
+    };
+    out.push_str(&format!(
+        "Recent work — {} session(s), {scope}\n\n",
+        briefing.sessions.len()
+    ));
+
+    for recap in &briefing.sessions {
+        let session = &recap.session;
+        out.push_str(&format!(
+            "{} · {}\n",
+            format_unix(session.imported_at),
+            session.project.as_deref().unwrap_or("no project"),
+        ));
+        if !recap.summary.is_empty() {
+            out.push_str(&format!("  {}\n", recap.summary));
+        }
+        if !recap.overview.is_empty() {
+            for line in recap.overview.lines().filter(|l| !l.trim().is_empty()) {
+                out.push_str(&format!("  {}\n", line.trim()));
+            }
+        }
+        if recap.memories.is_empty() {
+            out.push_str("  (no durable memories from this session)\n");
+        } else {
+            out.push_str(&format!("  remembered ({}):\n", recap.memories.len()));
+            for memory in &recap.memories {
+                out.push_str(&format!(
+                    "    - [{}] {}\n",
+                    memory.kind.as_str(),
+                    memory.statement
+                ));
+            }
+        }
+        out.push_str(&format!(
+            "  session: {} · {}\n\n",
+            session.id, session.source
+        ));
+    }
+
+    if briefing.more > 0 {
+        out.push_str(&format!(
+            "{} older session(s) not shown — raise --limit to include them.\n",
+            briefing.more
+        ));
+    }
+    out
+}
+
+fn resume_json(briefing: &ResumeBriefing) -> serde_json::Value {
+    serde_json::json!({
+        "projects": briefing.projects,
+        "more": briefing.more,
+        "sessions": briefing
+            .sessions
+            .iter()
+            .map(|recap| serde_json::json!({
+                "id": recap.session.id,
+                "source": recap.session.source,
+                "project": recap.session.project,
+                "imported_at": recap.session.imported_at,
+                "message_count": recap.session.message_count,
+                "summary": recap.summary,
+                "overview": recap.overview,
+                "memories": recap
+                    .memories
+                    .iter()
+                    .map(|m| serde_json::json!({
+                        "id": m.id,
+                        "kind": m.kind.as_str(),
+                        "statement": m.statement,
+                        "project": m.project,
+                    }))
+                    .collect::<Vec<_>>(),
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// A unix timestamp as `YYYY-MM-DD HH:MM` UTC — enough to place a session in
+/// time without pulling in a date library.
+fn format_unix(seconds: i64) -> String {
+    let days = seconds.div_euclid(86_400);
+    let secs_of_day = seconds.rem_euclid(86_400);
+    // Civil-from-days (Howard Hinnant's algorithm), epoch-shifted to 0000-03-01.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}",
+        secs_of_day / 3_600,
+        (secs_of_day % 3_600) / 60
+    )
 }
 
 async fn sessions(container: &Container, format: OutputFormat) -> Result<String, DomainError> {

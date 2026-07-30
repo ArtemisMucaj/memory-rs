@@ -101,7 +101,8 @@ impl DuckdbStore {
                 message_count BIGINT NOT NULL,
                 items_written BIGINT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'imported',
-                last_error TEXT
+                last_error TEXT,
+                project TEXT
             );
             CREATE TABLE IF NOT EXISTS memory_nodes (
                 uri TEXT PRIMARY KEY,
@@ -206,12 +207,15 @@ impl DuckdbStore {
             }
         }
 
-        // Older databases predate the harvest failure marker. Same idempotent
-        // add-and-swallow pattern as `memory_nodes.label` — but DuckDB rejects
-        // `ADD COLUMN` carrying a constraint ("Adding columns with constraints
-        // not yet supported"), so the column is added bare and backfilled.
-        // Every pre-existing row is by definition a successful import.
-        for column in ["status", "last_error"] {
+        // Older databases predate the harvest failure marker, and older ones
+        // still predate `project` (which scopes the resume briefing). Same
+        // idempotent add-and-swallow pattern as `memory_nodes.label` — but
+        // DuckDB rejects `ADD COLUMN` carrying a constraint ("Adding columns
+        // with constraints not yet supported"), so each column is added bare.
+        // `status` is backfilled below; a pre-existing row's `project` stays
+        // NULL, which reads as "unknown project" and lands in an unscoped
+        // briefing only.
+        for column in ["status", "last_error", "project"] {
             if let Err(e) = conn.execute_batch(&format!(
                 "ALTER TABLE memory_sessions ADD COLUMN {column} TEXT;"
             )) {
@@ -846,15 +850,17 @@ impl NodeRepository for DuckdbStore {
         let conn = self.conn.lock().await;
         conn.execute(
             "INSERT INTO memory_sessions \
-                 (id, source, imported_at, message_count, items_written, status, last_error) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                 (id, source, imported_at, message_count, items_written, status, last_error, \
+                  project) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
              ON CONFLICT (id) DO UPDATE SET \
                  source = excluded.source, \
                  imported_at = excluded.imported_at, \
                  message_count = excluded.message_count, \
                  items_written = excluded.items_written, \
                  status = excluded.status, \
-                 last_error = excluded.last_error",
+                 last_error = excluded.last_error, \
+                 project = excluded.project",
             params![
                 session.id,
                 session.source,
@@ -863,6 +869,7 @@ impl NodeRepository for DuckdbStore {
                 session.items_written as i64,
                 session.status.as_str(),
                 session.last_error,
+                session.project,
             ],
         )
         .map_err(|e| DomainError::storage(format!("Failed to record session: {e}")))?;
@@ -873,7 +880,8 @@ impl NodeRepository for DuckdbStore {
         let conn = self.conn.lock().await;
         let mut stmt = conn
             .prepare(
-                "SELECT id, source, imported_at, message_count, items_written, status, last_error \
+                "SELECT id, source, imported_at, message_count, items_written, status, \
+                        last_error, project \
                  FROM memory_sessions WHERE id = ?1",
             )
             .map_err(|e| DomainError::storage(format!("Failed to prepare find_session: {e}")))?;
@@ -890,7 +898,8 @@ impl NodeRepository for DuckdbStore {
         let conn = self.conn.lock().await;
         let mut stmt = conn
             .prepare(
-                "SELECT id, source, imported_at, message_count, items_written, status, last_error \
+                "SELECT id, source, imported_at, message_count, items_written, status, \
+                        last_error, project \
                  FROM memory_sessions ORDER BY imported_at DESC",
             )
             .map_err(|e| DomainError::storage(format!("Failed to prepare list_sessions: {e}")))?;
@@ -1398,5 +1407,9 @@ fn session_from_row(row: &Row<'_>) -> Result<ImportedSession, duckdb::Error> {
             .map(|s| SessionStatus::parse(&s))
             .unwrap_or(SessionStatus::Imported),
         last_error: row.get::<_, Option<String>>(6)?,
+        // Nullable for the same reason as `status`: rows written before the
+        // column existed. An unknown project is not an error, it just cannot be
+        // scoped to.
+        project: row.get::<_, Option<String>>(7)?,
     })
 }

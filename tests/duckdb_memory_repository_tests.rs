@@ -1059,6 +1059,7 @@ async fn memories_and_nodes_share_one_connection() {
             source: "claude".to_string(),
             imported_at: 100,
             message_count: 12,
+            project: None,
             items_written: 3,
             status: SessionStatus::Imported,
             last_error: None,

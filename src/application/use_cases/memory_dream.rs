@@ -379,6 +379,9 @@ impl MemoryDreamUseCase {
             source: source.to_string(),
             imported_at: unix_now(),
             message_count: 0,
+            // Unknown: the transcript is what carries the project, and this
+            // marker exists precisely because it could not be read.
+            project: None,
             items_written: 0,
             status: SessionStatus::Failed,
             last_error: Some(error.to_string()),

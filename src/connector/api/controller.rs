@@ -10,7 +10,7 @@
 
 use crate::application::{
     resource_slug, DreamReport, ImportOutcome, IngestionOutcome, MemorySearchUseCase, NodeStats,
-    Recalled, MEMORY_ROOT_URI, RESOURCES_ROOT_URI, SESSIONS_ROOT_URI,
+    Recalled, ResumeBriefing, MEMORY_ROOT_URI, RESOURCES_ROOT_URI, SESSIONS_ROOT_URI,
 };
 use crate::connector::adapter::{fetch_resource, parse_transcript_file};
 use crate::connector::api::Container;
@@ -135,7 +135,7 @@ pub async fn recall_memories(
 ///
 /// A memory stores its subject and object as entity *ids*, which are UUIDs and
 /// mean nothing to a reader. This resolves them in one query so any surface can
-/// render "gateway-events deployment" where the row would otherwise say
+/// render "orders-events deployment" where the row would otherwise say
 /// `@c95de38f-03e9-463e-…`. Ids with no entity are simply absent; callers fall
 /// back to whatever they had.
 pub async fn entity_labels(
@@ -457,6 +457,31 @@ pub async fn delete(container: &Container, id: &str) -> Result<DeleteOutcome, Do
 /// List imported sessions, newest first.
 pub async fn sessions(container: &Container) -> Result<Vec<ImportedSession>, DomainError> {
     container.node_repository()?.list_sessions().await
+}
+
+/// The result of a scoped resume briefing, mirroring [`SearchOutcome`].
+pub enum ResumeOutcome {
+    Briefing(ResumeBriefing),
+    EmptyNamespace(String),
+}
+
+/// "What was I working on" — the last `limit` sessions in `scope`, each with
+/// its summary and the memories it produced.
+pub async fn resume(
+    container: &Container,
+    scope: &SearchScope,
+    limit: usize,
+) -> Result<ResumeOutcome, DomainError> {
+    let projects = match resolve_scope(container, scope).await? {
+        ScopeResolution::All => None,
+        ScopeResolution::Projects(p) => Some(p),
+        ScopeResolution::EmptyNamespace(ns) => return Ok(ResumeOutcome::EmptyNamespace(ns)),
+    };
+    let briefing = container
+        .memory_resume_use_case()?
+        .execute(projects.as_deref(), limit)
+        .await?;
+    Ok(ResumeOutcome::Briefing(briefing))
 }
 
 /// Aggregate memory-store statistics.

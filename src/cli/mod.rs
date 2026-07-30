@@ -7,8 +7,15 @@
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+use crate::application::DEFAULT_SESSION_LIMIT;
 use crate::connector::adapter::DEFAULT_EMBEDDING_DIMENSIONS;
 use crate::domain::{MemoryKind, NodeKind};
+
+/// clap needs a `const fn`-able default; the constant lives with the use case
+/// so the CLI, MCP and HTTP surfaces all brief over the same window.
+const fn memory_rs_default_resume_limit() -> usize {
+    DEFAULT_SESSION_LIMIT
+}
 
 /// Long-term memory for coding assistants: import sessions, ingest durable
 /// memories, recall by hybrid search over an append-only memory graph.
@@ -163,6 +170,31 @@ pub enum Command {
 
     /// List imported sessions.
     Sessions {
+        /// Output format: text or json.
+        #[arg(short = 'F', long, value_enum, default_value = "text")]
+        format: OutputFormat,
+    },
+
+    /// Brief yourself on recent work: the latest sessions and what they left
+    /// behind, so you can pick up where you stopped without re-explaining.
+    ///
+    /// Each entry is the session's summary, the arc of what happened, and the
+    /// durable memories it produced. No LLM call — every part was written when
+    /// the session was imported.
+    Resume {
+        /// Restrict to sessions worked in this project.
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Restrict to a namespace: sessions across its member projects.
+        /// Mutually exclusive with --project.
+        #[arg(long, conflicts_with = "project")]
+        namespace: Option<String>,
+
+        /// How many sessions to cover, newest first.
+        #[arg(short, long, default_value_t = memory_rs_default_resume_limit())]
+        limit: usize,
+
         /// Output format: text or json.
         #[arg(short = 'F', long, value_enum, default_value = "text")]
         format: OutputFormat,

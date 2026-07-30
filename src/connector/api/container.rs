@@ -14,8 +14,8 @@ use crate::connector::adapter::LlmUsage;
 use crate::application::interfaces::Embedder;
 use crate::application::{
     ImportSessionUseCase, MemoryBrowseUseCase, MemoryDreamUseCase, MemoryIngestionUseCase,
-    MemoryRecallUseCase, MemoryRepository, MemorySearchUseCase, NodeRepository, SessionDiscovery,
-    SummarizeMemoryUseCase,
+    MemoryRecallUseCase, MemoryRepository, MemoryResumeUseCase, MemorySearchUseCase,
+    NodeRepository, SessionDiscovery, SummarizeMemoryUseCase,
 };
 use crate::connector::adapter::{
     build_chat_client, build_embedding_client, DuckdbStore, LocalSessionDiscovery, MemoryConfig,
@@ -279,6 +279,14 @@ impl Container {
         Ok(MemoryRecallUseCase::new(
             self.memory_repository()?,
             self.embedder()?,
+        ))
+    }
+
+    /// The "what was I working on" briefing over recent sessions.
+    pub fn memory_resume_use_case(&self) -> Result<MemoryResumeUseCase, DomainError> {
+        Ok(MemoryResumeUseCase::new(
+            self.node_repository()?,
+            self.memory_repository()?,
         ))
     }
 

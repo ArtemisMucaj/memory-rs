@@ -131,6 +131,7 @@ impl ImportSessionUseCase {
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0),
             message_count: transcript.messages.len(),
+            project: transcript.project.clone(),
             // Column name predates memories; it is the count of memories this
             // session wrote, which is now memories. Renaming it would rewrite the
             // sessions table for no behavioural gain.

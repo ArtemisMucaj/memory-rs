@@ -145,10 +145,14 @@ async fn opening_a_pre_memory_database_is_additive() {
     let items = NodeRepository::list_items(&repo, None).await.unwrap();
     assert_eq!(items.len(), 1, "the legacy item was lost on upgrade");
     assert_eq!(items[0].name(), "legacy_fact");
+    let sessions = NodeRepository::list_sessions(&repo).await.unwrap();
+    assert_eq!(sessions.len(), 1, "the legacy session was lost on upgrade");
+    // `memory_sessions.project` is added by an `ALTER` on upgrade. A legacy row
+    // has none, and that has to read as "unknown" rather than fail the open —
+    // this is the column the resume briefing scopes on.
     assert_eq!(
-        NodeRepository::list_sessions(&repo).await.unwrap().len(),
-        1,
-        "the legacy session was lost on upgrade"
+        sessions[0].project, None,
+        "a pre-project session must migrate to an unattributed one",
     );
     assert_eq!(
         NodeRepository::list_namespaces(&repo).await.unwrap().len(),
