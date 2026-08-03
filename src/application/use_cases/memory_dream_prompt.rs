@@ -15,6 +15,16 @@
 
 use crate::domain::MemoryItem;
 
+/// How a global item's (absent) project is rendered when listing existing items.
+///
+/// Must stay the same token the schema uses for "global", because these prompts
+/// tell the model to copy an item's project through to its output. Rendering it
+/// as a word like `global` reads naturally but is a trap: the model copies that
+/// word back, and a literal project *named* "global" appears in the store,
+/// sitting alongside the real global row as a duplicate. `null` is what the
+/// schema means, so `null` is what the listing shows.
+const GLOBAL_SCOPE_LABEL: &str = "null";
+
 /// Maximum characters of a single item's content included in a consolidation
 /// prompt (full content matters for contradiction detection, but a runaway
 /// item must not blow the context).
@@ -100,7 +110,7 @@ pub(crate) fn consolidation_user_prompt(cluster: &[MemoryItem]) -> String {
             "### [{kind}] {name}\n- project: {project}\n- last updated (unix): {updated}, updates: {count}\n\n{content}\n\n",
             kind = item.kind(),
             name = item.name(),
-            project = item.project().unwrap_or("global"),
+            project = item.project().unwrap_or(GLOBAL_SCOPE_LABEL),
             updated = item.updated_at(),
             count = item.update_count(),
             content = clamp(item.content(), MAX_CLUSTER_ITEM_CHARS),
@@ -139,7 +149,7 @@ pub(crate) fn reflection_user_prompt(items: &[MemoryItem]) -> String {
             "- [{}] {} (project: {}): {}\n",
             item.kind(),
             item.name(),
-            item.project().unwrap_or("global"),
+            item.project().unwrap_or(GLOBAL_SCOPE_LABEL),
             clamp(&one_line(item.content()), MAX_REFLECTION_ITEM_CHARS)
         ));
     }
@@ -191,7 +201,7 @@ pub(crate) fn skill_synthesis_user_prompt(items: &[&MemoryItem]) -> String {
             "### [{kind}] {name}\n- project: {project}\n- updates: {count}\n\n{content}\n\n",
             kind = item.kind(),
             name = item.name(),
-            project = item.project().unwrap_or("global"),
+            project = item.project().unwrap_or(GLOBAL_SCOPE_LABEL),
             count = item.update_count(),
             content = clamp(item.content(), MAX_SKILL_ITEM_CHARS),
         ));

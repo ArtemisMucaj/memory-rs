@@ -1,207 +1,246 @@
+//! Persistence port for the append-only memory graph.
+//!
+//! The store is a log, not a table of current values: an "update" is a *new*
+//! memory that closes out an old one through a typed edge, so nothing written by
+//! ingestion is ever rewritten in place. That is what makes supersession
+//! history, provenance and reversibility answerable — questions a
+//! mutate-in-place store destroys the moment it answers them.
+//!
+//! Two consequences show up directly in these signatures. Retiring a memory is a
+//! *status transition* ([`MemoryRepository::set_memory_status`]), never a delete;
+//! and the one destructive method
+//! ([`MemoryRepository::delete_memories_for_session`]) is scoped to a single
+//! session because re-running extraction over an unchanged transcript is a
+//! do-over, not a new observation.
+
 use async_trait::async_trait;
 
 use crate::domain::{
-    DomainError, DreamRun, ImportedSession, MemoryItem, MemoryKind, MemoryNode, NodeKind,
+    DomainError, EdgeType, Entity, Memory, MemoryEdge, MemoryKind, MemoryStatus, MemoryStoreStats,
 };
 
-/// Persistence port for long-term memory items and imported-session records.
+/// Persistence port for memories, typed edges, and resolved entities.
 ///
-/// Memory lives in its own store (a dedicated DuckDB file, separate from the
-/// code index) so that importing sessions never contends with indexing and
-/// the memory database can be inspected, backed up, or wiped independently.
+/// Vectors are the embedding of the memory `statement` / entity name; `None`
+/// when embeddings are unavailable (the row stays keyword-searchable).
+///
+/// Scope filters take `projects: Option<&[String]>` rather than a single
+/// project because a namespace resolves to *many* projects, and namespace-wide
+/// recall is a shipped feature. `None` means every scope; `Some(&[])` means
+/// globals only.
 #[async_trait]
 pub trait MemoryRepository: Send + Sync {
-    /// Insert or replace a memory item, keyed by `(kind, name, project)`.
+    // ── Memories (append-only log) ─────────────────────────────────────────
+
+    /// Append a memory to the log, with its optional statement embedding.
     ///
-    /// `vector` is the embedding of the item content; `None` when embeddings
-    /// are unavailable (the item remains keyword-searchable).
-    async fn upsert_item(
+    /// The memory id is expected to be unique; appending a memory whose id
+    /// already exists replaces that row (idempotent re-append), but callers on
+    /// the ingestion path always mint a fresh id — an "update" is a new memory.
+    async fn append_memory(
         &self,
-        item: &MemoryItem,
+        memory: &Memory,
         vector: Option<&[f32]>,
     ) -> Result<(), DomainError>;
 
-    /// Find the item with exactly this identity. `project: None` addresses the
-    /// global item, which is a *different* item from a same-named one scoped to
-    /// a project — two projects that independently learn "flaky_test_fix" keep
-    /// separate memories rather than overwriting each other.
-    async fn find_item(
-        &self,
-        kind: MemoryKind,
-        name: &str,
-        project: Option<&str>,
-    ) -> Result<Option<MemoryItem>, DomainError>;
+    /// Fetch a memory by id.
+    async fn find_memory(&self, id: &str) -> Result<Option<Memory>, DomainError>;
 
-    /// Every item sharing `(kind, name)` across all project scopes, newest
-    /// first. For callers holding a `kind/name` reference with no project to
-    /// disambiguate it (CLI `show`/`delete`, model-issued deletes).
-    async fn find_items_named(
-        &self,
-        kind: MemoryKind,
-        name: &str,
-    ) -> Result<Vec<MemoryItem>, DomainError>;
+    /// Fetch many memories by id in one query.
+    ///
+    /// Recall walks enrichment edges and then needs the memories those edges
+    /// point at; resolving them one call at a time is an N+1 against a
+    /// connection shared with nodes, sessions and digests. Unknown ids are
+    /// skipped rather than erroring, and the result order is unspecified.
+    async fn find_memories(&self, ids: &[String]) -> Result<Vec<Memory>, DomainError>;
 
-    /// Find an item by its ID.
-    async fn find_item_by_id(&self, id: &str) -> Result<Option<MemoryItem>, DomainError>;
-
-    /// Delete by the full `(kind, name, project)` identity. Returns `true` when
-    /// an item was removed.
-    async fn delete_item(
+    /// List memories, newest first, optionally restricted by `kind`, lifecycle
+    /// `status`, and scope (`projects` plus globals).
+    async fn list_memories(
         &self,
-        kind: MemoryKind,
-        name: &str,
-        project: Option<&str>,
+        kind: Option<MemoryKind>,
+        status: Option<MemoryStatus>,
+        projects: Option<&[String]>,
+    ) -> Result<Vec<Memory>, DomainError>;
+
+    /// Transition a memory's lifecycle status, optionally closing its validity
+    /// window (`valid_to`). Returns whether the memory existed. This is the
+    /// non-destructive way an append-only store retires a memory (e.g. flipping
+    /// it to `superseded` when a newer memory supersedes it).
+    ///
+    /// `valid_to: None` leaves any existing `valid_to` untouched — retracting a
+    /// memory must not silently rewrite when it stopped being true. Use
+    /// [`Self::reopen_memory`] to actually clear it.
+    async fn set_memory_status(
+        &self,
+        id: &str,
+        status: MemoryStatus,
+        valid_to: Option<i64>,
     ) -> Result<bool, DomainError>;
 
-    /// Delete by item ID. Returns `true` when an item was removed.
-    async fn delete_item_by_id(&self, id: &str) -> Result<bool, DomainError>;
-
-    /// List items, optionally restricted to one kind, newest first.
-    async fn list_items(&self, kind: Option<MemoryKind>) -> Result<Vec<MemoryItem>, DomainError>;
-
-    /// Cosine-similarity search over item embeddings.
-    /// Returns `(item, score)` pairs, best first, score in `[0, 1]`.
+    /// Overwrite a memory's confidence, returning whether the memory existed.
     ///
-    /// `projects` scopes the search: `None` searches everything; `Some(list)`
-    /// returns global items plus items belonging to any project in `list`. A
-    /// single-project scope passes a one-element slice; a namespace passes its
-    /// member projects. An empty slice restricts to globals only.
-    async fn search_semantic(
-        &self,
-        vector: &[f32],
-        kind: Option<MemoryKind>,
-        projects: Option<&[String]>,
-        limit: usize,
-    ) -> Result<Vec<(MemoryItem, f32)>, DomainError>;
-
-    /// Case-insensitive keyword search over item names and content.
-    /// Returns `(item, score)` pairs, best first. `projects` scopes as in
-    /// [`Self::search_semantic`].
-    async fn search_keyword(
-        &self,
-        query: &str,
-        kind: Option<MemoryKind>,
-        projects: Option<&[String]>,
-        limit: usize,
-    ) -> Result<Vec<(MemoryItem, f32)>, DomainError>;
-
-    /// Stored embedding for every item that has one, as `(item_id, vector)`.
-    /// Items without a vector (embeddings disabled at write time) are omitted.
-    /// Used by dream consolidation to cluster near-duplicate memories.
-    async fn list_item_vectors(&self) -> Result<Vec<(String, Vec<f32>)>, DomainError>;
-
-    /// Stored embedding for a single item by ID, or `None` if it has none.
-    /// Used to preserve an item's existing vector across an update whose
-    /// re-embedding transiently failed, so it is not dropped from recall.
-    async fn find_item_vector(&self, id: &str) -> Result<Option<Vec<f32>>, DomainError>;
-
-    /// Record that a session has been imported (idempotence marker).
-    async fn record_session(&self, session: &ImportedSession) -> Result<(), DomainError>;
-
-    async fn find_session(&self, id: &str) -> Result<Option<ImportedSession>, DomainError>;
-
-    /// List imported sessions, newest first.
-    async fn list_sessions(&self) -> Result<Vec<ImportedSession>, DomainError>;
-
-    // ── Virtual filesystem nodes (L0/L1/L2) ──────────────────────────────
-
-    /// Insert or replace a node, keyed by its `uri`.
+    /// Not an append-only violation, for the same reason
+    /// [`Self::set_memory_status`] is not: confidence is lifecycle metadata
+    /// *about* an assertion, not the assertion itself. The memory's statement,
+    /// its embedding and its recall behaviour are untouched.
     ///
-    /// `vector` is the embedding of the node's L0/L1 summary; `None` when
-    /// embeddings are unavailable (the node remains keyword-searchable and
-    /// browsable by URI).
-    async fn upsert_node(
+    /// It exists as its own method because the alternative — reading the memory,
+    /// editing the field and re-appending it — routes through
+    /// [`Self::append_memory`], which replaces the row *and its vector*. A
+    /// caller that re-appended without re-embedding would silently drop the
+    /// memory out of semantic recall as a side effect of nudging a number.
+    async fn set_memory_confidence(&self, id: &str, confidence: f32) -> Result<bool, DomainError>;
+
+    /// Return a memory to `active` *and* clear its `valid_to`.
+    ///
+    /// The consolidation pass can decide that a supersession was wrong — that
+    /// the older memory is in fact still true. Restoring it needs to clear the
+    /// validity window, which [`Self::set_memory_status`] deliberately will not
+    /// do: a reopened memory carrying a stale `valid_to` would assert that it
+    /// stopped being true at a moment it did not.
+    async fn reopen_memory(&self, id: &str) -> Result<bool, DomainError>;
+
+    /// Hard-delete every memory whose provenance is `session_id`, along with its
+    /// vector and any edges touching it. The single sanctioned destructive
+    /// operation, used only by a forced re-import: re-running extraction over an
+    /// unchanged transcript is a do-over, not a new observation, so the prior
+    /// run's memories are wiped rather than tombstoned. Returns the number of
+    /// memories removed.
+    async fn delete_memories_for_session(&self, session_id: &str) -> Result<usize, DomainError>;
+
+    /// How many memories currently carry `session_id` as their provenance. Used
+    /// as the ingestion idempotence marker: a non-forced re-ingest of a session
+    /// that already produced memories is skipped.
+    async fn count_memories_for_session(&self, session_id: &str) -> Result<usize, DomainError>;
+
+    // ── Typed edges ──────────────────────────────────────────────────────
+
+    /// Insert (or replace) a typed edge between two memories, keyed by
+    /// `(from, to, type)`.
+    async fn add_edge(&self, edge: &MemoryEdge) -> Result<(), DomainError>;
+
+    /// Edges originating at `memory_id`.
+    async fn edges_from(&self, memory_id: &str) -> Result<Vec<MemoryEdge>, DomainError>;
+
+    /// Edges pointing at `memory_id`.
+    async fn edges_to(&self, memory_id: &str) -> Result<Vec<MemoryEdge>, DomainError>;
+
+    /// Every edge touching any of `ids`, in either direction, in one query.
+    ///
+    /// Recall now returns each hit's provenance — what it superseded, what
+    /// corroborates it, what it still contradicts — which means edges are
+    /// needed for a whole result set at once. Doing that with `edges_from` +
+    /// `edges_to` per hit is two round-trips per result on a connection shared
+    /// with nodes, sessions and digests. Duplicate ids are tolerated; the
+    /// result order is unspecified.
+    async fn edges_for(&self, ids: &[String]) -> Result<Vec<MemoryEdge>, DomainError>;
+
+    /// Every edge of one type, or every edge when `edge_type` is `None`.
+    ///
+    /// This is how the conflict queue is derived rather than stored: the
+    /// unresolved conflicts are the `contradicts` edges whose two endpoints are
+    /// both still active. A memory therefore cannot get *stuck* in a conflicted
+    /// state — resolving one simply means one endpoint stops being active.
+    async fn list_edges(&self, edge_type: Option<EdgeType>)
+        -> Result<Vec<MemoryEdge>, DomainError>;
+
+    // ── Entities ─────────────────────────────────────────────────────────
+
+    /// Insert or replace an entity (and every name it goes by), keyed by id,
+    /// with its optional name embedding.
+    async fn upsert_entity(
         &self,
-        node: &MemoryNode,
+        entity: &Entity,
         vector: Option<&[f32]>,
     ) -> Result<(), DomainError>;
 
-    /// Fetch a single node by its `memory://` URI.
-    async fn find_node(&self, uri: &str) -> Result<Option<MemoryNode>, DomainError>;
+    /// Fetch an entity by id.
+    async fn find_entity(&self, id: &str) -> Result<Option<Entity>, DomainError>;
 
-    /// Delete a node (and its embedding) by URI. Returns whether it existed.
-    async fn delete_node(&self, uri: &str) -> Result<bool, DomainError>;
+    /// Every entity reachable from `name` under
+    /// [`entity_name_key`](crate::domain::entity_name_key) — an exact match on
+    /// any name it goes by, canonical or learned, once both sides are
+    /// normalized.
+    ///
+    /// The cheap leg of entity resolution, and the one that short-circuits
+    /// *before* the embedding call — which is why it stays even though
+    /// similarity search would also find an exact match. It is also the only
+    /// leg that works when embeddings are disabled.
+    ///
+    /// Returns a list rather than the first hit because the key is deliberately
+    /// broader than the name: two entities of different types can share one, and
+    /// the caller is what decides which (if either) the mention means.
+    async fn find_entities_by_name(&self, name: &str) -> Result<Vec<Entity>, DomainError>;
 
-    /// List the direct children of a directory URI (its immediate members in
-    /// the virtual filesystem), newest first.
-    async fn list_child_nodes(&self, parent_uri: &str) -> Result<Vec<MemoryNode>, DomainError>;
+    /// Memories referencing `entity_id` as subject or object, newest first.
+    ///
+    /// The FK points memory → entity, so this is the reverse direction and the
+    /// only way to answer "what do we know about this thing". Both columns are
+    /// searched because an entity is as often the object of a memory as the
+    /// subject.
+    async fn memories_for_entity(&self, entity_id: &str) -> Result<Vec<Memory>, DomainError>;
 
-    /// List nodes, optionally restricted to one kind, newest first.
-    async fn list_nodes(&self, kind: Option<NodeKind>) -> Result<Vec<MemoryNode>, DomainError>;
+    /// Fetch many entities by id in one query. Unknown ids are skipped.
+    ///
+    /// Every surface renders a memory's subject and object, and a raw entity id
+    /// is meaningless to a reader — the canonical name is the short, humane
+    /// label the graph already holds. Resolving those one at a time would be an
+    /// N+1 per rendered list.
+    async fn find_entities(&self, ids: &[String]) -> Result<Vec<Entity>, DomainError>;
 
-    /// Cosine-similarity search over node L0/L1 embeddings.
-    /// Returns `(node, score)` pairs, best first, score in `[0, 1]`.
-    async fn search_nodes_semantic(
+    /// List all entities, newest first.
+    async fn list_entities(&self) -> Result<Vec<Entity>, DomainError>;
+
+    /// Cosine-similarity search over entity name embeddings — the fuzzy second
+    /// leg of entity resolution. Returns `(entity, score)` best first.
+    async fn search_entities_semantic(
         &self,
         vector: &[f32],
-        kind: Option<NodeKind>,
         limit: usize,
-    ) -> Result<Vec<(MemoryNode, f32)>, DomainError>;
+    ) -> Result<Vec<(Entity, f32)>, DomainError>;
 
-    /// Case-insensitive keyword search over node abstracts and overviews.
-    /// Returns `(node, score)` pairs, best first.
-    async fn search_nodes_keyword(
+    /// Move every memory reference from entity `from` to entity `to`, returning
+    /// how many references moved (subject and object both count).
+    ///
+    /// This is how consolidation merges two entities that ingestion created
+    /// separately. It is *not* a breach of the append-only rule: a memory's
+    /// assertion — its statement, and therefore its embedding and its recall
+    /// behaviour — is untouched, and only an internal foreign key is repaired.
+    async fn repoint_entity(&self, from: &str, to: &str) -> Result<usize, DomainError>;
+
+    /// Delete an entity along with its names and vector. Only safe once
+    /// [`Self::repoint_entity`] has moved its memories elsewhere.
+    async fn delete_entity(&self, id: &str) -> Result<bool, DomainError>;
+
+    // ── Memory retrieval (entry-point finder) ─────────────────────────────
+
+    /// Cosine-similarity search over `active` memory statement embeddings,
+    /// filtered by `kind` and scope. Returns `(memory, score)` best first, score
+    /// in `[0, 1]`.
+    async fn search_memories_semantic(
+        &self,
+        vector: &[f32],
+        kind: Option<MemoryKind>,
+        projects: Option<&[String]>,
+        limit: usize,
+    ) -> Result<Vec<(Memory, f32)>, DomainError>;
+
+    /// Case-insensitive keyword search over `active` memory statements, filtered
+    /// by `kind` and scope. Returns `(memory, score)` best first.
+    async fn search_memories_keyword(
         &self,
         query: &str,
-        kind: Option<NodeKind>,
+        kind: Option<MemoryKind>,
+        projects: Option<&[String]>,
         limit: usize,
-    ) -> Result<Vec<(MemoryNode, f32)>, DomainError>;
+    ) -> Result<Vec<(Memory, f32)>, DomainError>;
 
-    // ── Dream runs ───────────────────────────────────────────────────────
+    /// Stored embedding for every memory that has one, as `(memory_id, vector)`.
+    /// Memories without a vector are omitted. Used by consolidation to cluster
+    /// near-duplicate memories.
+    async fn list_memory_embeddings(&self) -> Result<Vec<(String, Vec<f32>)>, DomainError>;
 
-    /// Record a completed dream cycle.
-    async fn record_dream_run(&self, run: &DreamRun) -> Result<(), DomainError>;
-
-    /// The most recently finished dream run, if any.
-    async fn last_dream_run(&self) -> Result<Option<DreamRun>, DomainError>;
-
-    // ── Namespaces (cohesive groups of projects) ─────────────────────────────
-
-    /// Create a namespace (a named group of projects). Idempotent — creating an
-    /// existing namespace is a no-op. Returns `true` when it was newly created.
-    async fn create_namespace(&self, name: &str) -> Result<bool, DomainError>;
-
-    /// Delete a namespace and all its project memberships (the member projects'
-    /// items are untouched — only the grouping is removed). Returns whether it
-    /// existed.
-    async fn delete_namespace(&self, name: &str) -> Result<bool, DomainError>;
-
-    /// Add `project` to `namespace` (creating the namespace if needed).
-    /// Idempotent. Returns `true` when the membership was newly added.
-    async fn assign_project(&self, namespace: &str, project: &str) -> Result<bool, DomainError>;
-
-    /// Remove `project` from `namespace`. Returns whether the membership existed.
-    async fn unassign_project(&self, namespace: &str, project: &str) -> Result<bool, DomainError>;
-
-    /// All namespaces with their member-project counts, name order.
-    async fn list_namespaces(&self) -> Result<Vec<(String, u64)>, DomainError>;
-
-    /// The member projects of `namespace`, name order (empty if it has none or
-    /// does not exist).
-    async fn namespace_projects(&self, namespace: &str) -> Result<Vec<String>, DomainError>;
-
-    /// Aggregate memory-store statistics: item counts by kind, session count,
-    /// and node counts by kind.
-    async fn stats(&self) -> Result<MemoryStats, DomainError>;
-
-    /// The embedding model that wrote the stored vectors, persisted on first
-    /// open. This is authoritative for **retrieval**: queries must be embedded
-    /// with the same model the vectors were, or the cosine comparison is
-    /// meaningless. Empty only for a store that has never recorded one.
-    async fn embedding_model(&self) -> Result<String, DomainError>;
-}
-
-/// Statistics about the memory store.
-#[derive(Debug, Clone, Default)]
-pub struct MemoryStats {
-    /// Total memory items across all kinds.
-    pub total_items: u64,
-    /// Breakdown of memory items by kind.
-    pub items_by_kind: Vec<(String, u64)>,
-    /// Total imported sessions.
-    pub total_sessions: u64,
-    /// Total nodes across all kinds.
-    pub total_nodes: u64,
-    /// Breakdown of nodes by kind.
-    pub nodes_by_kind: Vec<(String, u64)>,
+    /// Aggregate store statistics.
+    async fn memory_stats(&self) -> Result<MemoryStoreStats, DomainError>;
 }

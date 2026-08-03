@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::application::interfaces::{Embedder, MemoryRepository};
+use crate::application::interfaces::{Embedder, NodeRepository};
 use crate::domain::{DomainError, MemoryItem, MemoryKind};
 
 /// RRF dampening constant (standard value used across the codebase).
@@ -15,14 +15,14 @@ const RRF_K: f32 = 60.0;
 const CANDIDATES_PER_LEG: usize = 20;
 
 pub struct MemorySearchUseCase {
-    memory_repo: Arc<dyn MemoryRepository>,
+    node_repo: Arc<dyn NodeRepository>,
     embedding_service: Arc<Embedder>,
 }
 
 impl MemorySearchUseCase {
-    pub fn new(memory_repo: Arc<dyn MemoryRepository>, embedding_service: Arc<Embedder>) -> Self {
+    pub fn new(node_repo: Arc<dyn NodeRepository>, embedding_service: Arc<Embedder>) -> Self {
         Self {
-            memory_repo,
+            node_repo,
             embedding_service,
         }
     }
@@ -33,7 +33,7 @@ impl MemorySearchUseCase {
     /// `projects` scopes the search to global items plus items belonging to any
     /// listed project (a single project, or a namespace's member projects);
     /// `None` searches the whole store. See
-    /// [`MemoryRepository::search_semantic`](crate::application::MemoryRepository::search_semantic).
+    /// [`NodeRepository::search_semantic`](crate::application::NodeRepository::search_semantic).
     pub async fn execute(
         &self,
         query: &str,
@@ -48,14 +48,14 @@ impl MemorySearchUseCase {
 
         let semantic = if self.embedding_service.embeddings_enabled() {
             let vector = self.embedding_service.embed_query(query).await?;
-            self.memory_repo
+            self.node_repo
                 .search_semantic(&vector, kind, projects, CANDIDATES_PER_LEG)
                 .await?
         } else {
             Vec::new()
         };
         let keyword = self
-            .memory_repo
+            .node_repo
             .search_keyword(query, kind, projects, CANDIDATES_PER_LEG)
             .await?;
 

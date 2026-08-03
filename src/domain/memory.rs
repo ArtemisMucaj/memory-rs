@@ -212,12 +212,19 @@ impl SessionTranscript {
 }
 
 /// Record of a session that has been imported into the memory store.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportedSession {
     pub id: String,
     pub source: String,
     pub imported_at: i64,
     pub message_count: usize,
+    /// The project the session was worked in, when the transcript names one.
+    ///
+    /// Recorded on the session rather than derived from the memories it wrote,
+    /// because a session that produced nothing durable is still part of the
+    /// answer to "what was I working on" — and deriving it would make exactly
+    /// those sessions invisible.
+    pub project: Option<String>,
     /// Number of memory items written (created or updated) by the extraction.
     pub items_written: usize,
     /// Why this session was recorded. A failed attempt is recorded too, so the

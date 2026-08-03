@@ -124,7 +124,7 @@ impl ImportScreen {
     }
 
     fn seed_imported(&mut self, container: &Container) {
-        let Ok(repo) = container.memory_repository() else {
+        let Ok(repo) = container.node_repository() else {
             return;
         };
         let events_tx = self.events_tx.clone();
@@ -284,7 +284,7 @@ impl ImportScreen {
                         summary: format!(
                             "Imported '{}' — {} memories",
                             session.display_title(),
-                            report.applied.len()
+                            report.memories_written
                         ),
                     });
                 }

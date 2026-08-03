@@ -18,9 +18,12 @@ use tracing::{debug, warn};
 
 use openai_rs::ChatClient;
 
-use crate::application::interfaces::{Embedder, MemoryRepository};
+use crate::application::interfaces::{Embedder, NodeRepository};
+use crate::application::use_cases::llm_json::{
+    extract_json_object, normalize_name, repair_json_string_escapes, unix_now,
+};
 use crate::application::use_cases::memory_extraction_prompt as prompt;
-use crate::application::use_cases::memory_support::{unix_now, upsert_preserving_identity};
+use crate::application::use_cases::memory_support::{upsert_preserving_identity, WriteScope};
 use crate::domain::{DomainError, MemoryItem, MemoryKind, MemoryOperation, SessionTranscript};
 
 /// How many existing memories are prefetched into the extraction context.
@@ -29,9 +32,6 @@ const PREFETCH_LIMIT: usize = 8;
 /// Upper bound on operations applied from a single extraction, as a guard
 /// against a runaway model flooding the store with noise.
 const MAX_OPERATIONS_PER_RUN: usize = 24;
-
-/// Maximum length of a normalized item name.
-const MAX_NAME_CHARS: usize = 64;
 
 /// Outcome of one extraction run.
 #[derive(Debug, Default)]
@@ -104,19 +104,19 @@ struct RawDelete {
 
 pub struct MemoryExtractionUseCase {
     chat_client: Arc<dyn ChatClient>,
-    memory_repo: Arc<dyn MemoryRepository>,
+    node_repo: Arc<dyn NodeRepository>,
     embedding_service: Arc<Embedder>,
 }
 
 impl MemoryExtractionUseCase {
     pub fn new(
         chat_client: Arc<dyn ChatClient>,
-        memory_repo: Arc<dyn MemoryRepository>,
+        node_repo: Arc<dyn NodeRepository>,
         embedding_service: Arc<Embedder>,
     ) -> Self {
         Self {
             chat_client,
-            memory_repo,
+            node_repo,
             embedding_service,
         }
     }
@@ -148,7 +148,7 @@ impl MemoryExtractionUseCase {
                     // actually relevant to this project/namespace.
                     let scope = transcript.project.clone().map(|p| vec![p]);
                     match self
-                        .memory_repo
+                        .node_repo
                         .search_semantic(&vector, None, scope.as_deref(), PREFETCH_LIMIT)
                         .await
                     {
@@ -162,7 +162,7 @@ impl MemoryExtractionUseCase {
         // No embeddings: surface the most recent items instead so merging
         // still has a chance to happen. Filter to the transcript's project
         // (global memories plus its project/namespace items) before the limit.
-        match self.memory_repo.list_items(None).await {
+        match self.node_repo.list_items(None).await {
             Ok(items) => {
                 let mut filtered: Vec<MemoryItem> = items
                     .into_iter()
@@ -248,12 +248,13 @@ impl MemoryExtractionUseCase {
                     ref project,
                 } => {
                     upsert_preserving_identity(
-                        self.memory_repo.as_ref(),
+                        self.node_repo.as_ref(),
                         self.embedding_service.as_ref(),
                         kind,
                         name,
                         content,
                         project.clone(),
+                        WriteScope::Session(transcript.project.as_deref()),
                         Some(&transcript.id),
                         now,
                     )
@@ -265,14 +266,14 @@ impl MemoryExtractionUseCase {
                     // its prefetch context: this session's project, or a
                     // global. Resolve within that scope so a delete never
                     // reaches a same-named memory owned by another project.
-                    let candidates = self.memory_repo.find_items_named(kind, name).await?;
+                    let candidates = self.node_repo.find_items_named(kind, name).await?;
                     let target = candidates
                         .iter()
                         .find(|item| item.project() == transcript.project.as_deref())
                         .or_else(|| candidates.iter().find(|item| item.project().is_none()));
                     match target {
                         Some(item) => {
-                            self.memory_repo.delete_item_by_id(item.id()).await?;
+                            self.node_repo.delete_item_by_id(item.id()).await?;
                             report.applied.push(op);
                         }
                         None => report.skipped.push((op, "item not found".to_string())),
@@ -395,109 +396,6 @@ fn parse_operations(
         operations.push(MemoryOperation::Delete { kind, name });
     }
     Ok(operations)
-}
-
-/// Repair invalid backslash escapes inside JSON string literals.
-///
-/// Small local models frequently emit markdown content with escapes that are
-/// valid in Markdown but invalid in JSON — `\_`, `\(`, `\<`, a trailing `\`,
-/// or raw control characters (a literal newline/tab) inside a string. Strict
-/// `serde_json` rejects all of these. This walks the text tracking string
-/// context and, inside strings, passes valid JSON escapes through untouched
-/// while escaping anything else so the result parses. Text outside strings is
-/// left exactly as-is.
-pub(crate) fn repair_json_string_escapes(json: &str) -> String {
-    let mut out = String::with_capacity(json.len() + json.len() / 16);
-    let mut in_string = false;
-    let mut chars = json.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if !in_string {
-            if ch == '"' {
-                in_string = true;
-            }
-            out.push(ch);
-            continue;
-        }
-        match ch {
-            '"' => {
-                in_string = false;
-                out.push(ch);
-            }
-            '\\' => match chars.peek() {
-                // Valid JSON escape — copy the pair through verbatim.
-                Some(&next @ ('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u')) => {
-                    out.push('\\');
-                    out.push(next);
-                    chars.next();
-                }
-                // Invalid escape (`\_`, `\(`, …) or a trailing backslash:
-                // escape the backslash itself so it becomes a literal.
-                _ => out.push_str("\\\\"),
-            },
-            // Raw control characters are illegal inside a JSON string; escape
-            // the common ones and drop anything else unrepresentable.
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {}
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-/// Extract the first balanced `{ ... }` object from mixed model output.
-pub(crate) fn extract_json_object(text: &str) -> Option<&str> {
-    let start = text.find('{')?;
-    let mut depth = 0usize;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (offset, ch) in text[start..].char_indices() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match ch {
-            '"' => in_string = true,
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(&text[start..start + offset + ch.len_utf8()]);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Normalize an item name to lowercase snake_case; `None` when empty.
-pub(crate) fn normalize_name(raw: &str) -> Option<String> {
-    let name: String = raw
-        .trim()
-        .to_lowercase()
-        .chars()
-        .map(|c| {
-            if c.is_whitespace() || c == '-' {
-                '_'
-            } else {
-                c
-            }
-        })
-        .filter(|c| c.is_alphanumeric() || *c == '_')
-        .collect();
-    let name = name.trim_matches('_').to_string();
-    if name.is_empty() {
-        return None;
-    }
-    Some(name.chars().take(MAX_NAME_CHARS).collect())
 }
 
 #[cfg(test)]
@@ -635,12 +533,6 @@ mod tests {
             panic!("expected upsert");
         };
         assert_eq!(content, "line one\nline two");
-    }
-
-    #[test]
-    fn repair_leaves_valid_escapes_untouched() {
-        let valid = r#"{"a": "tab\there \"quoted\" and \\ slash and \n newline"}"#;
-        assert_eq!(repair_json_string_escapes(valid), valid);
     }
 
     #[test]

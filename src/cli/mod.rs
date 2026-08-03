@@ -7,11 +7,18 @@
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+use crate::application::DEFAULT_SESSION_LIMIT;
 use crate::connector::adapter::DEFAULT_EMBEDDING_DIMENSIONS;
 use crate::domain::{MemoryKind, NodeKind};
 
-/// Long-term memory for coding assistants: import sessions, extract durable
-/// memories, recall by hybrid search.
+/// clap needs a `const fn`-able default; the constant lives with the use case
+/// so the CLI, MCP and HTTP surfaces all brief over the same window.
+const fn memory_rs_default_resume_limit() -> usize {
+    DEFAULT_SESSION_LIMIT
+}
+
+/// Long-term memory for coding assistants: import sessions, ingest durable
+/// memories, recall by hybrid search over an append-only memory graph.
 #[derive(Debug, Parser)]
 #[command(name = "memory-rs", version, about)]
 pub struct Cli {
@@ -83,22 +90,27 @@ impl From<NodeKindArg> for NodeKind {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Import a finished session transcript and extract memories from it.
+    /// Import a finished session transcript and ingest memories from it.
     ///
     /// PATH is a Claude Code session log
     /// (`~/.claude/projects/<project>/<id>.jsonl`) or a generic JSONL chat log
-    /// (`{"role": "...", "content": "..."}` per line). Extraction calls the
+    /// (`{"role": "...", "content": "..."}` per line). Ingestion calls the
     /// configured LLM.
     Import {
         /// Path to a transcript file (JSONL).
         path: String,
 
-        /// Re-import even if this session was already imported.
+        /// Re-import even if this session was already imported. This clears
+        /// the session's prior memories first — the one destructive operation in
+        /// the store.
         #[arg(short, long)]
         force: bool,
     },
 
-    /// Search stored memories (hybrid semantic + keyword).
+    /// Recall stored memories (hybrid semantic + keyword, then a graph walk).
+    ///
+    /// Only current memories are returned — superseded, retracted and unsettled
+    /// ones never surface.
     Search {
         query: String,
 
@@ -110,12 +122,12 @@ pub enum Command {
         #[arg(short, long, value_enum)]
         kind: Option<MemoryKindArg>,
 
-        /// Restrict to memories relevant in this project (its items plus
+        /// Restrict to memories relevant in this project (its memories plus
         /// globals). Omit to search everything.
         #[arg(long)]
         project: Option<String>,
 
-        /// Restrict to a namespace: the union of its member projects' items,
+        /// Restrict to a namespace: the union of its member projects' memories,
         /// plus globals. Mutually exclusive with --project.
         #[arg(long, conflicts_with = "project")]
         namespace: Option<String>,
@@ -131,26 +143,58 @@ pub enum Command {
         #[arg(short, long, value_enum)]
         kind: Option<MemoryKindArg>,
 
+        /// Lifecycle status: active (default), superseded, retracted, or all.
+        #[arg(long, default_value = "active")]
+        status: String,
+
         /// Output format: text or json.
         #[arg(short = 'F', long, value_enum, default_value = "text")]
         format: OutputFormat,
     },
 
-    /// Show the full content of one memory item or virtual-filesystem node.
+    /// Show one memory with its typed edges, or a virtual-filesystem node.
     Show {
-        /// Memory item ID, a `kind/name` item reference, or a `memory://` node
-        /// URI (e.g. `memory://memory`, `memory://sessions/<id>`).
+        /// A memory ID, or a `memory://` node URI (e.g. `memory://memory`,
+        /// `memory://sessions/<id>`).
         id: String,
     },
 
-    /// Delete a memory item by ID, or a `kind/name` reference.
+    /// Forget a memory: mark it as never having been true.
+    ///
+    /// The memory is retracted, not deleted — an append-only store keeps it for
+    /// provenance, and it simply stops being recalled.
     Delete {
-        /// Memory item ID or a `kind/name` reference.
+        /// A memory ID.
         id: String,
     },
 
     /// List imported sessions.
     Sessions {
+        /// Output format: text or json.
+        #[arg(short = 'F', long, value_enum, default_value = "text")]
+        format: OutputFormat,
+    },
+
+    /// Brief yourself on recent work: the latest sessions and what they left
+    /// behind, so you can pick up where you stopped without re-explaining.
+    ///
+    /// Each entry is the session's summary, the arc of what happened, and the
+    /// durable memories it produced. No LLM call — every part was written when
+    /// the session was imported.
+    Resume {
+        /// Restrict to sessions worked in this project.
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Restrict to a namespace: sessions across its member projects.
+        /// Mutually exclusive with --project.
+        #[arg(long, conflicts_with = "project")]
+        namespace: Option<String>,
+
+        /// How many sessions to cover, newest first.
+        #[arg(short, long, default_value_t = memory_rs_default_resume_limit())]
+        limit: usize,
+
         /// Output format: text or json.
         #[arg(short = 'F', long, value_enum, default_value = "text")]
         format: OutputFormat,
@@ -192,8 +236,20 @@ pub enum Command {
         format: OutputFormat,
     },
 
-    /// Show memory-store statistics.
+    /// Show memory-store statistics, including the unresolved-conflict count.
     Stats {
+        /// Output format: text or json.
+        #[arg(short = 'F', long, value_enum, default_value = "text")]
+        format: OutputFormat,
+    },
+
+    /// List unresolved disagreements: pairs of memories that contradict each
+    /// other and are both still current.
+    ///
+    /// Both sides keep answering queries — nothing is hidden while a conflict
+    /// stands. The consolidation pass reconciles a pair by writing a new memory
+    /// that supersedes both, at which point it drops off this list.
+    Conflicts {
         /// Output format: text or json.
         #[arg(short = 'F', long, value_enum, default_value = "text")]
         format: OutputFormat,

@@ -282,7 +282,7 @@ pub async fn run(container: Container, logs: LogCapture) -> Result<(), DomainErr
 mod tests {
     use super::*;
     use crate::connector::api::ContainerConfig;
-    use crate::domain::{MemoryItem, MemoryKind};
+    use crate::domain::{MemoryKind, Predicate};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -324,21 +324,40 @@ mod tests {
     async fn memory_tab_renders_grouped_tree_from_the_store() {
         let dir = tempfile::tempdir().unwrap();
         let container = temp_container(dir.path());
-        // Seed a couple of items through the real repository.
+        // Seeded through the *memory* port — the projection import writes.
         let repo = container.memory_repository().unwrap();
-        for name in ["duckdb_locks", "storage_engine"] {
-            let item = MemoryItem::new(
-                name.into(),
-                MemoryKind::Fact,
-                name.into(),
-                "content".into(),
+        for (id, predicate, statement) in [
+            (
+                "m-1",
+                "requires",
+                "duckdb takes a file lock on the database",
+            ),
+            ("m-2", "uses", "the storage engine is columnar"),
+        ] {
+            repo.append_memory(
+                &crate::domain::Memory {
+                    id: id.into(),
+                    kind: MemoryKind::Fact,
+                    subject: crate::domain::EntityRef::Literal("the project".into()),
+                    predicate: Predicate::parse(predicate).unwrap_or(Predicate::RelatesTo),
+                    object: crate::domain::EntityRef::Literal("duckdb".into()),
+                    statement: statement.into(),
+                    project: None,
+                    recorded_at: 1,
+                    valid_from: 1,
+                    valid_to: None,
+                    source_session_id: None,
+                    source_message_index: None,
+                    source_kind: crate::domain::SourceKind::UserStated,
+                    confidence: 0.9,
+                    status: crate::domain::MemoryStatus::Active,
+                    derived: false,
+                    derived_from: Vec::new(),
+                },
                 None,
-                None,
-                0,
-                0,
-                0,
-            );
-            repo.upsert_item(&item, None).await.unwrap();
+            )
+            .await
+            .unwrap();
         }
 
         let mut app = App::new(container, LogCapture::new());
@@ -346,7 +365,17 @@ mod tests {
         let text = render_to_text(&mut app, 120, 24);
         assert!(text.contains("Memories"), "top group renders");
         assert!(text.contains("Facts"), "category subgroup renders");
-        assert!(text.contains("duckdb_locks"), "leaf item renders");
+        // The row is the short title — subject plus predicate — not the whole
+        // statement. A list of self-contained sentences is unreadable.
+        assert!(
+            text.contains("the project · requires · duckdb"),
+            "leaf memory renders:\n{text}"
+        );
+        assert!(text.contains("the project · uses · duckdb"));
+        assert!(
+            !text.contains("duckdb takes a file lock on the database"),
+            "the full statement belongs in the detail pane, not the row"
+        );
     }
 
     #[tokio::test]
@@ -367,7 +396,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let seed = temp_container(dir.path()); // 4 dims (see helper)
-            seed.memory_repository().unwrap(); // creates memory.duckdb at dim 4
+            seed.node_repository().unwrap(); // creates memory.duckdb at dim 4
         }
         let mismatched = Container::new(ContainerConfig {
             data_dir: dir.path().to_str().unwrap().to_string(),

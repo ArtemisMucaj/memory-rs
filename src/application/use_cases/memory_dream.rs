@@ -37,14 +37,14 @@ use tracing::{debug, info, warn};
 
 use openai_rs::ChatClient;
 
-use crate::application::interfaces::{Embedder, MemoryRepository, SessionDiscovery};
+use crate::application::interfaces::{Embedder, NodeRepository, SessionDiscovery};
 use crate::application::use_cases::import_session::{ImportOutcome, ImportSessionUseCase};
-use crate::application::use_cases::memory_dream_prompt as prompt;
-use crate::application::use_cases::memory_extraction::{
-    extract_json_object, normalize_name, repair_json_string_escapes,
+use crate::application::use_cases::llm_json::{
+    extract_json_object, normalize_name, repair_json_string_escapes, unix_now,
 };
+use crate::application::use_cases::memory_dream_prompt as prompt;
 use crate::application::use_cases::memory_summary::SummarizeMemoryUseCase;
-use crate::application::use_cases::memory_support::{unix_now, upsert_preserving_identity};
+use crate::application::use_cases::memory_support::{upsert_preserving_identity, WriteScope};
 use crate::domain::{
     cosine_similarity, DomainError, DreamRun, ImportedSession, MemoryItem, MemoryKind,
     MemoryOperation, SessionStatus,
@@ -150,7 +150,7 @@ struct RawDreamDelete {
 }
 
 pub struct MemoryDreamUseCase {
-    memory_repo: Arc<dyn MemoryRepository>,
+    node_repo: Arc<dyn NodeRepository>,
     chat_client: Arc<dyn ChatClient>,
     embedding_service: Arc<Embedder>,
     discovery: Arc<dyn SessionDiscovery>,
@@ -176,7 +176,7 @@ impl Drop for RunningGuard<'_> {
 
 impl MemoryDreamUseCase {
     pub fn new(
-        memory_repo: Arc<dyn MemoryRepository>,
+        node_repo: Arc<dyn NodeRepository>,
         chat_client: Arc<dyn ChatClient>,
         embedding_service: Arc<Embedder>,
         discovery: Arc<dyn SessionDiscovery>,
@@ -184,7 +184,7 @@ impl MemoryDreamUseCase {
         summary: SummarizeMemoryUseCase,
     ) -> Self {
         Self {
-            memory_repo,
+            node_repo,
             chat_client,
             embedding_service,
             discovery,
@@ -267,7 +267,7 @@ impl MemoryDreamUseCase {
             report.sessions_failed = harvest.sessions_failed;
         }
 
-        let items = self.memory_repo.list_items(None).await?;
+        let items = self.node_repo.list_items(None).await?;
 
         // Phase 2 — consolidate near-duplicate clusters.
         let delete_budget = (items.len() / DELETE_CAP_DIVISOR).max(1);
@@ -300,7 +300,7 @@ impl MemoryDreamUseCase {
         // Phase 3 — reflect over the whole store (writes only, no deletes).
         // Reload first: consolidation just rewrote/deleted items, and stale
         // inputs would let reflection resurrect what was merged away.
-        let items = self.memory_repo.list_items(None).await?;
+        let items = self.node_repo.list_items(None).await?;
         if items.len() >= MIN_REFLECTION_ITEMS {
             match self.reflect(&items).await {
                 Ok(operations) => {
@@ -320,7 +320,7 @@ impl MemoryDreamUseCase {
         // Phase 3.5 — synthesize skills from recurring procedural memory.
         // Reload so freshly reflected items are in view, then look only at the
         // `experience`/`skill` items — the raw material for reusable procedures.
-        let items = self.memory_repo.list_items(None).await?;
+        let items = self.node_repo.list_items(None).await?;
         let procedural: Vec<MemoryItem> = items
             .into_iter()
             .filter(|item| matches!(item.kind(), MemoryKind::Experience | MemoryKind::Skill))
@@ -379,11 +379,14 @@ impl MemoryDreamUseCase {
             source: source.to_string(),
             imported_at: unix_now(),
             message_count: 0,
+            // Unknown: the transcript is what carries the project, and this
+            // marker exists precisely because it could not be read.
+            project: None,
             items_written: 0,
             status: SessionStatus::Failed,
             last_error: Some(error.to_string()),
         };
-        if let Err(e) = self.memory_repo.record_session(&session).await {
+        if let Err(e) = self.node_repo.record_session(&session).await {
             warn!("dream harvest: could not record failure for '{id}': {e}");
         }
     }
@@ -392,7 +395,7 @@ impl MemoryDreamUseCase {
         let mut report = HarvestReport::default();
         let sessions = self.discovery.discover().await?;
         let imported: HashSet<String> = self
-            .memory_repo
+            .node_repo
             .list_sessions()
             .await?
             .into_iter()
@@ -456,7 +459,7 @@ impl MemoryDreamUseCase {
         &self,
         items: &[MemoryItem],
     ) -> Result<Vec<Vec<MemoryItem>>, DomainError> {
-        let vectors = self.memory_repo.list_item_vectors().await?;
+        let vectors = self.node_repo.list_item_vectors().await?;
         let by_id: std::collections::HashMap<&str, &MemoryItem> =
             items.iter().map(|item| (item.id(), item)).collect();
         // Keep only vectors whose item still exists, in a stable order.
@@ -652,10 +655,10 @@ impl MemoryDreamUseCase {
                     // cluster key carries no project to choose by. Deleting all
                     // of them would destroy other projects' memories, so an
                     // ambiguous target is left alone.
-                    let candidates = self.memory_repo.find_items_named(kind, name).await?;
+                    let candidates = self.node_repo.find_items_named(kind, name).await?;
                     match candidates.as_slice() {
                         [item] => {
-                            self.memory_repo.delete_item_by_id(item.id()).await?;
+                            self.node_repo.delete_item_by_id(item.id()).await?;
                             *deletes_used += 1;
                             report.applied.push(op);
                         }
@@ -684,12 +687,13 @@ impl MemoryDreamUseCase {
             return Ok(());
         };
         upsert_preserving_identity(
-            self.memory_repo.as_ref(),
+            self.node_repo.as_ref(),
             self.embedding_service.as_ref(),
             *kind,
             name,
             content,
             project.clone(),
+            WriteScope::Consolidation,
             None,
             unix_now(),
         )
@@ -711,7 +715,7 @@ impl MemoryDreamUseCase {
             operations_skipped: report.skipped.len(),
             status: status.to_string(),
         };
-        if let Err(e) = self.memory_repo.record_dream_run(&run).await {
+        if let Err(e) = self.node_repo.record_dream_run(&run).await {
             warn!("failed to record dream run: {e}");
         }
     }
@@ -769,7 +773,14 @@ fn parse_dream_operations(response: &str) -> Result<Vec<MemoryOperation>, Domain
             .project
             .as_deref()
             .map(str::trim)
-            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("null"))
+            // "null"/"global" are how a global item's scope reads in the
+            // prompt and in the schema; a model echoing either back means
+            // "global", never a project that happens to be called that.
+            .filter(|s| {
+                !s.is_empty()
+                    && !s.eq_ignore_ascii_case("null")
+                    && !s.eq_ignore_ascii_case("global")
+            })
             .map(str::to_string);
         operations.push(MemoryOperation::Upsert {
             kind,
@@ -853,6 +864,22 @@ mod tests {
     fn dream_parse_treats_string_null_project_as_global() {
         let response = r#"{"items": [
             {"kind": "fact", "name": "n", "content": "c", "project": "null"}
+        ], "delete": []}"#;
+        let ops = parse_dream_operations(response).unwrap();
+        let MemoryOperation::Upsert { project, .. } = &ops[0] else {
+            panic!("expected upsert");
+        };
+        assert_eq!(*project, None);
+    }
+
+    #[test]
+    fn dream_parse_treats_string_global_project_as_global() {
+        // The prompts list an item's scope and tell the model to copy it
+        // through. When that label reads as a word, the model copies the word
+        // back — and a project literally named "global" lands in the store next
+        // to the real global row, as a duplicate of it.
+        let response = r#"{"items": [
+            {"kind": "fact", "name": "n", "content": "c", "project": "global"}
         ], "delete": []}"#;
         let ops = parse_dream_operations(response).unwrap();
         let MemoryOperation::Upsert { project, .. } = &ops[0] else {

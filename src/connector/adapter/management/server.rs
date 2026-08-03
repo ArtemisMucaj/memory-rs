@@ -12,7 +12,10 @@ use axum::routing::{delete, get, post};
 use axum::Router;
 use tower_http::cors::CorsLayer;
 
-use super::handlers;
+use super::copilot_login::CopilotLoginService;
+use super::dream::DreamService;
+use super::session_import::SessionImportService;
+use super::{dream_routes, handlers, llm, sessions};
 use crate::connector::api::Container;
 use crate::domain::DomainError;
 
@@ -21,11 +24,33 @@ use crate::domain::DomainError;
 pub struct AppState {
     /// The dependency-injection container wiring adapters to use cases.
     pub container: Arc<Container>,
+    /// Session discovery + background imports. Shared (not per-request) so an
+    /// import's status survives the request that queued it.
+    pub sessions: Arc<SessionImportService>,
+    /// The dream scheduler. Shared so the background loop and the status/trigger
+    /// endpoints observe the same `running` flag and live config.
+    pub dream: Arc<DreamService>,
+    /// GitHub Copilot device-flow login. Shared so the background poll that
+    /// persists the token and the status endpoint see one session.
+    pub copilot_login: Arc<CopilotLoginService>,
 }
 
 impl AppState {
-    pub fn new(container: Arc<Container>) -> Self {
-        Self { container }
+    /// Build the shared state.
+    ///
+    /// Fallible because the dream scheduler needs the resolved chat endpoint and
+    /// the memory store up front; a server that cannot schedule dreams should
+    /// fail at start-up rather than 500 on the first status poll.
+    pub fn new(container: Arc<Container>) -> Result<Self, DomainError> {
+        let sessions = SessionImportService::build(Arc::clone(&container));
+        let dream = DreamService::build(&container)?;
+        let copilot_login = CopilotLoginService::new(container.data_dir().to_string());
+        Ok(Self {
+            container,
+            sessions,
+            dream,
+            copilot_login,
+        })
     }
 }
 
@@ -36,13 +61,17 @@ pub fn routes(state: AppState) -> Router {
         .route("/api", get(handlers::index))
         .route("/health", get(handlers::health))
         .route("/api/search", get(handlers::search))
-        .route("/api/memory", get(handlers::list_items))
+        .route("/api/memory", get(handlers::list_memories))
         .route(
             "/api/memory/{id}",
             get(handlers::show).delete(handlers::delete),
         )
+        .route("/api/conflicts", get(handlers::conflicts))
+        .route("/api/entities", get(handlers::entities))
+        .route("/api/entities/{id}", get(handlers::entity))
         .route("/api/tree", get(handlers::tree))
         .route("/api/sessions", get(handlers::sessions))
+        .route("/api/resume", get(handlers::resume))
         .route("/api/stats", get(handlers::stats))
         .route(
             "/api/namespaces",
@@ -60,9 +89,47 @@ pub fn routes(state: AppState) -> Router {
             "/api/namespaces/{name}/projects/{project}",
             delete(handlers::unassign_project),
         )
+        // Session discovery + background import (what the TUI's Import screen
+        // does in-process). Discovery is under `/discover` because `/api/sessions`
+        // above already serves the *imported* sessions — a different set.
+        .route("/api/sessions/discover", get(sessions::discover))
+        .route("/api/sessions/transcript", get(sessions::transcript))
+        .route(
+            "/api/sessions/import",
+            get(sessions::import_status).post(sessions::import),
+        )
         .route("/api/import", post(handlers::import))
         .route("/api/resources", post(handlers::add_resource))
-        .route("/api/dream", post(handlers::dream))
+        // Dream scheduler: status, background trigger, and live settings.
+        // `POST` starts a cycle and returns 202 rather than blocking for the
+        // many minutes a full consolidation can take.
+        .route(
+            "/api/dream",
+            get(dream_routes::status).post(dream_routes::trigger),
+        )
+        .route(
+            "/api/dream/config",
+            axum::routing::put(dream_routes::update_config),
+        )
+        // LLM endpoint configuration + model discovery. Per-service on purpose:
+        // memory and code intelligence may want different backends.
+        .route("/api/llm/endpoints", get(llm::list_endpoints))
+        .route(
+            "/api/llm/endpoints/{name}",
+            axum::routing::put(llm::upsert_endpoint).delete(llm::delete_endpoint),
+        )
+        .route("/api/llm/active", post(llm::set_active))
+        .route("/api/llm/models", get(llm::models))
+        // Per-usage model selection: each LLM job this server runs can name its
+        // own endpoint + model, falling back to the shared role.
+        .route("/api/llm/usages", get(llm::list_usages))
+        .route("/api/llm/usages/{id}", axum::routing::put(llm::set_usage))
+        // GitHub Copilot device-flow login, so a GUI can authenticate without a
+        // terminal command (the bundled binary isn't on the user's PATH).
+        .route(
+            "/api/llm/copilot/login",
+            get(llm::copilot_login_status).post(llm::copilot_login_start),
+        )
         // Allow a local native app (different origin) to call the API.
         .layer(CorsLayer::permissive())
         .with_state(state)
@@ -79,7 +146,15 @@ pub async fn serve(container: Container, port: u16, public: bool) -> Result<(), 
     // Mount the MCP streamable-HTTP service at /mcp on the same process, so one
     // `serve` gives a native app both the REST API and MCP over HTTP.
     let mcp = super::super::mcp::http_service(Arc::clone(&container));
-    let app = routes(AppState::new(container)).nest_service("/mcp", mcp);
+    let state = AppState::new(container)?;
+
+    // Run the dream scheduler alongside the server: it harvests finished
+    // sessions on a sweep and consolidates when a full cycle is due. Detached,
+    // so it lives as long as the process; the shared `DreamService` is what the
+    // status/trigger endpoints observe.
+    tokio::spawn(Arc::clone(&state.dream).run_scheduler());
+
+    let app = routes(state).nest_service("/mcp", mcp);
 
     let bind_addr: [u8; 4] = if public { [0, 0, 0, 0] } else { [127, 0, 0, 1] };
     let addr = SocketAddr::from((bind_addr, port));
@@ -115,7 +190,7 @@ mod tests {
             openai_endpoint: None,
         })
         .unwrap();
-        routes(AppState::new(Arc::new(container)))
+        routes(AppState::new(Arc::new(container)).unwrap())
     }
 
     async fn body_json(resp: axum::response::Response) -> serde_json::Value {
@@ -143,8 +218,11 @@ mod tests {
         assert_eq!(json["status"], "ok");
     }
 
+    /// Contract test. The native app decodes `/api/stats` into a struct whose
+    /// keys are required; if a key is renamed server-side the app renders an
+    /// empty dashboard rather than failing, so the rename has to fail *here*.
     #[tokio::test]
-    async fn stats_endpoint_returns_counts() {
+    async fn stats_endpoint_returns_memory_counts() {
         let dir = tempfile::tempdir().unwrap();
         let app = test_app(dir.path());
         let resp = app
@@ -158,8 +236,64 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(resp).await;
-        assert_eq!(json["total_items"], 0);
-        assert!(json["items_by_kind"].is_array());
+        assert_eq!(json["total_memories"], 0);
+        assert!(json["memories_by_kind"].is_array());
+        assert!(json["memories_by_status"].is_array());
+        assert_eq!(json["total_entities"], 0);
+        assert_eq!(json["total_edges"], 0);
+        // Nodes survive the cutover; the virtual filesystem is not memories.
+        assert!(json["nodes_by_kind"].is_array());
+    }
+
+    /// The other half of the same contract: the list envelope's key is
+    /// `memories`. Hoplon's response type makes this key required precisely so a
+    /// new app pointed at an old binary fails loudly instead of showing a blank
+    /// pane — which only works if the key is actually there.
+    #[tokio::test]
+    async fn memory_endpoint_returns_a_memories_envelope() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = test_app(dir.path());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/memory")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert!(
+            json.get("memories").is_some_and(|c| c.is_array()),
+            "GET /api/memory must carry a `memories` array, got: {json}",
+        );
+        assert!(
+            json.get("items").is_none(),
+            "the item envelope must be gone, or clients will keep reading it",
+        );
+    }
+
+    /// An unparseable `status` is a 4xx, not a silently-ignored filter that
+    /// returns the wrong rows.
+    #[tokio::test]
+    async fn an_unknown_status_filter_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = test_app(dir.path());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/memory?status=bogus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_client_error(),
+            "expected a client error, got {}",
+            resp.status(),
+        );
     }
 
     #[tokio::test]

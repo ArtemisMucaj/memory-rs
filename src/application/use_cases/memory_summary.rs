@@ -27,9 +27,10 @@ use openai_rs::ChatClient;
 use serde::Deserialize;
 use tracing::{debug, warn};
 
-use crate::application::interfaces::{Embedder, MemoryRepository};
+use crate::application::interfaces::{Embedder, MemoryRepository, NodeRepository};
+use crate::application::use_cases::llm_json::{extract_json_object, unix_now};
 use crate::domain::{
-    DomainError, MemoryItem, MemoryNode, NodeKind, SessionMessage, SessionTranscript,
+    DomainError, Memory, MemoryNode, MemoryStatus, NodeKind, SessionMessage, SessionTranscript,
 };
 
 /// Root URI of the memory digest node ("read this first").
@@ -56,9 +57,22 @@ const MAX_ABSTRACT_CHARS: usize = 400;
 /// Maximum characters of a single overview (L1) kept after generation.
 const MAX_OVERVIEW_CHARS: usize = 2_000;
 
+/// Most memories fed into a digest prompt.
+///
+/// Memories are roughly an order of magnitude more numerous than the items they
+/// replaced — one per fact rather than one per topic — so a whole-store digest
+/// would otherwise be truncated mid-list by `MAX_SUMMARY_INPUT_CHARS`. That
+/// truncation is what makes the cap matter: cutting a *character* budget takes
+/// whatever happened to be listed first, so the memories must be **ranked** and
+/// cut here, deliberately, before the character clamp gets to them.
+const MAX_DIGEST_MEMORIES: usize = 400;
+
 /// Builds and maintains the memory virtual filesystem's L0/L1 nodes.
 pub struct SummarizeMemoryUseCase {
     chat_client: Arc<dyn ChatClient>,
+    node_repo: Arc<dyn NodeRepository>,
+    /// Digests summarize memories; sessions and resources are still nodes, so
+    /// both ports are needed.
     memory_repo: Arc<dyn MemoryRepository>,
     embedding_service: Arc<Embedder>,
 }
@@ -66,14 +80,36 @@ pub struct SummarizeMemoryUseCase {
 impl SummarizeMemoryUseCase {
     pub fn new(
         chat_client: Arc<dyn ChatClient>,
+        node_repo: Arc<dyn NodeRepository>,
         memory_repo: Arc<dyn MemoryRepository>,
         embedding_service: Arc<Embedder>,
     ) -> Self {
         Self {
             chat_client,
+            node_repo,
             memory_repo,
             embedding_service,
         }
+    }
+
+    /// Active memories, ranked and capped for a digest prompt.
+    ///
+    /// Ranked by confidence then recency so the cap keeps the memories most worth
+    /// indexing, rather than an arbitrary slice of whatever the store returned.
+    async fn digest_memories(&self) -> Result<Vec<Memory>, DomainError> {
+        let mut memories = self
+            .memory_repo
+            .list_memories(None, Some(MemoryStatus::Active), None)
+            .await?;
+        memories.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.recorded_at.cmp(&a.recorded_at))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        memories.truncate(MAX_DIGEST_MEMORIES);
+        Ok(memories)
     }
 
     /// Store `transcript` as a session node (`memory://sessions/<id>`) with a
@@ -101,7 +137,7 @@ impl SummarizeMemoryUseCase {
 
         let uri = format!("{SESSIONS_ROOT_URI}/{}", transcript.id);
         let now = unix_now();
-        let created_at = match self.memory_repo.find_node(&uri).await {
+        let created_at = match self.node_repo.find_node(&uri).await {
             Ok(Some(prev)) => prev.created_at(),
             _ => now,
         };
@@ -116,9 +152,7 @@ impl SummarizeMemoryUseCase {
             now,
         );
         let vector = self.embed_node(&node).await;
-        self.memory_repo
-            .upsert_node(&node, vector.as_deref())
-            .await?;
+        self.node_repo.upsert_node(&node, vector.as_deref()).await?;
         Ok(node)
     }
 
@@ -151,7 +185,7 @@ impl SummarizeMemoryUseCase {
 
         let uri = format!("{RESOURCES_ROOT_URI}/{slug}");
         let now = unix_now();
-        let created_at = match self.memory_repo.find_node(&uri).await {
+        let created_at = match self.node_repo.find_node(&uri).await {
             Ok(Some(prev)) => prev.created_at(),
             _ => now,
         };
@@ -166,9 +200,7 @@ impl SummarizeMemoryUseCase {
             now,
         );
         let vector = self.embed_node(&node).await;
-        self.memory_repo
-            .upsert_node(&node, vector.as_deref())
-            .await?;
+        self.node_repo.upsert_node(&node, vector.as_deref()).await?;
         Ok(node)
     }
 
@@ -180,21 +212,21 @@ impl SummarizeMemoryUseCase {
     /// placeholder is written without spending an LLM call.
     #[tracing::instrument(skip_all)]
     pub async fn regenerate_digest(&self) -> Result<MemoryNode, DomainError> {
-        let items = self.memory_repo.list_items(None).await?;
-        let (abstract_, overview) = if items.len() < 2 {
-            fallback_digest_summary(&items)
+        let memories = self.digest_memories().await?;
+        let (abstract_, overview) = if memories.len() < 2 {
+            fallback_digest_summary(&memories)
         } else {
             match self
-                .generate(&digest_system_prompt(), &digest_user_prompt(&items))
+                .generate(&digest_system_prompt(), &digest_user_prompt(&memories))
                 .await
             {
                 Some(summary) => summary,
-                None => fallback_digest_summary(&items),
+                None => fallback_digest_summary(&memories),
             }
         };
 
         let now = unix_now();
-        let created_at = match self.memory_repo.find_node(MEMORY_ROOT_URI).await {
+        let created_at = match self.node_repo.find_node(MEMORY_ROOT_URI).await {
             Ok(Some(prev)) => prev.created_at(),
             _ => now,
         };
@@ -209,9 +241,7 @@ impl SummarizeMemoryUseCase {
             now,
         );
         let vector = self.embed_node(&node).await;
-        self.memory_repo
-            .upsert_node(&node, vector.as_deref())
-            .await?;
+        self.node_repo.upsert_node(&node, vector.as_deref()).await?;
         Ok(node)
     }
 
@@ -225,24 +255,24 @@ impl SummarizeMemoryUseCase {
     /// removed. Returns how many digests were (re)generated.
     #[tracing::instrument(skip_all)]
     pub async fn regenerate_project_digests(&self) -> Result<usize, DomainError> {
-        let items = self.memory_repo.list_items(None).await?;
-        let mut by_project: std::collections::BTreeMap<&str, Vec<&MemoryItem>> =
+        let memories = self.digest_memories().await?;
+        let mut by_project: std::collections::BTreeMap<&str, Vec<&Memory>> =
             std::collections::BTreeMap::new();
-        for item in &items {
-            if let Some(project) = item.project() {
-                by_project.entry(project).or_default().push(item);
+        for memory in &memories {
+            if let Some(project) = memory.project.as_deref() {
+                by_project.entry(project).or_default().push(memory);
             }
         }
 
         // Drop digests for projects that vanished from the store.
-        let existing = self.memory_repo.list_nodes(Some(NodeKind::Project)).await?;
+        let existing = self.node_repo.list_nodes(Some(NodeKind::Project)).await?;
         let live_uris: std::collections::HashSet<String> = by_project
             .keys()
             .map(|project| project_digest_uri(project))
             .collect();
         for node in &existing {
             if !live_uris.contains(node.uri()) {
-                if let Err(e) = self.memory_repo.delete_node(node.uri()).await {
+                if let Err(e) = self.node_repo.delete_node(node.uri()).await {
                     warn!(
                         "failed to delete stale project digest '{}': {e}",
                         node.uri()
@@ -252,43 +282,42 @@ impl SummarizeMemoryUseCase {
         }
 
         let mut regenerated = 0usize;
-        for (project, project_items) in by_project {
+        for (project, project_memories) in by_project {
             let uri = project_digest_uri(project);
-            let previous = self.memory_repo.find_node(&uri).await?;
+            let previous = self.node_repo.find_node(&uri).await?;
             // A sorted concatenation of item IDs + timestamps: it changes on any
             // content edit, deletion, move, or addition, and is stored as the
             // node's content so the next run can detect a change. Computed once
             // and reused for both the staleness check and the written node.
+            // Memories are immutable, so a memory's id fully determines its
+            // content — the manifest needs no timestamp to detect an edit,
+            // because an "edit" is a different memory with a different id. That
+            // makes this staleness check strictly more reliable than the item
+            // version it replaces, which had to guess from `updated_at`.
             let manifest: String = {
-                let mut pairs: Vec<String> = project_items
-                    .iter()
-                    .map(|i| format!("{}:{}", i.id(), i.updated_at()))
-                    .collect();
-                pairs.sort_unstable();
-                pairs.join(";")
+                let mut ids: Vec<&str> = project_memories.iter().map(|c| c.id.as_str()).collect();
+                ids.sort_unstable();
+                ids.join(";")
             };
-            // Skip projects whose items haven't changed. Compare both the newest
-            // updated_at (catches item content edits) and the manifest (catches
-            // deletions/moves/additions).
-            if let Some(ref prev) = previous {
-                let newest = project_items.iter().map(|i| i.updated_at()).max();
-                if newest.is_some_and(|t| t < prev.updated_at()) && prev.content() == manifest {
-                    continue;
-                }
+            if previous
+                .as_ref()
+                .is_some_and(|prev| prev.content() == manifest)
+            {
+                continue;
             }
 
-            let (abstract_, overview) = if project_items.len() < 2 {
-                fallback_project_digest_summary(project, &project_items)
+            let (abstract_, overview) = if project_memories.len() < 2 {
+                fallback_project_digest_summary(project, &project_memories)
             } else {
                 match self
                     .generate(
                         &project_digest_system_prompt(),
-                        &project_digest_user_prompt(project, &project_items),
+                        &project_digest_user_prompt(project, &project_memories),
                     )
                     .await
                 {
                     Some(summary) => summary,
-                    None => fallback_project_digest_summary(project, &project_items),
+                    None => fallback_project_digest_summary(project, &project_memories),
                 }
             };
 
@@ -309,9 +338,7 @@ impl SummarizeMemoryUseCase {
             // client should show instead of `github_com_org_repo-<hash>`.
             .with_label(project);
             let vector = self.embed_node(&node).await;
-            self.memory_repo
-                .upsert_node(&node, vector.as_deref())
-                .await?;
+            self.node_repo.upsert_node(&node, vector.as_deref()).await?;
             regenerated += 1;
         }
         Ok(regenerated)
@@ -433,24 +460,23 @@ fn resource_user_prompt(source: &str, content: &str) -> String {
 
 fn digest_system_prompt() -> String {
     r#"You maintain a top-level index of an assistant's long-term memory about a user and their project.
-You are given the full list of stored memory items (preferences, experiences, skills, facts).
+You are given the stored memories (preferences, experiences, skills, facts) as atomic statements.
 Produce a summary an agent reads FIRST, before drilling into individual memories:
 - "abstract": ONE sentence (max ~35 words) capturing who this user is and what the memory covers at a glance.
 - "overview": a markdown outline grouping what is known by theme (e.g. preferences, project facts, reusable experiences), naming the notable items so the reader knows what exists and can drill in. Keep it scannable.
 
-Do not invent anything not present in the items. Output ONLY a JSON object: {"abstract": "...", "overview": "..."}"#
+Do not invent anything not present in the memories. Output ONLY a JSON object: {"abstract": "...", "overview": "..."}"#
         .to_string()
 }
 
-fn digest_user_prompt(items: &[MemoryItem]) -> String {
-    const MAX_ITEM_CHARS: usize = 400;
-    let mut prompt = String::from("## Stored memory items\n\n");
-    for item in items {
+fn digest_user_prompt(memories: &[Memory]) -> String {
+    const MAX_MEMORY_CHARS: usize = 400;
+    let mut prompt = String::from("## Stored memories\n\n");
+    for memory in memories {
         prompt.push_str(&format!(
-            "- [{}] {}: {}\n",
-            item.kind(),
-            item.name(),
-            clamp(&one_line(item.content()), MAX_ITEM_CHARS)
+            "- [{}] {}\n",
+            memory.kind.as_str(),
+            clamp(&one_line(&memory.statement), MAX_MEMORY_CHARS)
         ));
     }
     prompt.push_str("\n\nSummarize the memory store as the specified JSON object.");
@@ -478,19 +504,18 @@ Produce a summary an agent working in this project reads FIRST, before drilling 
 - "abstract": ONE sentence (max ~35 words) capturing what this project is and what the memory covers at a glance.
 - "overview": a markdown outline grouping what is known by theme, naming the notable items so the reader knows what exists and can drill in. Keep it scannable.
 
-Do not invent anything not present in the items. Output ONLY a JSON object: {"abstract": "...", "overview": "..."}"#
+Do not invent anything not present in the memories. Output ONLY a JSON object: {"abstract": "...", "overview": "..."}"#
         .to_string()
 }
 
-fn project_digest_user_prompt(project: &str, items: &[&MemoryItem]) -> String {
-    const MAX_ITEM_CHARS: usize = 400;
-    let mut prompt = format!("## Memory items belonging to project '{project}'\n\n");
-    for item in items {
+fn project_digest_user_prompt(project: &str, memories: &[&Memory]) -> String {
+    const MAX_MEMORY_CHARS: usize = 400;
+    let mut prompt = format!("## Memories belonging to project '{project}'\n\n");
+    for memory in memories {
         prompt.push_str(&format!(
-            "- [{}] {}: {}\n",
-            item.kind(),
-            item.name(),
-            clamp(&one_line(item.content()), MAX_ITEM_CHARS)
+            "- [{}] {}\n",
+            memory.kind.as_str(),
+            clamp(&one_line(&memory.statement), MAX_MEMORY_CHARS)
         ));
     }
     prompt.push_str("\n\nSummarize this project's memory as the specified JSON object.");
@@ -499,13 +524,20 @@ fn project_digest_user_prompt(project: &str, items: &[&MemoryItem]) -> String {
 
 /// Deterministic fallback for a project digest when there is little to summarize
 /// or the model is unavailable.
-fn fallback_project_digest_summary(project: &str, items: &[&MemoryItem]) -> (String, String) {
+fn fallback_project_digest_summary(project: &str, memories: &[&Memory]) -> (String, String) {
     let mut overview = format!("Memories belonging to '{project}':\n");
-    for item in items {
-        overview.push_str(&format!("- [{}] {}\n", item.kind(), item.name()));
+    for memory in memories {
+        overview.push_str(&format!(
+            "- [{}] {}\n",
+            memory.kind.as_str(),
+            one_line(&memory.statement)
+        ));
     }
     (
-        format!("{} stored memories about project '{project}'.", items.len()),
+        format!(
+            "{} stored memories about project '{project}'.",
+            memories.len()
+        ),
         overview,
     )
 }
@@ -537,21 +569,25 @@ fn fallback_session_summary(transcript: &SessionTranscript) -> (String, String) 
 
 /// Deterministic fallback for the digest when there is nothing to summarize or
 /// the model is unavailable.
-fn fallback_digest_summary(items: &[MemoryItem]) -> (String, String) {
-    if items.is_empty() {
+fn fallback_digest_summary(memories: &[Memory]) -> (String, String) {
+    if memories.is_empty() {
         return (
             "No memories stored yet.".to_string(),
             "- The memory store is empty. Import a session to populate it.".to_string(),
         );
     }
     let mut overview = String::from("Stored memories:\n");
-    for item in items {
-        overview.push_str(&format!("- [{}] {}\n", item.kind(), item.name()));
+    for memory in memories {
+        overview.push_str(&format!(
+            "- [{}] {}\n",
+            memory.kind.as_str(),
+            one_line(&memory.statement)
+        ));
     }
     (
         format!(
             "{} stored memories about the user and project.",
-            items.len()
+            memories.len()
         ),
         overview,
     )
@@ -583,38 +619,6 @@ fn parse_summary(response: &str) -> Option<(String, String)> {
         return None;
     }
     Some((abstract_, overview))
-}
-
-/// Extract the first balanced `{ ... }` object from mixed model output.
-fn extract_json_object(text: &str) -> Option<&str> {
-    let start = text.find('{')?;
-    let mut depth = 0usize;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (offset, ch) in text[start..].char_indices() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match ch {
-            '"' => in_string = true,
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(&text[start..start + offset + ch.len_utf8()]);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
 }
 
 fn one_line(text: &str) -> String {
@@ -682,13 +686,6 @@ fn head_tail(text: &str, max_chars: usize) -> String {
         all[all.len() - tail_budget..].iter().collect()
     };
     format!("{head}\n\n[... middle elided ...]\n\n{tail}")
-}
-
-fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

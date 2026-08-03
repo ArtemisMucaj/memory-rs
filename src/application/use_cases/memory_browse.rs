@@ -17,12 +17,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::application::interfaces::{Embedder, MemoryRepository};
-use crate::application::use_cases::memory_search::MemorySearchUseCase;
+use crate::application::interfaces::{Embedder, MemoryRepository, NodeRepository};
+use crate::application::use_cases::memory_recall::MemoryRecallUseCase;
 use crate::application::use_cases::memory_summary::{
     MEMORY_ROOT_URI, PROJECTS_ROOT_URI, RESOURCES_ROOT_URI, SESSIONS_ROOT_URI,
 };
-use crate::domain::{DomainError, MemoryItem, MemoryKind, MemoryNode, NodeKind};
+use crate::domain::{
+    DomainError, EdgeType, EntityRef, Memory, MemoryKind, MemoryNode, MemoryStatus, NodeKind,
+};
 
 /// RRF dampening constant (matches [`MemorySearchUseCase`]).
 const RRF_K: f32 = 60.0;
@@ -80,10 +82,59 @@ pub enum RowTarget {
         level: MemoryLevel,
     },
     /// A flat memory item.
-    Item(MemoryItem),
+    Memory {
+        memory: LabelledMemory,
+        /// The memory's typed edges, already resolved to the other side's
+        /// statement. Carried on the row rather than fetched when the detail
+        /// pane opens: the TUI's selection handling is synchronous, and a
+        /// personal store's whole edge table is a single small query per
+        /// refresh — cheaper than plumbing a lazy async fetch through the
+        /// screen for a handful of rows.
+        links: Vec<MemoryLink>,
+    },
 }
 
-/// One rendered row in the memory tree/list.
+/// A memory plus its display labels, so a row can show "orders-events" rather
+/// than the entity UUID the memory actually stores.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LabelledMemory {
+    pub memory: Memory,
+    pub subject: Option<String>,
+    pub object: Option<String>,
+}
+
+impl LabelledMemory {
+    /// The row title: the whole triple, `subject · predicate · object`.
+    ///
+    /// Not the statement — a self-contained sentence repeated down a list reads
+    /// as a wall of prose. Not subject+predicate either: without the object,
+    /// two memories about one subject render identically and the row looks
+    /// truncated rather than deliberately short.
+    pub fn title(&self) -> String {
+        let Some(subject) = &self.subject else {
+            return self.memory.statement.clone();
+        };
+        let predicate = self.memory.predicate.as_str();
+        match &self.object {
+            Some(object) => format!("{subject} · {predicate} · {object}"),
+            None => format!("{subject} · {predicate}"),
+        }
+    }
+}
+
+/// One edge of a memory, resolved for display.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryLink {
+    pub edge_type: EdgeType,
+    /// `true` when this memory is the edge's source. Direction is shown rather
+    /// than normalised away: "supersedes X" and "superseded by X" are opposite
+    /// facts about the memory you are looking at.
+    pub outgoing: bool,
+    pub other_id: String,
+    /// The other side's statement, or its id when that memory is missing.
+    pub other_statement: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct MemoryRow {
     /// Indentation depth (0 = top level).
@@ -103,21 +154,119 @@ pub struct MemoryRow {
 
 /// Combined search/browse over memory items and virtual-filesystem nodes.
 pub struct MemoryBrowseUseCase {
+    node_repo: Arc<dyn NodeRepository>,
     memory_repo: Arc<dyn MemoryRepository>,
     embedder: Embedder,
-    item_search: MemorySearchUseCase,
+    recall: MemoryRecallUseCase,
 }
 
 impl MemoryBrowseUseCase {
-    pub fn new(memory_repo: Arc<dyn MemoryRepository>, embedder: Embedder) -> Self {
-        let embedder_arc = Arc::new(embedder.clone());
-        let item_search =
-            MemorySearchUseCase::new(Arc::clone(&memory_repo), Arc::clone(&embedder_arc));
+    pub fn new(
+        node_repo: Arc<dyn NodeRepository>,
+        memory_repo: Arc<dyn MemoryRepository>,
+        embedder: Embedder,
+    ) -> Self {
+        let recall = MemoryRecallUseCase::new(Arc::clone(&memory_repo), embedder.clone());
         Self {
+            node_repo,
             memory_repo,
             embedder,
-            item_search,
+            recall,
         }
+    }
+
+    /// Canonical names for every entity these memories reference, in one query.
+    async fn entity_labels(
+        &self,
+        memories: &[Memory],
+    ) -> Result<HashMap<String, String>, DomainError> {
+        let mut ids: Vec<String> = memories
+            .iter()
+            .flat_map(|m| [m.subject.entity_id(), m.object.entity_id()])
+            .flatten()
+            .map(str::to_string)
+            .collect();
+        ids.sort();
+        ids.dedup();
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        Ok(self
+            .memory_repo
+            .find_entities(&ids)
+            .await?
+            .into_iter()
+            .map(|e| (e.id, e.canonical_name))
+            .collect())
+    }
+
+    /// Resolve every edge touching `memories` into display-ready links.
+    ///
+    /// Two queries regardless of how many memories there are: one for the
+    /// edges, one to resolve the statements on the far side (which may be
+    /// superseded, and so absent from the caller's list).
+    async fn link_index(
+        &self,
+        memories: &[Memory],
+    ) -> Result<HashMap<String, Vec<MemoryLink>>, DomainError> {
+        let mut index: HashMap<String, Vec<MemoryLink>> = HashMap::new();
+        if memories.is_empty() {
+            return Ok(index);
+        }
+        let ids: Vec<String> = memories.iter().map(|m| m.id.clone()).collect();
+        let edges = self.memory_repo.edges_for(&ids).await?;
+        if edges.is_empty() {
+            return Ok(index);
+        }
+
+        let mut referenced: Vec<String> = edges
+            .iter()
+            .flat_map(|e| [e.from_memory.clone(), e.to_memory.clone()])
+            .collect();
+        referenced.sort();
+        referenced.dedup();
+        let statements: HashMap<String, String> = self
+            .memory_repo
+            .find_memories(&referenced)
+            .await?
+            .into_iter()
+            .map(|m| (m.id, m.statement))
+            .collect();
+        let label = |id: &str| {
+            statements
+                .get(id)
+                .cloned()
+                .unwrap_or_else(|| id.to_string())
+        };
+
+        let owned: std::collections::HashSet<&String> = ids.iter().collect();
+        for edge in &edges {
+            // Both endpoints are considered: an edge between two listed
+            // memories is a fact about each of them.
+            if owned.contains(&edge.from_memory) {
+                index
+                    .entry(edge.from_memory.clone())
+                    .or_default()
+                    .push(MemoryLink {
+                        edge_type: edge.edge_type,
+                        outgoing: true,
+                        other_id: edge.to_memory.clone(),
+                        other_statement: label(&edge.to_memory),
+                    });
+            }
+            if owned.contains(&edge.to_memory) {
+                index
+                    .entry(edge.to_memory.clone())
+                    .or_default()
+                    .push(MemoryLink {
+                        edge_type: edge.edge_type,
+                        outgoing: false,
+                        other_id: edge.from_memory.clone(),
+                        other_statement: label(&edge.from_memory),
+                    });
+            }
+        }
+        Ok(index)
     }
 
     /// Produce the rows to display: the filesystem tree when `query` is empty,
@@ -162,17 +311,22 @@ impl MemoryBrowseUseCase {
             return self.search(query, limit).await;
         }
 
-        let items = self.memory_repo.list_items(None).await?;
-        let nodes = self.memory_repo.list_nodes(None).await?;
+        let memories = self
+            .memory_repo
+            .list_memories(None, Some(MemoryStatus::Active), None)
+            .await?;
+        let links = self.link_index(&memories).await?;
+        let labels = self.entity_labels(&memories).await?;
+        let nodes = self.node_repo.list_nodes(None).await?;
 
         let mut rows: Vec<MemoryRow> = Vec::new();
 
-        // ── Memories: one group over all items, with a category subgroup per
+        // ── Memories: one group over all of them, with a category subgroup per
         //    non-empty kind (preferences/experiences/skills/facts). ──────────
-        if !items.is_empty() {
-            rows.push(group_row("memories", "Memories", items.len(), 0));
+        if !memories.is_empty() {
+            rows.push(group_row("memories", "Memories", memories.len(), 0));
             for kind in MemoryKind::ALL {
-                let group: Vec<&MemoryItem> = items.iter().filter(|i| i.kind() == kind).collect();
+                let group: Vec<&Memory> = memories.iter().filter(|m| m.kind == kind).collect();
                 if group.is_empty() {
                     continue;
                 }
@@ -182,8 +336,8 @@ impl MemoryBrowseUseCase {
                     group.len(),
                     1,
                 ));
-                for item in group {
-                    rows.push(item_row(item, 2, None));
+                for memory in group {
+                    rows.push(memory_row(memory, &links, &labels, 2, None));
                 }
             }
         }
@@ -207,12 +361,22 @@ impl MemoryBrowseUseCase {
     /// Hybrid semantic + keyword recall over items *and* nodes, fused per
     /// modality and interleaved by score into a flat list of depth-0 rows.
     async fn search(&self, query: &str, limit: usize) -> Result<Vec<MemoryRow>, DomainError> {
-        let items = self.item_search.execute(query, None, None, limit).await?;
+        let hits = self.recall.execute(query, None, None, limit).await?;
         let nodes = self.search_nodes(query, limit).await?;
 
+        // Only the hits need links, so the index is built over them rather than
+        // the whole store.
+        let found: Vec<Memory> = hits.iter().map(|h| h.memory.clone()).collect();
+        let links = self.link_index(&found).await?;
+        let labels = self.entity_labels(&found).await?;
+
         let mut scored: Vec<(f32, MemoryRow)> = Vec::new();
-        for (item, score) in items {
-            scored.push((score, item_row(&item, 0, Some(score))));
+        for hit in hits {
+            let score = hit.score;
+            scored.push((
+                score,
+                memory_row(&hit.memory, &links, &labels, 0, Some(score)),
+            ));
         }
         for (node, score) in nodes {
             scored.push((score, node_row(&node, 0, Some(score))));
@@ -230,14 +394,14 @@ impl MemoryBrowseUseCase {
     ) -> Result<Vec<(MemoryNode, f32)>, DomainError> {
         let semantic = if self.embedder.embeddings_enabled() {
             let vector = self.embedder.embed_query(query).await?;
-            self.memory_repo
+            self.node_repo
                 .search_nodes_semantic(&vector, None, NODE_CANDIDATES_PER_LEG)
                 .await?
         } else {
             Vec::new()
         };
         let keyword = self
-            .memory_repo
+            .node_repo
             .search_nodes_keyword(query, None, NODE_CANDIDATES_PER_LEG)
             .await?;
 
@@ -280,8 +444,13 @@ impl MemoryBrowseUseCase {
     /// Before the first digest exists, items fall back to a top-level
     /// `memory/` directory so they are never orphaned.
     async fn browse_tree(&self) -> Result<Vec<MemoryRow>, DomainError> {
-        let items = self.memory_repo.list_items(None).await?;
-        let mut nodes = self.memory_repo.list_nodes(None).await?;
+        let memories = self
+            .memory_repo
+            .list_memories(None, Some(MemoryStatus::Active), None)
+            .await?;
+        let links = self.link_index(&memories).await?;
+        let labels = self.entity_labels(&memories).await?;
+        let mut nodes = self.node_repo.list_nodes(None).await?;
 
         nodes.sort_by(|a, b| {
             node_kind_rank(a.kind())
@@ -309,14 +478,14 @@ impl MemoryBrowseUseCase {
         // categories omitted. Nest them under the digest (depth 1/2) when it
         // exists; otherwise fall back to a top-level `memory/` dir so items are
         // never orphaned before the first digest is generated.
-        if !items.is_empty() {
+        if !memories.is_empty() {
             let base_depth = if has_digest {
                 1
             } else {
                 rows.push(dir_row("memory/", 0));
                 1
             };
-            push_item_groups(&mut rows, &items, base_depth);
+            push_memory_groups(&mut rows, &memories, &links, &labels, base_depth);
         }
 
         // Project digests, sessions, and resources each get a directory header,
@@ -349,15 +518,21 @@ impl MemoryBrowseUseCase {
 
 /// Append one category sub-directory per non-empty memory kind (at
 /// `category_depth`) with its items nested one level deeper.
-fn push_item_groups(rows: &mut Vec<MemoryRow>, items: &[MemoryItem], category_depth: u8) {
+fn push_memory_groups(
+    rows: &mut Vec<MemoryRow>,
+    memories: &[Memory],
+    links: &HashMap<String, Vec<MemoryLink>>,
+    labels: &HashMap<String, String>,
+    category_depth: u8,
+) {
     for kind in MemoryKind::ALL {
-        let group: Vec<&MemoryItem> = items.iter().filter(|i| i.kind() == kind).collect();
+        let group: Vec<&Memory> = memories.iter().filter(|m| m.kind == kind).collect();
         if group.is_empty() {
             continue;
         }
         rows.push(dir_row(&format!("{}/", kind.plural()), category_depth));
-        for item in group {
-            rows.push(item_row(item, category_depth + 1, None));
+        for memory in group {
+            rows.push(memory_row(memory, links, labels, category_depth + 1, None));
         }
     }
 }
@@ -484,14 +659,40 @@ fn level_row(node: &MemoryNode, level: MemoryLevel, depth: u8) -> MemoryRow {
     }
 }
 
-fn item_row(item: &MemoryItem, depth: u8, score: Option<f32>) -> MemoryRow {
+fn memory_row(
+    memory: &Memory,
+    links: &HashMap<String, Vec<MemoryLink>>,
+    labels: &HashMap<String, String>,
+    depth: u8,
+    score: Option<f32>,
+) -> MemoryRow {
+    let labelled = LabelledMemory {
+        memory: memory.clone(),
+        subject: entity_label(&memory.subject, labels),
+        object: entity_label(&memory.object, labels),
+    };
     MemoryRow {
         depth,
-        kind_label: item.kind().to_string(),
-        label: item.name().to_string(),
-        preview: one_line(item.content()),
+        kind_label: memory.kind.as_str().to_string(),
+        // Short title in the row; the full statement is the preview and the
+        // detail pane. A list of self-contained sentences is unreadable.
+        label: labelled.title(),
+        preview: one_line(&memory.statement),
         score,
-        target: RowTarget::Item(item.clone()),
+        target: RowTarget::Memory {
+            memory: labelled,
+            links: links.get(&memory.id).cloned().unwrap_or_default(),
+        },
+    }
+}
+
+/// An entity ref rendered for display: the entity's canonical name when it
+/// resolves, the literal value otherwise.
+fn entity_label(r: &EntityRef, labels: &HashMap<String, String>) -> Option<String> {
+    match r {
+        EntityRef::Entity(id) => Some(labels.get(id).cloned().unwrap_or_else(|| id.clone())),
+        EntityRef::Literal(v) if v.trim().is_empty() => None,
+        EntityRef::Literal(v) => Some(v.clone()),
     }
 }
 
@@ -508,6 +709,7 @@ fn one_line(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::Predicate;
 
     fn node(uri: &str, kind: NodeKind, overview: &str, content: &str) -> MemoryNode {
         MemoryNode::new(
@@ -557,31 +759,39 @@ mod tests {
         assert_eq!(rows[1].depth, 2);
     }
 
-    fn item(kind: MemoryKind, name: &str) -> MemoryItem {
-        MemoryItem::new(
-            name.into(),
+    fn memory(kind: MemoryKind, statement: &str) -> Memory {
+        Memory {
+            id: statement.into(),
             kind,
-            name.into(),
-            "content".into(),
-            None,
-            None,
-            0,
-            0,
-            0,
-        )
+            subject: crate::domain::EntityRef::Literal("the user".into()),
+            predicate: Predicate::Prefers,
+            object: crate::domain::EntityRef::Literal("tabs".into()),
+            statement: statement.into(),
+            project: None,
+            recorded_at: 1,
+            valid_from: 1,
+            valid_to: None,
+            source_session_id: None,
+            source_message_index: None,
+            source_kind: crate::domain::SourceKind::UserStated,
+            confidence: 0.9,
+            status: MemoryStatus::Active,
+            derived: false,
+            derived_from: Vec::new(),
+        }
     }
 
     #[test]
-    fn push_item_groups_nests_items_by_category() {
-        let items = vec![
-            item(MemoryKind::Fact, "duckdb_locks"),
-            item(MemoryKind::Preference, "commit_style"),
-            item(MemoryKind::Fact, "storage_engine"),
+    fn push_memory_groups_nests_memories_by_category() {
+        let memories = vec![
+            memory(MemoryKind::Fact, "duckdb takes a file lock"),
+            memory(MemoryKind::Preference, "the user prefers short commits"),
+            memory(MemoryKind::Fact, "the storage engine is columnar"),
         ];
         let mut rows = Vec::new();
-        // Category dirs at depth 1, items at depth 2 (as when nested under the
-        // digest).
-        push_item_groups(&mut rows, &items, 1);
+        // Category dirs at depth 1, memories at depth 2 (as when nested under
+        // the digest).
+        push_memory_groups(&mut rows, &memories, &HashMap::new(), &HashMap::new(), 1);
 
         // Categories follow MemoryKind::ALL order (preferences before facts);
         // the empty experience/skill kinds are omitted entirely.
@@ -592,33 +802,49 @@ mod tests {
             .collect();
         assert_eq!(dirs, vec!["preferences/", "facts/"]);
 
-        // Every dir is at depth 1 and every item at depth 2, and both facts are
-        // grouped under the single `facts/` header.
         assert!(rows.iter().all(|r| match r.target {
             RowTarget::Directory => r.depth == 1,
-            RowTarget::Item(_) => r.depth == 2,
+            RowTarget::Memory { .. } => r.depth == 2,
             _ => false,
         }));
-        let item_count = rows
+        let leaves = rows
             .iter()
-            .filter(|r| matches!(r.target, RowTarget::Item(_)))
+            .filter(|r| matches!(r.target, RowTarget::Memory { .. }))
             .count();
-        assert_eq!(item_count, 3);
+        assert_eq!(leaves, 3);
     }
 
-    use crate::connector::adapter::DuckdbMemoryRepository;
+    /// The row label is the statement, because that is the only part of a
+    /// memory a human reads — a memory has no name to fall back on.
+    #[test]
+    fn a_memory_row_is_labelled_by_its_statement() {
+        let m = memory(MemoryKind::Fact, "duckdb takes a file lock");
+        // No entity labels resolved, and the subject is a literal, so the row
+        // falls back to the subject text plus predicate rather than the whole
+        // statement.
+        let row = memory_row(&m, &HashMap::new(), &HashMap::new(), 0, None);
+        assert_eq!(row.label, "the user · prefers · tabs");
+        assert_eq!(row.preview.as_deref(), Some("duckdb takes a file lock"));
+        assert_eq!(row.kind_label, "fact");
+    }
+
+    use crate::connector::adapter::DuckdbStore;
     use std::sync::Arc;
 
     #[tokio::test]
     async fn grouped_tree_matches_the_app_shape() {
-        let repo = Arc::new(DuckdbMemoryRepository::in_memory(4, "mock").unwrap());
-        // Two facts, one preference, and a session node.
-        for it in [
-            item(MemoryKind::Fact, "duckdb_locks"),
-            item(MemoryKind::Fact, "storage_engine"),
-            item(MemoryKind::Preference, "commit_style"),
+        let repo = Arc::new(DuckdbStore::in_memory(4, "mock").unwrap());
+        // Two facts, one preference, and a session node. Seeded through the
+        // *memory* port — the projection the import path actually writes, so
+        // this test fails if the tree is ever pointed back at the item table.
+        for m in [
+            memory(MemoryKind::Fact, "duckdb takes a file lock"),
+            memory(MemoryKind::Fact, "the storage engine is columnar"),
+            memory(MemoryKind::Preference, "the user prefers short commits"),
         ] {
-            repo.upsert_item(&it, None).await.unwrap();
+            crate::application::MemoryRepository::append_memory(repo.as_ref(), &m, None)
+                .await
+                .unwrap();
         }
         repo.upsert_node(
             &node(
@@ -632,7 +858,7 @@ mod tests {
         .await
         .unwrap();
 
-        let use_case = MemoryBrowseUseCase::new(repo, Embedder::disabled());
+        let use_case = MemoryBrowseUseCase::new(repo.clone(), repo.clone(), Embedder::disabled());
         let rows = use_case.grouped_tree("", 50).await.unwrap();
 
         // Group headers, in order, with their counts.
@@ -675,11 +901,15 @@ mod tests {
 
     #[tokio::test]
     async fn grouped_tree_defers_to_search_when_querying() {
-        let repo = Arc::new(DuckdbMemoryRepository::in_memory(4, "mock").unwrap());
-        repo.upsert_item(&item(MemoryKind::Fact, "network_timeout"), None)
-            .await
-            .unwrap();
-        let use_case = MemoryBrowseUseCase::new(repo, Embedder::disabled());
+        let repo = Arc::new(DuckdbStore::in_memory(4, "mock").unwrap());
+        crate::application::MemoryRepository::append_memory(
+            repo.as_ref(),
+            &memory(MemoryKind::Fact, "retry network timeouts with backoff"),
+            None,
+        )
+        .await
+        .unwrap();
+        let use_case = MemoryBrowseUseCase::new(repo.clone(), repo.clone(), Embedder::disabled());
 
         // A non-empty query returns ranked hit rows (depth 0), not group headers.
         let rows = use_case.grouped_tree("network", 10).await.unwrap();

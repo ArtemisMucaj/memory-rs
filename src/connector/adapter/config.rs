@@ -54,6 +54,42 @@ pub struct MemoryConfig {
     /// Dream-cycle settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dream: Option<DreamConfig>,
+
+    /// GitHub Copilot subscription, usable as the chat backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copilot: Option<CopilotConfig>,
+}
+
+/// The reserved endpoint name that selects the Copilot backend.
+///
+/// Copilot isn't an OpenAI-compatible endpoint the user registers — its base
+/// URL, headers and credential are fixed — so rather than adding a parallel
+/// "target" concept it occupies a reserved name in the same `active_chat` slot
+/// the registered endpoints use. Binding chat to `copilot` switches the backend;
+/// everything else about role resolution is unchanged.
+pub const COPILOT_ENDPOINT: &str = "copilot";
+
+/// GitHub Copilot credentials + model selection.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CopilotConfig {
+    /// GitHub OAuth token (`ghu_…`) captured during the device-flow login. Sent
+    /// as a `Bearer` credential on every Copilot API request. When absent,
+    /// requests are unauthenticated and fail — log in first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_token: Option<String>,
+
+    /// Model id selected in the picker (e.g. `"claude-sonnet-4.5"`). When
+    /// absent the Copilot API's default model is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+impl CopilotConfig {
+    /// Whether a token is stored. Not a guarantee it's still valid — the API
+    /// will 401 on an expired one — just that a login has happened.
+    pub fn is_authenticated(&self) -> bool {
+        self.github_token.as_ref().is_some_and(|t| !t.is_empty())
+    }
 }
 
 /// A set of named OpenAI-compatible endpoints plus which ones are active.
@@ -85,6 +121,98 @@ pub struct OpenAiConfig {
     /// Registered endpoints, keyed by a user-chosen name (e.g. `"lmstudio"`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub endpoints: BTreeMap<String, OpenAiEndpoint>,
+
+    /// Per-usage overrides, keyed by [`LlmUsage::as_str`].
+    ///
+    /// The roles above answer "which server", but the jobs this crate runs have
+    /// genuinely different needs: extraction wants a model that follows a JSON
+    /// schema, consolidation benefits from a stronger reasoner, summarization is
+    /// cheap and high-volume. A usage with no entry here inherits its role
+    /// (chat or embedding), so this stays empty until someone deliberately
+    /// splits one out.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub usages: BTreeMap<String, UsageBinding>,
+}
+
+/// One usage's chosen endpoint + model. Either half may be absent: naming only
+/// the model keeps the role's endpoint and swaps the model, which is the common
+/// case when one server hosts several models.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageBinding {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+/// A distinct LLM job this crate runs. Each can name its own endpoint + model;
+/// unset ones follow the shared role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmUsage {
+    /// Turning a session transcript into durable memory items.
+    ExtractMemories,
+    /// L0/L1 abstracts for session, resource and digest nodes.
+    Summarize,
+    /// The dream cycle's merge/prune pass over the whole store.
+    Consolidate,
+    /// Vector embeddings for semantic recall.
+    Embedding,
+}
+
+impl LlmUsage {
+    pub const ALL: [LlmUsage; 4] = [
+        LlmUsage::ExtractMemories,
+        LlmUsage::Summarize,
+        LlmUsage::Consolidate,
+        LlmUsage::Embedding,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LlmUsage::ExtractMemories => "extract_memories",
+            LlmUsage::Summarize => "summarize",
+            LlmUsage::Consolidate => "consolidate",
+            LlmUsage::Embedding => "embedding",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|u| u.as_str() == s)
+    }
+
+    /// Human-readable label for a settings screen.
+    pub fn label(&self) -> &'static str {
+        match self {
+            LlmUsage::ExtractMemories => "Extract memories",
+            LlmUsage::Summarize => "Summarize",
+            LlmUsage::Consolidate => "Consolidate",
+            LlmUsage::Embedding => "Embedding",
+        }
+    }
+
+    pub fn description(&self) -> &'static str {
+        match self {
+            LlmUsage::ExtractMemories => {
+                "Turn an imported session into durable memory items. Needs a model that follows a JSON schema."
+            }
+            LlmUsage::Summarize => {
+                "Write the L0 abstract and L1 overview for sessions, resources and the digest."
+            }
+            LlmUsage::Consolidate => {
+                "The dream cycle's merge-and-prune pass over the whole store. Benefits from a stronger reasoner."
+            }
+            LlmUsage::Embedding => {
+                "Vector embeddings for semantic recall. Must match the dimension the database is pinned to."
+            }
+        }
+    }
+
+    /// Whether this usage embeds rather than chats — it follows
+    /// `active_embedding` and only accepts an embedding-capable model.
+    pub fn is_embedding(&self) -> bool {
+        matches!(self, LlmUsage::Embedding)
+    }
 }
 
 /// One OpenAI-compatible server.
@@ -128,21 +256,58 @@ impl Default for EmbeddingConfig {
 }
 
 /// Dream-cycle settings. Every field is optional; the accessors apply defaults.
+///
+/// These drive the `serve`-mode scheduler (see the management adapter's
+/// `DreamService`), which runs two cadences from one loop: a frequent harvest
+/// sweep that imports finished sessions, and a full consolidation cycle every
+/// `dream_interval_hours`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DreamConfig {
     /// Minutes a session must be inactive before it counts as finished and is
     /// harvested (default 60).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_idle_minutes: Option<u64>,
+
+    /// Whether the scheduler runs full consolidation cycles (default true).
+    /// Turning this off leaves harvesting alone — see `auto_import`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dream_enabled: Option<bool>,
+
+    /// Hours between full consolidation cycles (default 4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dream_interval_hours: Option<u64>,
+
+    /// Whether finished sessions are imported automatically between cycles
+    /// (default true). Each import spends LLM extraction calls, so this is the
+    /// switch for "never import without me asking".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_import: Option<bool>,
 }
 
 impl DreamConfig {
     pub const DEFAULT_SESSION_IDLE_MINUTES: u64 = 60;
+    pub const DEFAULT_DREAM_INTERVAL_HOURS: u64 = 4;
 
     pub fn session_idle_minutes(&self) -> u64 {
         self.session_idle_minutes
             .filter(|m| *m > 0)
             .unwrap_or(Self::DEFAULT_SESSION_IDLE_MINUTES)
+    }
+
+    pub fn dream_enabled(&self) -> bool {
+        self.dream_enabled.unwrap_or(true)
+    }
+
+    /// Zero is treated as unset (rather than "dream constantly"), so a bad
+    /// hand-edit degrades to the default instead of pinning the CPU.
+    pub fn dream_interval_hours(&self) -> u64 {
+        self.dream_interval_hours
+            .filter(|h| *h > 0)
+            .unwrap_or(Self::DEFAULT_DREAM_INTERVAL_HOURS)
+    }
+
+    pub fn auto_import(&self) -> bool {
+        self.auto_import.unwrap_or(true)
     }
 }
 
@@ -244,6 +409,55 @@ impl MemoryConfig {
             .or_else(|| role_active(openai))
             .or(openai.active.as_deref())?;
         openai.endpoints.get(name)
+    }
+
+    /// The binding a usage carries, if any.
+    pub fn usage_binding(&self, usage: LlmUsage) -> Option<&UsageBinding> {
+        self.openai.as_ref()?.usages.get(usage.as_str())
+    }
+
+    /// Resolve the chat endpoint for one **usage**: its own binding first, then
+    /// the shared chat role, then the environment.
+    ///
+    /// A binding may name only a model, which keeps the role's endpoint and
+    /// swaps the model — the common case when one server hosts several.
+    pub fn resolve_usage_chat_endpoint(&self, usage: LlmUsage) -> ResolvedChatEndpoint {
+        let binding = self.usage_binding(usage).cloned().unwrap_or_default();
+        // An endpoint named by the binding overrides the role's; otherwise the
+        // role resolves as before and only the model is swapped.
+        let mut resolved = self.resolve_chat_endpoint(binding.endpoint.as_deref());
+        if let Some(model) = binding.model {
+            resolved.model = Some(model);
+        }
+        resolved
+    }
+
+    /// Whether a usage is served by Copilot — either through its own binding or
+    /// by inheriting a chat role bound to the reserved name.
+    pub fn usage_uses_copilot(&self, usage: LlmUsage) -> bool {
+        match self
+            .usage_binding(usage)
+            .and_then(|b| b.endpoint.as_deref())
+        {
+            Some(name) => name == COPILOT_ENDPOINT,
+            None => self.chat_uses_copilot(None),
+        }
+    }
+
+    /// Whether chat is bound to the reserved [`COPILOT_ENDPOINT`] name.
+    ///
+    /// Checked before endpoint resolution: Copilot is not a registered
+    /// OpenAI-compatible endpoint, so `select_endpoint` would miss it and fall
+    /// through to the environment, silently ignoring the user's choice.
+    pub fn chat_uses_copilot(&self, name_override: Option<&str>) -> bool {
+        let name = match name_override {
+            Some(n) => Some(n),
+            None => self
+                .openai
+                .as_ref()
+                .and_then(|o| o.active_chat.as_deref().or(o.active.as_deref())),
+        };
+        name == Some(COPILOT_ENDPOINT)
     }
 
     /// Resolve the **chat** endpoint: the named config endpoint (override →

@@ -17,9 +17,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::application::{MemoryRow, RowTarget};
+use crate::application::{MemoryLink, MemoryRow, RowTarget};
 use crate::connector::api::Container;
-use crate::domain::NodeKind;
+use crate::domain::{EdgeType, NodeKind};
 use crate::tui::{markdown, theme};
 
 /// How many ranked hits a search shows.
@@ -88,7 +88,7 @@ impl MemoryScreen {
         self.total_items = self
             .rows
             .iter()
-            .filter(|r| matches!(r.target, RowTarget::Item(_)))
+            .filter(|r| matches!(r.target, RowTarget::Memory { .. }))
             .count();
         self.total_sessions = self
             .rows
@@ -396,14 +396,22 @@ impl MemoryScreen {
                     Style::default().fg(theme::MUTED).bg(bg),
                 ));
             }
-            RowTarget::Item(item) => {
+            RowTarget::Memory { memory, links } => {
                 spans.push(Span::styled(
                     "• ",
                     Style::default()
-                        .fg(theme::kind_color(item.kind().as_str()))
+                        .fg(theme::kind_color(memory.memory.kind.as_str()))
                         .bg(bg),
                 ));
                 spans.push(Span::styled(row.label.clone(), label_style(selected, bg)));
+                // A badge, not a list: the tree says a memory has history, the
+                // detail pane says what it is.
+                if !links.is_empty() {
+                    spans.push(Span::styled(
+                        format!("  ⇄{}", links.len()),
+                        Style::default().fg(theme::MUTED).bg(bg),
+                    ));
+                }
             }
             RowTarget::Node(node) => {
                 let glyph = if node.kind() == NodeKind::Session {
@@ -491,8 +499,45 @@ fn label_style(selected: bool, bg: ratatui::style::Color) -> Style {
     }
 }
 
-/// Build the styled detail for the selected row. Items show metadata + content;
-/// nodes show their L0/L1 and, when present, L2; groups/directories show a hint.
+/// Direction is spelled out rather than drawn, because "supersedes" and
+/// "superseded by" are opposite facts about the memory on screen.
+fn link_phrase(link: &MemoryLink) -> String {
+    let verb = match (link.edge_type, link.outgoing) {
+        (EdgeType::Supersedes, true) => "supersedes",
+        (EdgeType::Supersedes, false) => "superseded by",
+        (EdgeType::Contradicts, _) => "contradicts",
+        (EdgeType::Refines, true) => "refines",
+        (EdgeType::Refines, false) => "refined by",
+        (EdgeType::Corroborates, true) => "corroborates",
+        (EdgeType::Corroborates, false) => "corroborated by",
+        (EdgeType::Retracts, true) => "retracts",
+        (EdgeType::Retracts, false) => "retracted by",
+        (EdgeType::RelatesTo, _) => "relates to",
+    };
+    format!("{verb:<16}")
+}
+
+fn link_glyph(link: &MemoryLink) -> &'static str {
+    match link.edge_type {
+        EdgeType::Supersedes if link.outgoing => "↑",
+        EdgeType::Supersedes => "↓",
+        EdgeType::Contradicts => "⚡",
+        EdgeType::Corroborates => "✓",
+        EdgeType::Refines => "◦",
+        EdgeType::Retracts => "✗",
+        EdgeType::RelatesTo => "·",
+    }
+}
+
+fn link_color(edge_type: EdgeType) -> ratatui::style::Color {
+    match edge_type {
+        // A live disagreement is the one thing here worth interrupting for.
+        EdgeType::Contradicts => theme::WARN,
+        EdgeType::Supersedes => theme::ACCENT,
+        _ => theme::MUTED,
+    }
+}
+
 fn detail_body(row: &MemoryRow) -> Vec<Line<'static>> {
     match &row.target {
         RowTarget::Group { count, .. } => vec![
@@ -501,22 +546,68 @@ fn detail_body(row: &MemoryRow) -> Vec<Line<'static>> {
             meta_line(&format!("{count} item(s). Select a child to read it.")),
         ],
         RowTarget::Directory => vec![meta_line("Directory — select a child to view it.")],
-        RowTarget::Item(item) => {
+        RowTarget::Memory { memory, links } => {
             let mut lines = vec![
                 Line::from(Span::styled(
-                    format!("[{}] {}", item.kind(), item.name()),
+                    format!(
+                        "[{}] {}",
+                        memory.memory.kind.as_str(),
+                        memory.memory.statement
+                    ),
                     Style::default()
-                        .fg(theme::kind_color(item.kind().as_str()))
+                        .fg(theme::kind_color(memory.memory.kind.as_str()))
                         .add_modifier(Modifier::BOLD),
                 )),
                 meta_line(&format!(
-                    "updated {}×  ·  source: {}",
-                    item.update_count(),
-                    item.source_session_id().unwrap_or("(unknown)")
+                    "{}  ·  confidence {:.2}  ·  {}  ·  {}",
+                    memory.memory.source_kind.as_str(),
+                    memory.memory.confidence,
+                    memory.memory.status.as_str(),
+                    memory.memory.project.as_deref().unwrap_or("global"),
+                )),
+                meta_line(&format!(
+                    "source: {}",
+                    memory
+                        .memory
+                        .source_session_id
+                        .as_deref()
+                        .unwrap_or("(unknown)")
                 )),
                 Line::from(""),
+                // The triple behind the statement. Shown because it is what
+                // deduplication and entity resolution actually key on, so when
+                // two memories look alike this is where the difference is.
+                meta_line(&format!(
+                    "{} — {} → {}",
+                    memory.subject.as_deref().unwrap_or("?"),
+                    memory.memory.predicate.as_str(),
+                    memory.object.as_deref().unwrap_or("?"),
+                )),
             ];
-            lines.extend(markdown::render(item.content()));
+
+            if links.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(meta_line("No links."));
+            } else {
+                lines.push(Line::from(""));
+                lines.push(section_header(&format!("Links ({})", links.len())));
+                for link in links {
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("  {} ", link_glyph(link)),
+                            Style::default().fg(link_color(link.edge_type)),
+                        ),
+                        Span::styled(
+                            link_phrase(link),
+                            Style::default().fg(link_color(link.edge_type)),
+                        ),
+                        Span::styled(
+                            format!("  {}", link.other_statement),
+                            Style::default().fg(theme::MUTED),
+                        ),
+                    ]));
+                }
+            }
             lines
         }
         RowTarget::NodeLevel { node, .. } => {
@@ -577,7 +668,8 @@ impl Default for MemoryScreen {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{MemoryItem, MemoryKind};
+    use crate::application::MemoryLink;
+    use crate::domain::{EntityRef, MemoryKind, Predicate};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -596,23 +688,42 @@ mod tests {
     }
 
     fn item_row_test(name: &str, depth: u8) -> MemoryRow {
+        memory_row_test(name, depth, Vec::new())
+    }
+
+    fn memory_row_test(statement: &str, depth: u8, links: Vec<MemoryLink>) -> MemoryRow {
         MemoryRow {
             depth,
             kind_label: "fact".into(),
-            label: name.into(),
+            label: statement.into(),
             preview: None,
             score: None,
-            target: RowTarget::Item(MemoryItem::new(
-                name.into(),
-                MemoryKind::Fact,
-                name.into(),
-                "content body".into(),
-                None,
-                None,
-                0,
-                0,
-                0,
-            )),
+            target: RowTarget::Memory {
+                memory: crate::application::LabelledMemory {
+                    subject: Some("the user".into()),
+                    object: Some("tabs".into()),
+                    memory: crate::domain::Memory {
+                        id: statement.into(),
+                        kind: MemoryKind::Fact,
+                        subject: EntityRef::Literal("the user".into()),
+                        predicate: Predicate::Prefers,
+                        object: EntityRef::Literal("tabs".into()),
+                        statement: statement.into(),
+                        project: None,
+                        recorded_at: 1,
+                        valid_from: 1,
+                        valid_to: None,
+                        source_session_id: None,
+                        source_message_index: None,
+                        source_kind: crate::domain::SourceKind::UserStated,
+                        confidence: 0.9,
+                        status: crate::domain::MemoryStatus::Active,
+                        derived: false,
+                        derived_from: Vec::new(),
+                    },
+                },
+                links,
+            },
         }
     }
 
@@ -681,17 +792,82 @@ mod tests {
     }
 
     #[test]
-    fn selecting_an_item_shows_its_content() {
+    fn selecting_a_memory_shows_its_statement_and_metadata() {
         let mut s = screen_with(vec![
             group("memories", "Memories", 1, 0),
-            item_row_test("duckdb_locks", 1),
+            item_row_test("duckdb takes a file lock", 1),
         ]);
-        s.selected = 1; // the item
+        s.selected = 1;
         let text = render_to_text(&mut s, 100, 20);
         assert!(
-            text.contains("content body"),
-            "item content in the detail pane"
+            text.contains("duckdb takes a file lock"),
+            "the statement is the memory's readable content"
         );
+        assert!(text.contains("user_stated"), "source kind shown");
+        assert!(text.contains("active"), "lifecycle status shown");
+    }
+
+    /// The graph is only worth having if you can see it. A memory's edges are
+    /// rendered with their direction spelled out, because "supersedes X" and
+    /// "superseded by X" are opposite facts about the memory on screen.
+    #[test]
+    fn selecting_a_memory_shows_its_edges_with_direction() {
+        let links = vec![
+            MemoryLink {
+                edge_type: EdgeType::Supersedes,
+                outgoing: true,
+                other_id: "old-1".into(),
+                other_statement: "the user prefers tabs".into(),
+            },
+            MemoryLink {
+                edge_type: EdgeType::Contradicts,
+                outgoing: false,
+                other_id: "rival-1".into(),
+                other_statement: "the user prefers two spaces".into(),
+            },
+        ];
+        let mut s = screen_with(vec![
+            group("memories", "Memories", 1, 0),
+            memory_row_test("the user prefers four spaces", 1, links),
+        ]);
+        s.selected = 1;
+        let text = render_to_text(&mut s, 120, 24);
+
+        assert!(text.contains("Links (2)"), "edge section header:\n{text}");
+        assert!(text.contains("supersedes"), "outgoing supersession named");
+        assert!(
+            text.contains("the user prefers tabs"),
+            "the superseded memory's statement is shown, not just its id"
+        );
+        assert!(text.contains("contradicts"), "live disagreement named");
+        assert!(text.contains("the user prefers two spaces"));
+    }
+
+    /// A memory with no history says so rather than showing an empty section.
+    #[test]
+    fn a_memory_without_edges_says_so() {
+        let mut s = screen_with(vec![
+            group("memories", "Memories", 1, 0),
+            memory_row_test("a lonely fact", 1, Vec::new()),
+        ]);
+        s.selected = 1;
+        let text = render_to_text(&mut s, 100, 20);
+        assert!(text.contains("No links."));
+    }
+
+    /// The tree badges a memory that has edges, so history is discoverable
+    /// without opening every row.
+    #[test]
+    fn the_tree_badges_a_memory_that_has_edges() {
+        let links = vec![MemoryLink {
+            edge_type: EdgeType::Corroborates,
+            outgoing: false,
+            other_id: "echo-1".into(),
+            other_statement: "restated".into(),
+        }];
+        let mut s = screen_with(vec![memory_row_test("a fact with history", 0, links)]);
+        let text = render_to_text(&mut s, 100, 20);
+        assert!(text.contains("⇄1"), "edge-count badge on the row:\n{text}");
     }
 
     #[test]

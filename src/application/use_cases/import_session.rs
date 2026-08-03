@@ -1,14 +1,20 @@
 //! Import a finished session transcript into the memory store.
 //!
-//! Orchestrates the session-commit flow: idempotence check, memory extraction,
+//! Orchestrates the session-commit flow: idempotence check, memory ingestion,
 //! and recording of the imported-session marker.
+//!
+//! Import writes **memories**, not items. The item extractor still exists and
+//! still compiles (it is deleted in its own step), but nothing calls it — so
+//! `memory_items` stops growing and the memory log is the projection every
+//! surface reads. Anything that reads items after this point is reading a table
+//! that no longer receives writes.
 
 use std::sync::Arc;
 
 use tracing::{info, warn};
 
-use crate::application::interfaces::MemoryRepository;
-use crate::application::use_cases::memory_extraction::{ExtractionReport, MemoryExtractionUseCase};
+use crate::application::interfaces::NodeRepository;
+use crate::application::use_cases::memory_ingestion::{IngestionOutcome, MemoryIngestionUseCase};
 use crate::application::use_cases::memory_summary::SummarizeMemoryUseCase;
 use crate::domain::{DomainError, ImportedSession, SessionStatus, SessionTranscript};
 
@@ -18,30 +24,30 @@ const MIN_MESSAGES: usize = 2;
 
 /// Outcome of an import request.
 pub enum ImportOutcome {
-    /// Extraction ran; the report describes what was written.
+    /// Ingestion ran; the report describes what was written.
     Imported {
         session: ImportedSession,
-        report: ExtractionReport,
+        report: crate::application::use_cases::memory_ingestion::IngestionReport,
     },
     /// The session was already imported and `force` was not set.
     AlreadyImported { session: ImportedSession },
 }
 
 pub struct ImportSessionUseCase {
-    memory_repo: Arc<dyn MemoryRepository>,
-    extraction: MemoryExtractionUseCase,
+    node_repo: Arc<dyn NodeRepository>,
+    ingestion: MemoryIngestionUseCase,
     summary: SummarizeMemoryUseCase,
 }
 
 impl ImportSessionUseCase {
     pub fn new(
-        memory_repo: Arc<dyn MemoryRepository>,
-        extraction: MemoryExtractionUseCase,
+        node_repo: Arc<dyn NodeRepository>,
+        ingestion: MemoryIngestionUseCase,
         summary: SummarizeMemoryUseCase,
     ) -> Self {
         Self {
-            memory_repo,
-            extraction,
+            node_repo,
+            ingestion,
             summary,
         }
     }
@@ -68,17 +74,27 @@ impl ImportSessionUseCase {
         }
 
         if !force {
-            if let Some(session) = self.memory_repo.find_session(&transcript.id).await? {
+            if let Some(session) = self.node_repo.find_session(&transcript.id).await? {
                 return Ok(ImportOutcome::AlreadyImported { session });
             }
         }
 
-        let report = self.extraction.execute(transcript).await?;
+        // `force` is threaded through: a forced re-import must clear the
+        // session's prior memories, or the second run appends a near-duplicate
+        // set alongside the first instead of replacing it.
+        let report = match self.ingestion.execute(transcript, force).await? {
+            IngestionOutcome::Ingested(report) => report,
+            // The session marker said "not imported" but the memory log
+            // disagrees. Trust the memory log and report nothing written rather
+            // than double-ingesting.
+            IngestionOutcome::AlreadyIngested => Default::default(),
+        };
         info!(
-            "session '{}': {} operations applied, {} skipped",
+            "session '{}': {} memories written, {} corroborated, {} conflicts recorded",
             transcript.id,
-            report.applied.len(),
-            report.skipped.len()
+            report.memories_written,
+            report.memories_corroborated,
+            report.conflicts_recorded
         );
 
         // Build the virtual-filesystem layer over the flat items:
@@ -115,11 +131,15 @@ impl ImportSessionUseCase {
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0),
             message_count: transcript.messages.len(),
-            items_written: report.items_written(),
+            project: transcript.project.clone(),
+            // Column name predates memories; it is the count of memories this
+            // session wrote, which is now memories. Renaming it would rewrite the
+            // sessions table for no behavioural gain.
+            items_written: report.memories_written,
             status: SessionStatus::Imported,
             last_error: None,
         };
-        self.memory_repo.record_session(&session).await?;
+        self.node_repo.record_session(&session).await?;
 
         Ok(ImportOutcome::Imported { session, report })
     }

@@ -1012,6 +1012,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "gh-copilot-rs"
+version = "0.1.0"
+source = "git+https://github.com/ArtemisMucaj/gh-copilot-rs?branch=main#06392a2520e2ff73da106aca4c57ebb5479d256e"
+dependencies = [
+ "async-trait",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1588,6 +1602,7 @@ dependencies = [
  "clap",
  "crossterm",
  "duckdb",
+ "gh-copilot-rs",
  "openai-rs",
  "ratatui",
  "reqwest",

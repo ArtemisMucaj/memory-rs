@@ -11,9 +11,9 @@
 //! Dependencies point inward, following ports & adapters:
 //!
 //! - [`domain`] — pure value types ([`MemoryItem`], [`MemoryNode`],
-//!   [`SessionTranscript`], [`DomainError`], …). No I/O, no async.
+//!   [`SessionTranscript`], [`Memory`], [`DomainError`], …). No I/O, no async.
 //! - [`application`] — use cases (orchestration) and port traits
-//!   ([`MemoryRepository`], [`SessionDiscovery`]). Depends only on the domain.
+//!   ([`NodeRepository`], [`SessionDiscovery`]). Depends only on the domain.
 //! - [`connector`] — concrete adapters (DuckDB store, session discovery,
 //!   transcript parsing, resource fetch). Depends on application + domain.
 //!
@@ -30,20 +30,22 @@ pub mod tui;
 
 pub use application::{
     resource_slug, DreamReport, ExtractionReport, HarvestReport, ImportOutcome,
-    ImportSessionUseCase, MemoryBrowseUseCase, MemoryDreamUseCase, MemoryExtractionUseCase,
-    MemoryLevel, MemoryRepository, MemoryRow, MemorySearchUseCase, MemoryStats, RowTarget,
-    SessionDiscovery, SummarizeMemoryUseCase, MEMORY_ROOT_URI, PROJECTS_ROOT_URI,
+    ImportSessionUseCase, IngestionOutcome, IngestionReport, MemoryBrowseUseCase,
+    MemoryDreamUseCase, MemoryExtractionUseCase, MemoryIngestionUseCase, MemoryLevel,
+    MemoryRecallUseCase, MemoryRepository, MemoryResumeUseCase, MemoryRow, MemorySearchUseCase,
+    NodeRepository, NodeStats, ResumeBriefing, RowTarget, SessionDiscovery, SessionRecap,
+    SummarizeMemoryUseCase, DEFAULT_SESSION_LIMIT, MEMORY_ROOT_URI, PROJECTS_ROOT_URI,
     RESOURCES_ROOT_URI, SESSIONS_ROOT_URI,
 };
 
 pub use connector::{
     build_chat_client, build_embedding_client, fetch_resource, parse_transcript,
-    parse_transcript_file, DiscoveredSessionSources, DuckdbMemoryRepository, FetchedResource,
-    MEMORY_DB_FILE,
+    parse_transcript_file, DiscoveredSessionSources, DuckdbStore, FetchedResource, MEMORY_DB_FILE,
 };
 
 pub use domain::{
-    cosine_similarity, DiscoveredSession, DomainError, DreamRun, ImportedSession, MemoryItem,
-    MemoryKind, MemoryNode, MemoryOperation, NodeKind, SessionLocator, SessionMessage,
-    SessionSource, SessionStatus, SessionTranscript,
+    cosine_similarity, DiscoveredSession, DomainError, DreamRun, EdgeOrigin, EdgeType, Entity,
+    EntityRef, ImportedSession, Memory, MemoryEdge, MemoryItem, MemoryKind, MemoryNode,
+    MemoryOperation, MemoryStatus, MemoryStoreStats, NodeKind, Predicate, SessionLocator,
+    SessionMessage, SessionSource, SessionStatus, SessionTranscript, SourceKind,
 };
