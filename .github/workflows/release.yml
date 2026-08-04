@@ -44,9 +44,6 @@ jobs:
           - os: macos-14
             artifact_name: memory-rs
             asset_name: memory-rs-macos-aarch64
-          - os: windows-latest
-            artifact_name: memory-rs.exe
-            asset_name: memory-rs-windows-x86_64.exe
 
     steps:
       - name: Checkout code
