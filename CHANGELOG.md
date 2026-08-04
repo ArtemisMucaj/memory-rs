@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/ArtemisMucaj/memory-rs/compare/v0.2.0...v0.2.1) (2026-08-04)
+
+
+### Bug Fixes
+
+* drop the Windows release target so macOS/Linux assets ship ([#8](https://github.com/ArtemisMucaj/memory-rs/issues/8)) ([fa04485](https://github.com/ArtemisMucaj/memory-rs/commit/fa04485a2558ee83e35360991845eb5d2fa55bf1))
+
 ## [0.2.0](https://github.com/ArtemisMucaj/memory-rs/compare/v0.1.0...v0.2.0) (2026-08-03)
 
 
