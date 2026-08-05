@@ -7,3 +7,5 @@ memories, recall by hybrid search.
 
 The macOS release binary is signed with a Developer ID and notarized by Apple,
 so it runs without a Gatekeeper exception.
+
+Releases are notarized by Apple.
