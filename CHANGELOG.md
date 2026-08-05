@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.4](https://github.com/ArtemisMucaj/memory-rs/compare/v0.2.3...v0.2.4) (2026-08-05)
+
+
+### Bug Fixes
+
+* re-release to publish the notarized macOS binary ([#17](https://github.com/ArtemisMucaj/memory-rs/issues/17)) ([4707adc](https://github.com/ArtemisMucaj/memory-rs/commit/4707adcc22d15d6841a218853926c14451f7bdad))
+
 ## [0.2.3](https://github.com/ArtemisMucaj/memory-rs/compare/v0.2.2...v0.2.3) (2026-08-05)
 
 
