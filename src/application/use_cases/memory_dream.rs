@@ -8,8 +8,11 @@
 //!
 //! 1. **Harvest** — discover finished sessions (idle for at least an hour)
 //!    that were never imported, and run them through the import pipeline.
-//!    Skipped when auto-import is off, so `auto_import: false` imports no
-//!    sessions even while dreaming stays enabled.
+//!    Only sessions whose project belongs to a namespace, and which ended
+//!    after that namespace was created, are eligible — see
+//!    [`harvest_inner`](MemoryDreamUseCase::harvest_inner). Skipped entirely
+//!    when auto-import is off, so `auto_import: false` imports no sessions
+//!    even while dreaming stays enabled.
 //! 2. **Consolidate** — cluster near-duplicate items by embedding similarity,
 //!    then let the model merge each cluster. Contradictions are the priority:
 //!    conflicting memories are rewritten into one item carrying the boundary
@@ -401,6 +404,23 @@ impl MemoryDreamUseCase {
             .into_iter()
             .map(|s| s.id)
             .collect();
+        // Auto-import is deliberately narrow: only sessions belonging to a
+        // project that the user put in a namespace, and only those that ended
+        // after that namespace was created. Without this, a first harvest on a
+        // machine with years of local history would try to import thousands of
+        // unrelated sessions. Namespacing a project is the opt-in, and the
+        // creation date keeps that opt-in forward-looking rather than
+        // retroactive. Manual `memory import` bypasses all of this.
+        let cutoffs: std::collections::HashMap<String, i64> = self
+            .node_repo
+            .namespaced_project_cutoffs()
+            .await?
+            .into_iter()
+            .collect();
+        if cutoffs.is_empty() {
+            debug!("dream harvest: no namespaced projects, nothing is auto-importable");
+            return Ok(report);
+        }
         let now = unix_now();
         let mut attempted = 0usize;
 
@@ -410,6 +430,24 @@ impl MemoryDreamUseCase {
             }
             if imported.contains(&session.id) {
                 continue;
+            }
+            // Not in a namespace, or older than that namespace: skip before
+            // loading the transcript, so an out-of-scope session costs nothing
+            // beyond the cwd lookup.
+            match self
+                .discovery
+                .session_project(&session)
+                .and_then(|project| cutoffs.get(&project).copied())
+            {
+                Some(cutoff) if session.updated_at >= cutoff => {}
+                Some(_) => {
+                    debug!(
+                        "dream harvest: skipping '{}' — predates its namespace",
+                        session.id
+                    );
+                    continue;
+                }
+                None => continue,
             }
             report.sessions_eligible += 1;
             // Every *attempt* counts against the budget, not just the ones that

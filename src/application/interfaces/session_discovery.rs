@@ -20,4 +20,13 @@ pub trait SessionDiscovery: Send + Sync {
         &self,
         session: &DiscoveredSession,
     ) -> Result<SessionTranscript, DomainError>;
+
+    /// The memory project a session belongs to, derived from its working
+    /// directory the same way [`load_transcript`](Self::load_transcript)
+    /// derives the transcript's project — but without reading the body.
+    ///
+    /// The dream harvest needs the project name to decide whether a session is
+    /// in a namespace *before* paying to parse its transcript, so this is a
+    /// separate, cheap lookup rather than a field on the session.
+    fn session_project(&self, session: &DiscoveredSession) -> Option<String>;
 }

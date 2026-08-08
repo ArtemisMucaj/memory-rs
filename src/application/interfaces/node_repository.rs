@@ -180,6 +180,16 @@ pub trait NodeRepository: Send + Sync {
     /// does not exist).
     async fn namespace_projects(&self, namespace: &str) -> Result<Vec<String>, DomainError>;
 
+    /// Every namespaced project paired with the auto-import cutoff it inherits:
+    /// the creation date of the namespace it belongs to. Used by the dream
+    /// harvest, which imports a discovered session only when its project
+    /// appears here and the session ended after that cutoff.
+    ///
+    /// A project in several namespaces yields the *earliest* cutoff, so the
+    /// namespace that has known about it longest decides. Namespaces with no
+    /// recorded creation date (pre-migration rows) contribute nothing.
+    async fn namespaced_project_cutoffs(&self) -> Result<Vec<(String, i64)>, DomainError>;
+
     /// Aggregate memory-store statistics: item counts by kind, session count,
     /// and node counts by kind.
     async fn stats(&self) -> Result<NodeStats, DomainError>;

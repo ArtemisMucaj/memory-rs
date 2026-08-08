@@ -159,6 +159,18 @@ async fn opening_a_pre_memory_database_is_additive() {
         1,
         "the legacy namespace mapping was lost on upgrade"
     );
+    // `memory_namespaces.created_at` is added by an `ALTER` on upgrade and is
+    // deliberately left NULL: a legacy namespace has no recorded creation date,
+    // so it yields no auto-import cutoff and harvests nothing. Backfilling it
+    // to epoch 0 would make the first dream after an upgrade try to import the
+    // machine's entire session history — the exact failure the cutoff prevents.
+    assert!(
+        NodeRepository::namespaced_project_cutoffs(&repo)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a dateless legacy namespace must not become auto-importable on upgrade"
+    );
 
     // The memory tables now exist on a file that was written without them.
     MemoryRepository::append_memory(
