@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/ArtemisMucaj/memory-rs/compare/v0.2.4...v0.3.0) (2026-08-08)
+
+
+### Features
+
+* **dream:** gate auto-import on namespace membership and creation date ([#19](https://github.com/ArtemisMucaj/memory-rs/issues/19)) ([471f882](https://github.com/ArtemisMucaj/memory-rs/commit/471f882b158836f87fa17e8d59d0bafa965e729a))
+
 ## [0.2.4](https://github.com/ArtemisMucaj/memory-rs/compare/v0.2.3...v0.2.4) (2026-08-05)
 
 
