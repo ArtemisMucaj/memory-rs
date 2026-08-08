@@ -132,6 +132,7 @@ impl DuckdbStore {
             CREATE TABLE IF NOT EXISTS memory_namespaces (
                 namespace TEXT NOT NULL,
                 project TEXT NOT NULL,
+                created_at BIGINT,
                 UNIQUE (namespace, project)
             );
             CREATE TABLE IF NOT EXISTS memories (
@@ -231,6 +232,21 @@ impl DuckdbStore {
             .map_err(|e| {
                 DomainError::storage(format!("Failed to backfill memory_sessions.status: {e}"))
             })?;
+
+        // Same idempotent add-and-swallow pattern, and deliberately NOT
+        // backfilled: NULL reads as "no cutoff", so harvest imports nothing for
+        // a legacy namespace. Backfilling to 0 would instead import the whole
+        // local history on first upgrade. Re-creating it stamps a date.
+        if let Err(e) =
+            conn.execute_batch("ALTER TABLE memory_namespaces ADD COLUMN created_at BIGINT;")
+        {
+            let msg = e.to_string().to_lowercase();
+            if !msg.contains("already exists") && !msg.contains("duplicate") {
+                return Err(DomainError::storage(format!(
+                    "Failed to add memory_namespaces.created_at column: {e}"
+                )));
+            }
+        }
 
         Self::migrate_item_identity(&conn)?;
 
@@ -1256,9 +1272,13 @@ impl NodeRepository for DuckdbStore {
         if existing > 0 {
             return Ok(false);
         }
+        // The placeholder row carries the creation date, i.e. the auto-import
+        // cutoff. Members added later inherit it rather than stamping their
+        // own, so assigning an old repo imports back to the namespace's
+        // creation, not the repo's whole history.
         conn.execute(
-            "INSERT INTO memory_namespaces (namespace, project) VALUES (?1, '')",
-            params![name],
+            "INSERT INTO memory_namespaces (namespace, project, created_at) VALUES (?1, '', ?2)",
+            params![name, crate::application::use_cases::llm_json::unix_now()],
         )
         .map_err(|e| DomainError::storage(format!("Failed to create namespace: {e}")))?;
         Ok(true)
@@ -1291,6 +1311,21 @@ impl NodeRepository for DuckdbStore {
         if existing > 0 {
             return Ok(false);
         }
+        // This call creates the namespace when it does not exist yet, so the
+        // placeholder has to be written here too — otherwise it would have no
+        // creation date and never harvest anything.
+        conn.execute(
+            "INSERT INTO memory_namespaces (namespace, project, created_at) \
+             SELECT ?1, '', ?2 WHERE NOT EXISTS ( \
+                 SELECT 1 FROM memory_namespaces WHERE namespace = ?1 \
+             )",
+            params![
+                namespace,
+                crate::application::use_cases::llm_json::unix_now()
+            ],
+        )
+        .map_err(|e| DomainError::storage(format!("Failed to create namespace: {e}")))?;
+        // Members inherit the placeholder's cutoff, so their own is left NULL.
         conn.execute(
             "INSERT INTO memory_namespaces (namespace, project) VALUES (?1, ?2)",
             params![namespace, project],
@@ -1345,6 +1380,36 @@ impl NodeRepository for DuckdbStore {
             })?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| DomainError::storage(format!("Failed to read project row: {e}")))
+    }
+
+    async fn namespaced_project_cutoffs(&self) -> Result<Vec<(String, i64)>, DomainError> {
+        let conn = self.conn.lock().await;
+        // Join members back to their namespace's placeholder, which holds the
+        // date. MIN picks the earliest when a project is in several. A NULL
+        // date fails the join, so a pre-migration namespace imports nothing.
+        let mut stmt = conn
+            .prepare(
+                "SELECT m.project, MIN(n.created_at) \
+                 FROM memory_namespaces m \
+                 JOIN memory_namespaces n \
+                   ON n.namespace = m.namespace \
+                  AND n.project = '' \
+                  AND n.created_at IS NOT NULL \
+                 WHERE m.project <> '' \
+                 GROUP BY m.project ORDER BY m.project",
+            )
+            .map_err(|e| {
+                DomainError::storage(format!("Failed to prepare namespaced_project_cutoffs: {e}"))
+            })?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|e| {
+                DomainError::storage(format!("Failed to query namespaced project cutoffs: {e}"))
+            })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| DomainError::storage(format!("Failed to read cutoff row: {e}")))
     }
 }
 

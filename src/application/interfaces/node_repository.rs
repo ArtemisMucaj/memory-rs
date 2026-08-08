@@ -180,6 +180,14 @@ pub trait NodeRepository: Send + Sync {
     /// does not exist).
     async fn namespace_projects(&self, namespace: &str) -> Result<Vec<String>, DomainError>;
 
+    /// Every namespaced project paired with its auto-import cutoff — the
+    /// creation date of the namespace it belongs to.
+    ///
+    /// A project in several namespaces yields the *earliest* cutoff.
+    /// Pre-migration namespaces, which have no recorded date, contribute
+    /// nothing.
+    async fn namespaced_project_cutoffs(&self) -> Result<Vec<(String, i64)>, DomainError>;
+
     /// Aggregate memory-store statistics: item counts by kind, session count,
     /// and node counts by kind.
     async fn stats(&self) -> Result<NodeStats, DomainError>;

@@ -19,6 +19,13 @@ fn repo() -> Arc<dyn NodeRepository> {
     Arc::new(DuckdbStore::in_memory(DIMS, "mock-embedding").unwrap())
 }
 
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 fn item(name: &str, content: &str, project: Option<&str>) -> MemoryItem {
     MemoryItem::new(
         format!("id-{name}-{}", project.unwrap_or("global")),
@@ -428,6 +435,72 @@ async fn assigning_a_project_autocreates_the_namespace() {
         repo.list_namespaces().await.unwrap(),
         vec![("infra".to_string(), 1)]
     );
+}
+
+#[tokio::test]
+async fn only_namespaced_projects_carry_an_auto_import_cutoff() {
+    let repo = repo();
+    let before = unix_now();
+    repo.create_namespace("payments").await.unwrap();
+    repo.assign_project("payments", "acme/billing")
+        .await
+        .unwrap();
+    let after = unix_now();
+
+    let cutoffs = repo.namespaced_project_cutoffs().await.unwrap();
+    assert_eq!(cutoffs.len(), 1, "only the member project is listed");
+    let (project, cutoff) = &cutoffs[0];
+    assert_eq!(project, "acme/billing");
+    // The cutoff is the namespace's creation, stamped at `create_namespace`.
+    assert!(
+        *cutoff >= before && *cutoff <= after,
+        "cutoff {cutoff} outside [{before}, {after}]"
+    );
+
+    // A namespace with no members contributes nothing to harvest at all.
+    repo.create_namespace("empty").await.unwrap();
+    assert_eq!(repo.namespaced_project_cutoffs().await.unwrap().len(), 1);
+
+    // Unassigning removes eligibility again.
+    repo.unassign_project("payments", "acme/billing")
+        .await
+        .unwrap();
+    assert!(repo.namespaced_project_cutoffs().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_project_in_two_namespaces_inherits_the_earliest_cutoff() {
+    let repo = repo();
+    // `old` is created first, so its creation date is the earlier one and must
+    // win — the namespace that has known the project longest sets the cutoff.
+    repo.create_namespace("old").await.unwrap();
+    let old_cutoff = repo.namespaced_project_cutoffs().await.unwrap();
+    assert!(old_cutoff.is_empty(), "no members yet");
+
+    repo.assign_project("old", "acme/svc").await.unwrap();
+    let earliest = repo.namespaced_project_cutoffs().await.unwrap()[0].1;
+
+    repo.create_namespace("new").await.unwrap();
+    repo.assign_project("new", "acme/svc").await.unwrap();
+
+    let cutoffs = repo.namespaced_project_cutoffs().await.unwrap();
+    assert_eq!(
+        cutoffs.len(),
+        1,
+        "the project is listed once, not per namespace"
+    );
+    assert_eq!(cutoffs[0].1, earliest);
+}
+
+#[tokio::test]
+async fn autocreating_a_namespace_by_assignment_still_stamps_a_cutoff() {
+    let repo = repo();
+    // `assign_project` creates the namespace implicitly; without a placeholder
+    // row carrying a date, the project would be permanently un-harvestable.
+    repo.assign_project("infra", "acme/svc-a").await.unwrap();
+    let cutoffs = repo.namespaced_project_cutoffs().await.unwrap();
+    assert_eq!(cutoffs.len(), 1);
+    assert!(cutoffs[0].1 > 1_700_000_000, "a real date was stamped");
 }
 
 #[tokio::test]

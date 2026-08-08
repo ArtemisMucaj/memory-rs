@@ -60,6 +60,12 @@ impl crate::application::SessionDiscovery for LocalSessionDiscovery {
             .await
             .map_err(|e| DomainError::internal(format!("transcript load task panicked: {e}")))?
     }
+
+    fn session_project(&self, session: &DiscoveredSession) -> Option<String> {
+        // Same derivation `load_transcript` applies, so a session's harvest
+        // eligibility and the project its memories land under always agree.
+        session.cwd.as_deref().and_then(project_from_cwd)
+    }
 }
 
 /// Characters of end-of-session preview surfaced in the picker.
