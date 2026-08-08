@@ -281,12 +281,10 @@ pub struct DreamConfig {
     /// (default true). Each import spends LLM extraction calls, so this is the
     /// switch for "never import without me asking".
     ///
-    /// Enabling it does not open the floodgates: auto-import only ever
-    /// considers sessions whose project belongs to a namespace, and only those
-    /// that ended after that namespace was created. Putting a project in a
-    /// namespace is therefore the per-project opt-in, and it applies going
-    /// forward rather than retroactively importing its whole history. Manual
-    /// `memory import` is unaffected and can still import anything.
+    /// Enabling it stays narrow: only projects in a namespace are considered,
+    /// and only for sessions newer than that namespace. Namespacing a project
+    /// is the per-project opt-in, and it applies going forward rather than
+    /// back-importing its history. Manual `memory import` is unaffected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_import: Option<bool>,
 }

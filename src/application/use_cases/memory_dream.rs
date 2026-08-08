@@ -8,11 +8,9 @@
 //!
 //! 1. **Harvest** — discover finished sessions (idle for at least an hour)
 //!    that were never imported, and run them through the import pipeline.
-//!    Only sessions whose project belongs to a namespace, and which ended
-//!    after that namespace was created, are eligible — see
-//!    [`harvest_inner`](MemoryDreamUseCase::harvest_inner). Skipped entirely
-//!    when auto-import is off, so `auto_import: false` imports no sessions
-//!    even while dreaming stays enabled.
+//!    Only namespaced projects are eligible, and only for sessions newer than
+//!    the namespace. Skipped when auto-import is off, so `auto_import: false`
+//!    imports no sessions even while dreaming stays enabled.
 //! 2. **Consolidate** — cluster near-duplicate items by embedding similarity,
 //!    then let the model merge each cluster. Contradictions are the priority:
 //!    conflicting memories are rewritten into one item carrying the boundary
@@ -71,6 +69,13 @@ const MAX_CLUSTER_ITEMS: usize = 6;
 /// does not turn into hundreds of extraction calls. The rest are picked up by
 /// subsequent cycles.
 const MAX_HARVEST_SESSIONS: usize = 10;
+
+/// Whether a session is auto-import eligible against its namespace's creation
+/// date. Strict: both sides are whole seconds, so a tie says nothing about the
+/// real order and is treated as predating the opt-in.
+fn is_after_cutoff(updated_at: i64, cutoff: i64) -> bool {
+    updated_at > cutoff
+}
 
 /// Upper bound on operations applied by one dream cycle.
 const MAX_DREAM_OPERATIONS: usize = 32;
@@ -404,13 +409,10 @@ impl MemoryDreamUseCase {
             .into_iter()
             .map(|s| s.id)
             .collect();
-        // Auto-import is deliberately narrow: only sessions belonging to a
-        // project that the user put in a namespace, and only those that ended
-        // after that namespace was created. Without this, a first harvest on a
-        // machine with years of local history would try to import thousands of
-        // unrelated sessions. Namespacing a project is the opt-in, and the
-        // creation date keeps that opt-in forward-looking rather than
-        // retroactive. Manual `memory import` bypasses all of this.
+        // Namespacing a project is the auto-import opt-in; the namespace's
+        // creation date keeps it forward-looking. Without this, a first harvest
+        // on a machine with years of history would import thousands of
+        // unrelated sessions. Manual `memory import` bypasses all of it.
         let cutoffs: std::collections::HashMap<String, i64> = self
             .node_repo
             .namespaced_project_cutoffs()
@@ -431,15 +433,14 @@ impl MemoryDreamUseCase {
             if imported.contains(&session.id) {
                 continue;
             }
-            // Not in a namespace, or older than that namespace: skip before
-            // loading the transcript, so an out-of-scope session costs nothing
-            // beyond the cwd lookup.
+            // Checked before loading the transcript, so an out-of-scope session
+            // costs nothing beyond the cwd lookup.
             match self
                 .discovery
                 .session_project(&session)
                 .and_then(|project| cutoffs.get(&project).copied())
             {
-                Some(cutoff) if session.updated_at >= cutoff => {}
+                Some(cutoff) if is_after_cutoff(session.updated_at, cutoff) => {}
                 Some(_) => {
                     debug!(
                         "dream harvest: skipping '{}' — predates its namespace",
@@ -857,6 +858,14 @@ fn union(parent: &mut [usize], a: usize, b: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_namespace_cutoff_excludes_the_boundary_second() {
+        let cutoff = 1_700_000_000;
+        assert!(!is_after_cutoff(cutoff - 1, cutoff));
+        assert!(!is_after_cutoff(cutoff, cutoff));
+        assert!(is_after_cutoff(cutoff + 1, cutoff));
+    }
 
     #[test]
     fn parses_dream_items_and_deletes() {

@@ -258,9 +258,8 @@ pub enum Command {
     /// Manage namespaces — cohesive groups of projects that focus retrieval
     /// across a set of related repositories.
     ///
-    /// Namespaces also gate auto-import: a project's sessions are only ever
-    /// harvested automatically once it is in a namespace, and only for
-    /// sessions that ended after that namespace was created.
+    /// Namespaces also gate auto-import: a project is harvested only once it
+    /// is in one, and only for sessions newer than that namespace.
     Namespace {
         #[command(subcommand)]
         command: NamespaceCommand,

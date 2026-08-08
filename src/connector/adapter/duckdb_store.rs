@@ -233,14 +233,10 @@ impl DuckdbStore {
                 DomainError::storage(format!("Failed to backfill memory_sessions.status: {e}"))
             })?;
 
-        // Databases created before namespaces carried a creation date. Same
-        // idempotent add-and-swallow pattern, and deliberately NOT backfilled:
-        // a NULL reads as "no auto-import cutoff recorded", which the harvest
-        // treats as "import nothing from this namespace". Backfilling it to
-        // now would be equally arbitrary, and backfilling it to 0 would open
-        // the floodgates on the entire local session history — exactly what
-        // the cutoff exists to prevent. Re-creating the namespace stamps a
-        // date and opts it back in.
+        // Same idempotent add-and-swallow pattern, and deliberately NOT
+        // backfilled: NULL reads as "no cutoff", so harvest imports nothing for
+        // a legacy namespace. Backfilling to 0 would instead import the whole
+        // local history on first upgrade. Re-creating it stamps a date.
         if let Err(e) =
             conn.execute_batch("ALTER TABLE memory_namespaces ADD COLUMN created_at BIGINT;")
         {
@@ -1276,12 +1272,10 @@ impl NodeRepository for DuckdbStore {
         if existing > 0 {
             return Ok(false);
         }
-        // The placeholder row carries the namespace's creation date, which is
-        // the auto-import cutoff: harvesting only ever considers sessions that
-        // ended after the namespace existed. Member rows added later inherit
-        // this cutoff rather than stamping their own, so assigning an old repo
-        // imports its sessions back to the namespace's creation, not the
-        // repo's whole history.
+        // The placeholder row carries the creation date, i.e. the auto-import
+        // cutoff. Members added later inherit it rather than stamping their
+        // own, so assigning an old repo imports back to the namespace's
+        // creation, not the repo's whole history.
         conn.execute(
             "INSERT INTO memory_namespaces (namespace, project, created_at) VALUES (?1, '', ?2)",
             params![name, crate::application::use_cases::llm_json::unix_now()],
@@ -1317,10 +1311,9 @@ impl NodeRepository for DuckdbStore {
         if existing > 0 {
             return Ok(false);
         }
-        // Assigning into a namespace that does not exist yet creates it, so the
-        // placeholder row (which carries the auto-import cutoff) has to be
-        // written here too — otherwise the namespace would exist with no
-        // creation date and harvest would never import anything for it.
+        // This call creates the namespace when it does not exist yet, so the
+        // placeholder has to be written here too — otherwise it would have no
+        // creation date and never harvest anything.
         conn.execute(
             "INSERT INTO memory_namespaces (namespace, project, created_at) \
              SELECT ?1, '', ?2 WHERE NOT EXISTS ( \
@@ -1332,8 +1325,7 @@ impl NodeRepository for DuckdbStore {
             ],
         )
         .map_err(|e| DomainError::storage(format!("Failed to create namespace: {e}")))?;
-        // Member rows inherit the namespace's cutoff, so `created_at` is left
-        // NULL on them; `namespace_created_at` reads the placeholder only.
+        // Members inherit the placeholder's cutoff, so their own is left NULL.
         conn.execute(
             "INSERT INTO memory_namespaces (namespace, project) VALUES (?1, ?2)",
             params![namespace, project],
@@ -1392,11 +1384,9 @@ impl NodeRepository for DuckdbStore {
 
     async fn namespaced_project_cutoffs(&self) -> Result<Vec<(String, i64)>, DomainError> {
         let conn = self.conn.lock().await;
-        // Join member rows (project <> '') back to their namespace's
-        // placeholder row (project = ''), which holds the creation date. The
-        // MIN picks the earliest cutoff when a project belongs to several
-        // namespaces. Placeholders with a NULL date are excluded by the join
-        // predicate, so a pre-migration namespace imports nothing.
+        // Join members back to their namespace's placeholder, which holds the
+        // date. MIN picks the earliest when a project is in several. A NULL
+        // date fails the join, so a pre-migration namespace imports nothing.
         let mut stmt = conn
             .prepare(
                 "SELECT m.project, MIN(n.created_at) \
