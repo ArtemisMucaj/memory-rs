@@ -410,11 +410,19 @@ impl MemoryIngestionUseCase {
         }
         // Globals plus this session's project — the same scope the memory will
         // be written into.
-        let projects: Option<Vec<String>> = transcript.project.as_ref().map(|p| vec![p.clone()]);
+        //
+        // A session whose project could not be resolved narrows to globals
+        // alone (the empty list), never to the whole store. The distinction is
+        // load-bearing: an unscoped search has no `WHERE` clause at all, so it
+        // would put another project's memories in front of the model *with
+        // their ids*, and a `supersedes` naming one of those ids is honoured
+        // unconditionally — retiring a memory belonging to a project this
+        // session has nothing to do with.
+        let projects: Vec<String> = transcript.project.clone().into_iter().collect();
         match self.embedder.embed_query(&query).await {
             Ok(vector) => match self
                 .memory_repo
-                .search_memories_semantic(&vector, None, projects.as_deref(), PREFETCH_LIMIT)
+                .search_memories_semantic(&vector, None, Some(&projects), PREFETCH_LIMIT)
                 .await
             {
                 Ok(results) => results.into_iter().map(|(memory, _)| memory).collect(),
