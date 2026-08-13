@@ -132,6 +132,37 @@ impl Harness {
             .unwrap();
         entity_id
     }
+
+    /// Seed one memory under an explicit project (`None` = global), embedded so
+    /// prefetch can find it. Unlike [`Self::seed_prior`] the subject is a
+    /// literal: these memories exist to be *scoped*, not to be related to.
+    async fn seed_scoped(&self, memory_id: &str, statement: &str, project: Option<&str>) {
+        self.memories()
+            .append_memory(
+                &Memory {
+                    id: memory_id.to_string(),
+                    kind: MemoryKind::Fact,
+                    subject: EntityRef::Literal(SUBJECT.to_string()),
+                    predicate: Predicate::Uses,
+                    object: EntityRef::Literal("something".to_string()),
+                    statement: statement.to_string(),
+                    project: project.map(str::to_string),
+                    recorded_at: 100,
+                    valid_from: 100,
+                    valid_to: None,
+                    source_session_id: Some("session-old".to_string()),
+                    source_message_index: None,
+                    source_kind: SourceKind::UserStated,
+                    confidence: 0.9,
+                    status: MemoryStatus::Active,
+                    derived: false,
+                    derived_from: Vec::new(),
+                },
+                Some(&embed_text(statement)),
+            )
+            .await
+            .unwrap();
+    }
 }
 
 fn transcript(id: &str, text: &str) -> SessionTranscript {
@@ -976,6 +1007,72 @@ async fn prior_memories_reach_the_model_with_their_ids() {
         "the prefetched memory's id must be in the prompt:\n{user}",
     );
     assert!(user.contains("the user prefers tabs"));
+}
+
+/// A session whose project could not be resolved prefetches globals only.
+///
+/// The failure this guards is not a bad ranking, it is a missing `WHERE`
+/// clause. An unscoped prefetch puts another project's memories in front of the
+/// model *with their ids*, and a `supersedes` naming one of those ids is
+/// honoured unconditionally — so importing a transcript whose project did not
+/// resolve (no `cwd`, or a cwd with no git remote) could retire a memory
+/// belonging to a project that session has nothing to do with.
+///
+/// Scoring is deliberately not what this test relies on: with only two memories
+/// stored and a prefetch limit of eight, an unscoped search returns both
+/// whatever the embedder says.
+#[tokio::test]
+async fn an_unprojected_session_prefetches_globals_not_every_project() {
+    let h = Harness::new(vec![r#"{"memories": []}"#]);
+    h.seed_scoped("foreign-1", "the team uses svc-a", Some("other/repo"))
+        .await;
+    h.seed_scoped("global-1", "the user prefers tabs", None)
+        .await;
+
+    let unprojected = SessionTranscript {
+        project: None,
+        ..transcript("session-1", "the user prefers tabs")
+    };
+    h.ingestion().execute(&unprojected, false).await.unwrap();
+
+    let calls = h.chat.recorded_calls().await;
+    assert_eq!(calls.len(), 1);
+    let (_, user) = &calls[0];
+    assert!(
+        !user.contains("foreign-1"),
+        "another project's memory reached an unprojected session's prompt:\n{user}",
+    );
+    assert!(
+        user.contains("global-1"),
+        "globals must still be prefetched:\n{user}",
+    );
+}
+
+/// The projected case still sees its own project *and* the globals — the fix
+/// above must narrow the unknown-project case without narrowing this one.
+#[tokio::test]
+async fn a_projected_session_prefetches_its_project_and_the_globals() {
+    let h = Harness::new(vec![r#"{"memories": []}"#]);
+    h.seed_scoped("foreign-1", "the team uses svc-a", Some("other/repo"))
+        .await;
+    h.seed_scoped("global-1", "the user prefers tabs", None)
+        .await;
+    h.seed_scoped("mine-1", "logging goes to stderr", Some(PROJECT))
+        .await;
+
+    h.ingestion()
+        .execute(&transcript("session-1", "the user prefers tabs"), false)
+        .await
+        .unwrap();
+
+    let calls = h.chat.recorded_calls().await;
+    let (_, user) = &calls[0];
+    assert!(user.contains("mine-1"), "own project missing:\n{user}");
+    assert!(user.contains("global-1"), "globals missing:\n{user}");
+    assert!(
+        !user.contains("foreign-1"),
+        "another project's memory leaked in:\n{user}",
+    );
 }
 
 /// An unparseable response is retried exactly once, then fails loudly rather

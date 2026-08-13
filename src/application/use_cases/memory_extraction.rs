@@ -145,11 +145,15 @@ impl MemoryExtractionUseCase {
                 Ok(vector) => {
                     // Prefetch within the session's project (its items +
                     // globals) so merging happens against memories that are
-                    // actually relevant to this project/namespace.
-                    let scope = transcript.project.clone().map(|p| vec![p]);
+                    // actually relevant to this project/namespace. An
+                    // unresolved project narrows to globals alone (the empty
+                    // list) rather than searching every project — matching the
+                    // no-embeddings fallback below, which has always been
+                    // global-only in that case.
+                    let scope: Vec<String> = transcript.project.clone().into_iter().collect();
                     match self
                         .node_repo
-                        .search_semantic(&vector, None, scope.as_deref(), PREFETCH_LIMIT)
+                        .search_semantic(&vector, None, Some(&scope), PREFETCH_LIMIT)
                         .await
                     {
                         Ok(results) => return results.into_iter().map(|(item, _)| item).collect(),
