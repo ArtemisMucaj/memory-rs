@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/ArtemisMucaj/memory-rs/compare/v0.3.0...v0.3.1) (2026-08-13)
+
+
+### Bug Fixes
+
+* **ingestion:** scope prefetch to globals when the project is unknown ([#21](https://github.com/ArtemisMucaj/memory-rs/issues/21)) ([baf7c30](https://github.com/ArtemisMucaj/memory-rs/commit/baf7c3004c6f99ec7dfb91f20646ce54a070deab))
+
 ## [0.3.0](https://github.com/ArtemisMucaj/memory-rs/compare/v0.2.4...v0.3.0) (2026-08-08)
 
 
