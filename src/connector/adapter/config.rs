@@ -489,25 +489,42 @@ impl MemoryConfig {
     }
 
     /// Resolve the **embedding** endpoint independently of chat: the named
-    /// config endpoint (override → `active_embedding` → `active`), else the
-    /// `OPENAI_EMBEDDING_*` (then `OPENAI_*`) environment variables, else the
-    /// built-in local LM Studio default. Point `active_embedding` at a local
-    /// server to run embeddings locally while chat goes to a remote model.
+    /// config endpoint (override → `usages.embedding` → `active_embedding` →
+    /// `active`), else the `OPENAI_EMBEDDING_*` (then `OPENAI_*`) environment
+    /// variables, else the built-in local LM Studio default. Point
+    /// `active_embedding` at a local server to run embeddings locally while
+    /// chat goes to a remote model.
     ///
-    /// `default_embedding_model` (from config or the built-in default) fills in
-    /// the model when the endpoint does not name its own `embedding_model`.
+    /// The model comes from the `usages.embedding` binding first, then the
+    /// endpoint's own `embedding_model`, then `default_embedding_model` (the
+    /// dimension the database is pinned to, or the built-in default).
     pub fn resolve_embedding_endpoint(
         &self,
         name_override: Option<&str>,
         default_embedding_model: &str,
     ) -> ResolvedEmbeddingEndpoint {
+        // The embedding usage binds like any other, so honour it here the way
+        // `resolve_usage_chat_endpoint` does for the chat usages. Reading only
+        // the endpoint-level `embedding_model` left a bound `usages.embedding`
+        // silently ignored: the built-in default model was requested instead,
+        // and a proxy fronting several providers routed that unknown id to
+        // whichever one it defaults to, so the 404 named the wrong server.
+        let binding = self
+            .usage_binding(LlmUsage::Embedding)
+            .cloned()
+            .unwrap_or_default();
+        // An explicit `--openai-endpoint` still wins -- it overrides both roles
+        // -- and only then does the binding get to name the server.
+        let name_override = name_override.or(binding.endpoint.as_deref());
+
         if let Some(ep) = self.select_endpoint(name_override, |o| o.active_embedding.as_deref()) {
             return ResolvedEmbeddingEndpoint {
                 base_url: ep.base_url.clone(),
                 api_key: ep.api_key.clone(),
-                model: ep
-                    .embedding_model
-                    .clone()
+                // Binding first, then the endpoint's own model, then the pin.
+                model: binding
+                    .model
+                    .or_else(|| ep.embedding_model.clone())
                     .unwrap_or_else(|| default_embedding_model.to_string()),
             };
         }
@@ -521,8 +538,10 @@ impl MemoryConfig {
             api_key: std::env::var("OPENAI_EMBEDDING_API_KEY")
                 .or_else(|_| std::env::var("OPENAI_API_KEY"))
                 .ok(),
-            model: std::env::var("OPENAI_EMBEDDING_MODEL")
-                .unwrap_or_else(|_| default_embedding_model.to_string()),
+            model: binding.model.unwrap_or_else(|| {
+                std::env::var("OPENAI_EMBEDDING_MODEL")
+                    .unwrap_or_else(|_| default_embedding_model.to_string())
+            }),
         }
     }
 }
@@ -678,6 +697,99 @@ mod tests {
         cfg.openai_mut().active = Some("a".to_string());
         let resolved = cfg.resolve_embedding_endpoint(None, "custom-embed");
         assert_eq!(resolved.model, "custom-embed");
+    }
+
+    #[test]
+    fn the_embedding_usage_binding_chooses_the_model() {
+        // Regression: a config that bound `usages.embedding` had it ignored,
+        // because resolution read only the endpoint-level `embedding_model`.
+        // The built-in default was requested instead -- an id no configured
+        // provider served -- so ingestion warned on every memory it embedded.
+        let mut cfg = MemoryConfig::default();
+        cfg.openai_mut().endpoints.insert(
+            "MLX".to_string(),
+            OpenAiEndpoint {
+                base_url: "http://127.0.0.1:8080".to_string(),
+                ..Default::default()
+            },
+        );
+        cfg.openai_mut().active = Some("MLX".to_string());
+        cfg.openai_mut().usages.insert(
+            LlmUsage::Embedding.as_str().to_string(),
+            UsageBinding {
+                endpoint: None,
+                model: Some("text-embedding-3-small".to_string()),
+            },
+        );
+
+        let resolved = cfg.resolve_embedding_endpoint(None, DEFAULT_EMBEDDING_MODEL);
+        assert_eq!(resolved.model, "text-embedding-3-small");
+        // Naming only the model keeps the role's endpoint.
+        assert_eq!(resolved.base_url, "http://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn the_embedding_usage_binding_chooses_the_endpoint() {
+        // The other half of the binding: embeddings can point at a different
+        // server than the active role, so any provider can serve them.
+        let mut cfg = MemoryConfig::default();
+        cfg.openai_mut().endpoints.insert(
+            "MLX".to_string(),
+            OpenAiEndpoint {
+                base_url: "http://127.0.0.1:8000".to_string(),
+                ..Default::default()
+            },
+        );
+        cfg.openai_mut().endpoints.insert(
+            "proxy".to_string(),
+            OpenAiEndpoint {
+                base_url: "http://127.0.0.1:8080".to_string(),
+                ..Default::default()
+            },
+        );
+        cfg.openai_mut().active = Some("MLX".to_string());
+        cfg.openai_mut().usages.insert(
+            LlmUsage::Embedding.as_str().to_string(),
+            UsageBinding {
+                endpoint: Some("proxy".to_string()),
+                model: Some("text-embedding-3-small".to_string()),
+            },
+        );
+
+        let resolved = cfg.resolve_embedding_endpoint(None, DEFAULT_EMBEDDING_MODEL);
+        assert_eq!(resolved.base_url, "http://127.0.0.1:8080");
+        assert_eq!(resolved.model, "text-embedding-3-small");
+    }
+
+    #[test]
+    fn an_explicit_endpoint_override_beats_the_embedding_binding() {
+        // `--openai-endpoint` overrides both roles, so it must still win over
+        // a binding that names a server.
+        let mut cfg = MemoryConfig::default();
+        cfg.openai_mut().endpoints.insert(
+            "chosen".to_string(),
+            OpenAiEndpoint {
+                base_url: "http://127.0.0.1:9999".to_string(),
+                ..Default::default()
+            },
+        );
+        cfg.openai_mut().endpoints.insert(
+            "bound".to_string(),
+            OpenAiEndpoint {
+                base_url: "http://127.0.0.1:8080".to_string(),
+                ..Default::default()
+            },
+        );
+        cfg.openai_mut().usages.insert(
+            LlmUsage::Embedding.as_str().to_string(),
+            UsageBinding {
+                endpoint: Some("bound".to_string()),
+                model: None,
+            },
+        );
+
+        let resolved = cfg.resolve_embedding_endpoint(Some("chosen"), DEFAULT_EMBEDDING_MODEL);
+        assert_eq!(resolved.base_url, "http://127.0.0.1:9999");
     }
 
     #[test]
