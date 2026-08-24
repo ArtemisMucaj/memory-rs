@@ -1,6 +1,6 @@
 [package]
 name = "memory-rs"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 license = "MIT"
 description = "Long-term memory for coding assistants: import sessions, extract durable memories, recall by hybrid search"
