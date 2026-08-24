@@ -99,10 +99,8 @@ impl SessionImportService {
         // heterogeneous — a `"zed:…"` tag, an `"opencode:…"` tag, or a Claude
         // file path — so it is normalized back to the source tag).
         let repo = self.container.memory_repository()?;
-        // A large-but-finite cap rather than `usize::MAX`: the adapter binds
-        // `limit` as text, and an oversized number can confuse type coercion.
         let imported: HashSet<SessionKey> = repo
-            .list_sessions(None, 10_000)
+            .list_sessions(None, usize::MAX)
             .await?
             .into_iter()
             .map(|s| (normalize_source_tag(&s.source), s.id))
@@ -262,17 +260,7 @@ fn session_key(s: &DiscoveredSession) -> SessionKey {
 /// back to `"claude"`, since a path is only ever a Claude transcript. Returning
 /// the raw string when unknown would silently never match, dropping the ✓.
 fn normalize_source_tag(stored: &str) -> String {
-    for tag in [
-        SessionSource::Claude.as_str(),
-        SessionSource::OpenCode.as_str(),
-        SessionSource::Zed.as_str(),
-    ] {
-        if stored == tag || stored.starts_with(&format!("{tag}:")) {
-            return tag.to_string();
-        }
-    }
-    // A bare path (no recognized tag prefix) is a Claude transcript.
-    SessionSource::Claude.as_str().to_string()
+    SessionSource::normalize_stored_tag(stored)
 }
 
 /// Build a status-map entry for a session.
