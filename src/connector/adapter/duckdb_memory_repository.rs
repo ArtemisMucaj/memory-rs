@@ -37,6 +37,13 @@ const MEMORY_COLUMN_COUNT: usize = 9;
 const ENTITY_COLUMNS: &str = "id, entity_type, canonical_name, created_at, updated_at";
 
 const RESOURCE_COLUMNS: &str = "uri, source, name, abstract, overview, content, created_at";
+/// The same columns qualified to `memory_resources`, for the one query that
+/// joins the embeddings table. Both tables carry a `uri`, so the bare list
+/// above is ambiguous there — DuckDB rejects it outright with "Ambiguous
+/// reference to column name". The unqualified form stays because the INSERT
+/// column list cannot take prefixes.
+const RESOURCE_COLUMNS_QUALIFIED: &str =
+    "r.uri, r.source, r.name, r.abstract, r.overview, r.content, r.created_at";
 const RESOURCE_COLUMN_COUNT: usize = 7;
 
 const SESSION_COLUMNS: &str =
@@ -498,7 +505,7 @@ impl MemoryRepository for DuckdbStore {
         }
         let scope = project_scope_clause(projects, "project", &mut scope_params);
         // Bind order follows the SQL's textual order: terms, then scope
-        // projects, then limit (bound as an integer — see `search_by_vector`).
+        // projects, then limit (bound as an integer — see `search_memories_semantic`).
         let mut ordered_params: Vec<String> = terms.clone();
         ordered_params.extend(scope_params);
 
@@ -549,7 +556,7 @@ impl MemoryRepository for DuckdbStore {
              ORDER BY recorded_at DESC LIMIT ?"
         );
         // Bind order: scope projects, then limit (bound as an integer — see
-        // `search_by_vector`).
+        // `search_memories_semantic`).
         let conn = self.conn.lock().await;
         let mut params_ref: Vec<&dyn duckdb::ToSql> = scope_params
             .iter()
@@ -661,17 +668,18 @@ impl MemoryRepository for DuckdbStore {
         }
         let literal = vector_literal(vector);
         let sql = format!(
-            "SELECT {RESOURCE_COLUMNS}, \
+            "SELECT {RESOURCE_COLUMNS_QUALIFIED}, \
                     1.0 - array_cosine_distance(e.vector, {literal}::FLOAT[{d}]) AS score \
              FROM memory_resources r JOIN memory_resource_embeddings e ON e.uri = r.uri \
              ORDER BY score DESC LIMIT ?",
             d = self.dimensions,
         );
         let conn = self.conn.lock().await;
+        let limit = sql_limit(limit);
         query_collect(
             &conn,
             &sql,
-            &[&(limit as i64) as &dyn duckdb::ToSql],
+            &[&limit as &dyn duckdb::ToSql],
             |row| {
                 let resource = resource_from_row(row)?;
                 let score: f64 = row.get(RESOURCE_COLUMN_COUNT)?;
@@ -1037,8 +1045,6 @@ fn vector_literal(vector: &[f32]) -> String {
     s
 }
 
-/// Prepare `sql`, bind `params`, and collect every row through `decode`.
-///
 /// The largest `LIMIT` DuckDB's binder accepts (2^62). Anything above this is
 /// rejected with "Max value … for LIMIT/OFFSET is 4611686018427387904".
 const MAX_SQL_LIMIT: i64 = 4_611_686_018_427_387_904;
@@ -1057,6 +1063,8 @@ fn sql_limit(limit: usize) -> i64 {
         .min(MAX_SQL_LIMIT)
 }
 
+/// Prepare `sql`, bind `params`, and collect every row through `decode`.
+///
 /// Every read method on this adapter used to spell the same six lines of
 /// prepare/query/loop inline; the shape was identical, only the SQL, the
 /// binds, and the row decoder varied. One helper keeps the variations

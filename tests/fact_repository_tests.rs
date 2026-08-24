@@ -188,6 +188,39 @@ async fn unbounded_limit_does_not_overflow_the_bind() {
         .await
         .unwrap();
     assert_eq!(keyword.len(), 1);
+
+    // The semantic paths bind a LIMIT too. `search_resources_semantic` was the
+    // one site already binding an integer, which is why it looked correct —
+    // but `limit as i64` wraps `usize::MAX` to -1 just the same.
+    let v = vec![0.0f32; common::DIMS];
+    store
+        .upsert_resource(
+            &MemoryResource {
+                uri: "memory://resources/x".into(),
+                source: "/tmp/x.md".into(),
+                name: "x".into(),
+                abstract_: "A note about x".into(),
+                overview: "Longer context.".into(),
+                content: "hello".into(),
+                created_at: 0,
+            },
+            Some(&v),
+        )
+        .await
+        .unwrap();
+    let resources = store
+        .search_resources_semantic(&v, usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(resources.len(), 1);
+
+    let semantic = store
+        .search_memories_semantic(&v, None, usize::MAX)
+        .await
+        .unwrap();
+    // The fact above was appended without an embedding, so it cannot match —
+    // the assertion that matters is that the query ran at all.
+    assert!(semantic.is_empty());
 }
 
 #[tokio::test]

@@ -260,17 +260,7 @@ fn session_key(s: &DiscoveredSession) -> SessionKey {
 /// back to `"claude"`, since a path is only ever a Claude transcript. Returning
 /// the raw string when unknown would silently never match, dropping the ✓.
 fn normalize_source_tag(stored: &str) -> String {
-    for tag in [
-        SessionSource::Claude.as_str(),
-        SessionSource::OpenCode.as_str(),
-        SessionSource::Zed.as_str(),
-    ] {
-        if stored == tag || stored.starts_with(&format!("{tag}:")) {
-            return tag.to_string();
-        }
-    }
-    // A bare path (no recognized tag prefix) is a Claude transcript.
-    SessionSource::Claude.as_str().to_string()
+    SessionSource::normalize_stored_tag(stored)
 }
 
 /// Build a status-map entry for a session.

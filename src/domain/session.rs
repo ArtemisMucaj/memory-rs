@@ -18,6 +18,25 @@ impl SessionSource {
             SessionSource::Zed => "zed",
         }
     }
+
+    /// Recover the source tag from what storage recorded for a session.
+    ///
+    /// The stored `source` is heterogeneous — a `"zed:<db path>"` tag, an
+    /// `"opencode:<db path>"` tag, or a bare Claude transcript path — so it
+    /// cannot be compared against a picker label directly. Anything without a
+    /// recognized prefix is a Claude transcript.
+    pub fn normalize_stored_tag(stored: &str) -> String {
+        for tag in [
+            SessionSource::Claude.as_str(),
+            SessionSource::OpenCode.as_str(),
+            SessionSource::Zed.as_str(),
+        ] {
+            if stored == tag || stored.starts_with(&format!("{tag}:")) {
+                return tag.to_string();
+            }
+        }
+        SessionSource::Claude.as_str().to_string()
+    }
 }
 
 impl std::fmt::Display for SessionSource {

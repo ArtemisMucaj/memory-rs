@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 
 use crate::application::{ImportOutcome, SessionDiscovery};
 use crate::connector::api::Container;
-use crate::domain::{DiscoveredSession, SessionMessage};
+use crate::domain::{DiscoveredSession, SessionMessage, SessionSource};
 use crate::tui::{markdown, theme};
 
 /// Stable identity of a discovered session: `(source, id)`.
@@ -46,8 +46,12 @@ enum Loaded {
 
 /// A status update from a background import task.
 enum ImportEvent {
-    /// A session already present in the store (seeded on open), keyed by id.
-    AlreadyImported(String),
+    /// A session already present in the store (seeded on open).
+    ///
+    /// Carries the full `(source, id)` key, not a bare id: ids are only unique
+    /// within a source, so matching on the id alone would mark an unimported
+    /// Zed session as imported because a Claude session reused its id.
+    AlreadyImported(SessionKey),
     Started(SessionKey),
     Done {
         key: SessionKey,
@@ -69,7 +73,7 @@ pub struct ImportScreen {
     /// Ids of sessions already in the store, from the open-time seed. Kept
     /// separately from `sessions` because the seed can arrive before discovery
     /// populates the list; the ✓ marks are (re)applied whenever sessions load.
-    imported_ids: std::collections::HashSet<String>,
+    imported_ids: std::collections::HashSet<SessionKey>,
     cache: HashMap<usize, Loaded>,
     discovering: bool,
     last_result: Option<String>,
@@ -133,7 +137,11 @@ impl ImportScreen {
         tokio::spawn(async move {
             if let Ok(sessions) = repo.list_sessions(None, usize::MAX).await {
                 for s in sessions {
-                    let _ = events_tx.send(ImportEvent::AlreadyImported(s.id));
+                    // The stored `source` is heterogeneous (a tag, or a bare
+                    // transcript path), so normalize it to the picker's label
+                    // before it becomes half of the key.
+                    let key = (SessionSource::normalize_stored_tag(&s.source), s.id);
+                    let _ = events_tx.send(ImportEvent::AlreadyImported(key));
                 }
             }
         });
@@ -144,7 +152,7 @@ impl ImportScreen {
     /// marks survive whichever of the two arrives first.
     fn apply_imported_marks(&mut self) {
         for s in &self.sessions {
-            if self.imported_ids.contains(&s.id) {
+            if self.imported_ids.contains(&session_key(s)) {
                 self.status
                     .entry(session_key(s))
                     // Don't clobber a live import result (Done/Failed/Importing).
@@ -183,8 +191,8 @@ impl ImportScreen {
 
     fn apply_event(&mut self, ev: ImportEvent) {
         match ev {
-            ImportEvent::AlreadyImported(id) => {
-                self.imported_ids.insert(id);
+            ImportEvent::AlreadyImported(key) => {
+                self.imported_ids.insert(key);
                 // Sessions may or may not have loaded yet; apply against whatever
                 // is present now, and `pump` reapplies when discovery loads.
                 self.apply_imported_marks();
@@ -682,13 +690,45 @@ mod tests {
     }
 
     #[test]
+    fn seed_does_not_mark_a_same_id_session_from_another_source() {
+        // Ids are only unique within a source. Seeding on a bare id marked an
+        // unimported session as imported whenever another source reused its
+        // id — the user then could not import it, with no way to see why.
+        let mut s = ImportScreen::new();
+        s.apply_event(ImportEvent::AlreadyImported((
+            SessionSource::Claude.as_str().to_string(),
+            "shared-id".to_string(),
+        )));
+
+        let zed = session(SessionSource::Zed, "shared-id", "A Zed session", 2000);
+        let claude = session(SessionSource::Claude, "shared-id", "A Claude session", 2000);
+        s.sessions = vec![zed.clone(), claude.clone()];
+        s.apply_imported_marks();
+
+        assert!(
+            matches!(
+                s.status.get(&session_key(&claude)),
+                Some(Status::AlreadyImported)
+            ),
+            "the claude session was the one in the store"
+        );
+        assert!(
+            !s.status.contains_key(&session_key(&zed)),
+            "the zed session shares only the id and is still importable"
+        );
+    }
+
+    #[test]
     fn seed_before_discovery_still_marks_imported() {
         // Regression: the "already imported" seed can arrive before discovery
         // populates the session list. The mark must survive and apply once the
         // sessions load, not be dropped against an empty list.
         let mut s = ImportScreen::new();
         // Seed arrives first (no sessions yet).
-        s.apply_event(ImportEvent::AlreadyImported("z".to_string()));
+        s.apply_event(ImportEvent::AlreadyImported((
+            SessionSource::Zed.as_str().to_string(),
+            "z".to_string(),
+        )));
         assert!(s.status.is_empty(), "nothing to mark yet");
 
         // Discovery loads the session with that id.
