@@ -9,7 +9,7 @@
 //!
 //! Dependencies point inward, following ports & adapters:
 //!
-//! - [`domain`] — pure value types ([`Memory`], [`Entity`], [`Predicate`],
+//! - [`domain`] — pure value types ([`Memory`], [`Entity`],
 //!   [`SessionTranscript`], [`DomainError`], …). No I/O, no async.
 //! - [`application`] — use cases (orchestration) and port traits
 //!   ([`MemoryRepository`], [`SessionDiscovery`]). Depends only on the domain.

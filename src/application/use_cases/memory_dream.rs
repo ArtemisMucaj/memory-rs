@@ -7,10 +7,10 @@
 //! history. Skipped entirely when `auto_import` is off.
 //!
 //! Consolidation, reflection and skill synthesis are gone: they existed to
-//! maintain typed edges between memories and to merge near-duplicate
-//! `MemoryItem`s. With edges removed and updates handled as hard delete +
-//! insert on the ingestion path, there is nothing left for an offline pass
-//! to reorganize.
+//! maintain typed edges between memories and to merge near-duplicate items
+//! under the old `MemoryItem` model. With edges removed and updates handled
+//! as hard delete + insert on the ingestion path, there is nothing left for
+//! an offline pass to reorganize.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};

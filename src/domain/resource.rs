@@ -1,7 +1,7 @@
 //! A file or URL added explicitly via `memory-rs add`. The LLM writes a
 //! one-line abstract (L0) and a longer overview (L1) at ingest time; the full
-//! content is kept alongside. What is gone is the `memory://` *tree* and the
-//! `MemoryNode` type — resources are their own table, not tree nodes.
+//! content is kept alongside. Resources live in their own table — the old
+//! `memory://` tree and its node type are gone.
 
 use serde::{Deserialize, Serialize};
 
@@ -24,7 +24,7 @@ pub struct MemoryResource {
 
 impl MemoryResource {
     /// Text used for the embedding — abstract plus overview, mirroring how
-    /// the old `MemoryNode::embedding_text` combined the two levels.
+    /// the old tree node combined its two summary levels.
     pub fn embedding_text(&self) -> String {
         if self.overview.trim().is_empty() {
             self.abstract_.clone()
