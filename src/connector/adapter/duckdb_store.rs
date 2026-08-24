@@ -84,11 +84,6 @@ impl DuckdbStore {
             CREATE TABLE IF NOT EXISTS memories (
                 id TEXT PRIMARY KEY,
                 kind TEXT NOT NULL,
-                subject_entity_id TEXT,
-                subject_literal TEXT,
-                predicate TEXT NOT NULL,
-                object_entity_id TEXT,
-                object_literal TEXT,
                 statement TEXT NOT NULL,
                 project TEXT NOT NULL DEFAULT '',
                 recorded_at BIGINT NOT NULL,
@@ -119,6 +114,13 @@ impl DuckdbStore {
                 PRIMARY KEY (name_key, entity_id)
             );
             CREATE INDEX IF NOT EXISTS entity_names_key_idx ON entity_names (name_key);
+            -- The memory↔entity link: a memory mentions an entity. Many-to-many.
+            CREATE TABLE IF NOT EXISTS memory_entities (
+                memory_id TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                PRIMARY KEY (memory_id, entity_id)
+            );
+            CREATE INDEX IF NOT EXISTS memory_entities_entity_idx ON memory_entities (entity_id);
             CREATE TABLE IF NOT EXISTS memory_sessions (
                 id TEXT PRIMARY KEY,
                 source TEXT NOT NULL,

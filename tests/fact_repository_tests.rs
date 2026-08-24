@@ -11,18 +11,15 @@ mod common;
 use memory_rs::application::MemoryRepository;
 use memory_rs::connector::DuckdbStore;
 use memory_rs::domain::{
-    Entity, EntityRef, ImportedSession, Memory, MemoryKind, MemoryResource, Predicate,
-    SessionStatus, SourceKind,
+    Entity, ImportedSession, Memory, MemoryKind, MemoryResource, SessionStatus, SourceKind,
 };
 
 fn fact(id: &str, statement: &str, recorded_at: i64) -> Memory {
     Memory {
         id: id.into(),
         kind: MemoryKind::Fact,
-        subject: EntityRef::Literal("user".into()),
-        predicate: Predicate::Prefers,
-        object: EntityRef::Literal(statement.into()),
         statement: statement.into(),
+        entity_ids: Vec::new(),
         project: None,
         recorded_at,
         source_session_id: None,

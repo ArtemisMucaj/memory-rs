@@ -4,19 +4,21 @@
 //! sessions and namespaces all share one connection to one `memory.duckdb`.
 //!
 //! Storage conventions: vectors are `FLOAT[dimensions]` literals scanned with
-//! `array_cosine_distance`, read back through `to_json(...)::VARCHAR`
-//! (duckdb-rs cannot fetch fixed-width arrays natively), and global scope is
-//! the **empty string**, never `NULL` — SQL treats `NULL`s as distinct,
-//! which is precisely how the item store once ended up holding the same
-//! memory twice.
+//! `array_cosine_distance`, and global scope is the **empty string**, never
+//! `NULL` — SQL treats `NULL`s as distinct, which is precisely how the
+//! store would otherwise end up holding the same global memory twice.
+//!
+//! The memory↔entity link is a join table (`memory_entities`), not a column
+//! pair: a memory mentions zero or more entities, and an entity is mentioned
+//! by zero or more memories.
 
 use async_trait::async_trait;
 use duckdb::{params, Connection, Row};
 
 use crate::application::MemoryRepository;
 use crate::domain::{
-    entity_name_key, DomainError, Entity, EntityRef, ImportedSession, Memory, MemoryKind,
-    MemoryResource, Predicate, SessionStatus, SourceKind,
+    entity_name_key, DomainError, Entity, ImportedSession, Memory, MemoryKind, MemoryResource,
+    SessionStatus, SourceKind,
 };
 
 use super::duckdb_store::{
@@ -25,22 +27,20 @@ use super::duckdb_store::{
 
 /// Memory columns in DDL order. [`memory_from_row`] reads by position, so
 /// the two must stay in lockstep.
-const MEMORY_COLUMNS: &str = "id, kind, subject_entity_id, subject_literal, predicate, \
-     object_entity_id, object_literal, statement, project, recorded_at, \
+const MEMORY_COLUMNS: &str = "id, kind, statement, project, recorded_at, \
      source_session_id, source_message_index, source_kind, confidence";
 
 /// Number of columns in [`MEMORY_COLUMNS`], and therefore the position of the
-/// `score` column the two search queries append after them. Kept as a named
-/// constant rather than a literal because adding a column shifts every index
-/// in [`memory_from_row`] *and* the score index in both search legs — and a
-/// stale score index reads a memory field as a float instead of failing,
-/// which is a silently wrong ranking rather than an error.
-const MEMORY_COLUMN_COUNT: usize = 14;
+/// `score` column the two search queries append after them.
+const MEMORY_COLUMN_COUNT: usize = 9;
 
 const ENTITY_COLUMNS: &str = "id, entity_type, canonical_name, created_at, updated_at";
 
 const RESOURCE_COLUMNS: &str = "uri, source, name, abstract, overview, content, created_at";
 const RESOURCE_COLUMN_COUNT: usize = 7;
+
+const SESSION_COLUMNS: &str =
+    "id, source, imported_at, message_count, items_written, status, last_error, project";
 
 /// Most query terms honoured by keyword search.
 const MAX_KEYWORD_TERMS: usize = 16;
@@ -50,21 +50,18 @@ fn memory_from_row(row: &Row<'_>) -> Result<Memory, duckdb::Error> {
     // written by a newer build must not make the whole store unreadable by
     // an older one.
     let kind: String = row.get(1)?;
-    let source_kind: String = row.get(12)?;
-    let predicate: String = row.get(4)?;
+    let source_kind: String = row.get(7)?;
     Ok(Memory {
-        id: row.get(0)?,                                            // 0  id
-        kind: MemoryKind::parse(&kind).unwrap_or(MemoryKind::Fact), // 1  kind
-        subject: EntityRef::from_columns(row.get(2)?, row.get(3)?), // 2,3 subject
-        predicate: Predicate::parse(&predicate).unwrap_or(Predicate::RelatesTo), // 4
-        object: EntityRef::from_columns(row.get(5)?, row.get(6)?),  // 5,6 object
-        statement: row.get(7)?,                                     // 7  statement
-        project: project_from_column(row.get::<_, String>(8)?),     // 8  project
-        recorded_at: row.get(9)?,                                   // 9  recorded_at
-        source_session_id: row.get(10)?,                            // 10 source_session_id
-        source_message_index: row.get(11)?,                         // 11 source_message_index
-        source_kind: SourceKind::parse(&source_kind).unwrap_or(SourceKind::AssistantInferred), // 12
-        confidence: row.get::<_, f64>(13)? as f32,                  // 13 confidence
+        id: row.get(0)?,                                            // 0 id
+        kind: MemoryKind::parse(&kind).unwrap_or(MemoryKind::Fact), // 1 kind
+        statement: row.get(2)?,                                     // 2 statement
+        entity_ids: Vec::new(), // filled by a second query; see `load_entity_ids`
+        project: project_from_column(row.get::<_, String>(3)?),     // 3 project
+        recorded_at: row.get(4)?,                                   // 4 recorded_at
+        source_session_id: row.get(5)?, // 5 source_session_id
+        source_message_index: row.get(6)?, // 6 source_message_index
+        source_kind: SourceKind::parse(&source_kind).unwrap_or(SourceKind::Extracted), // 7
+        confidence: row.get::<_, f64>(8)? as f32,                   // 8 confidence
     })
 }
 
@@ -105,9 +102,6 @@ fn session_from_row(row: &Row<'_>) -> Result<ImportedSession, duckdb::Error> {
     })
 }
 
-const SESSION_COLUMNS: &str =
-    "id, source, imported_at, message_count, items_written, status, last_error, project";
-
 #[async_trait]
 impl MemoryRepository for DuckdbStore {
     // ── Memories ─────────────────────────────────────────────────────────
@@ -118,21 +112,14 @@ impl MemoryRepository for DuckdbStore {
         vector: Option<&[f32]>,
     ) -> Result<(), DomainError> {
         let conn = self.conn.lock().await;
-        let (subject_entity_id, subject_literal) = entity_ref_columns(&memory.subject);
-        let (object_entity_id, object_literal) = entity_ref_columns(&memory.object);
         conn.execute(
             &format!(
                 "INSERT OR REPLACE INTO memories ({MEMORY_COLUMNS}) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
             ),
             params![
                 memory.id,
                 memory.kind.as_str(),
-                subject_entity_id,
-                subject_literal,
-                memory.predicate.as_str(),
-                object_entity_id,
-                object_literal,
                 memory.statement,
                 project_to_column(memory.project.as_deref()),
                 memory.recorded_at,
@@ -143,6 +130,20 @@ impl MemoryRepository for DuckdbStore {
             ],
         )
         .map_err(|e| DomainError::storage(format!("failed to append memory: {e}")))?;
+
+        // Replace the entity links wholesale.
+        conn.execute(
+            "DELETE FROM memory_entities WHERE memory_id = ?",
+            params![memory.id],
+        )
+        .map_err(|e| DomainError::storage(format!("failed to clear memory entities: {e}")))?;
+        for entity_id in &memory.entity_ids {
+            conn.execute(
+                "INSERT OR IGNORE INTO memory_entities (memory_id, entity_id) VALUES (?, ?)",
+                params![memory.id, entity_id],
+            )
+            .map_err(|e| DomainError::storage(format!("failed to link memory to entity: {e}")))?;
+        }
 
         conn.execute(
             "DELETE FROM memory_embeddings WHERE memory_id = ?",
@@ -179,15 +180,22 @@ impl MemoryRepository for DuckdbStore {
         let mut rows = stmt
             .query(params![id])
             .map_err(|e| DomainError::storage(format!("failed to find memory: {e}")))?;
-        match rows
+        let memory = match rows
             .next()
             .map_err(|e| DomainError::storage(format!("failed to find memory: {e}")))?
         {
-            Some(row) => Ok(Some(memory_from_row(row).map_err(|e| {
+            Some(row) => memory_from_row(row).map_err(|e| {
                 DomainError::storage(format!("failed to decode memory: {e}"))
-            })?)),
-            None => Ok(None),
-        }
+            })?,
+            None => return Ok(None),
+        };
+        drop(rows);
+        drop(stmt);
+        let entity_ids = load_entity_ids(&conn, &memory.id)?;
+        Ok(Some(Memory {
+            entity_ids,
+            ..memory
+        }))
     }
 
     async fn find_memories(&self, ids: &[String]) -> Result<Vec<Memory>, DomainError> {
@@ -217,7 +225,17 @@ impl MemoryRepository for DuckdbStore {
                 DomainError::storage(format!("failed to decode memory: {e}"))
             })?);
         }
-        Ok(out)
+        drop(rows);
+        drop(stmt);
+        let mut with_entities = Vec::with_capacity(out.len());
+        for memory in out {
+            let entity_ids = load_entity_ids(&conn, &memory.id)?;
+            with_entities.push(Memory {
+                entity_ids,
+                ..memory
+            });
+        }
+        Ok(with_entities)
     }
 
     async fn list_memories(
@@ -235,12 +253,12 @@ impl MemoryRepository for DuckdbStore {
             "SELECT {MEMORY_COLUMNS} FROM memories WHERE TRUE{kind_clause}{scope} \
              ORDER BY recorded_at DESC"
         );
-        // Bind order: kind (if any) then scope projects.
         let mut ordered: Vec<String> = Vec::new();
         if let Some(k) = kind {
             ordered.push(k.as_str().to_string());
         }
         ordered.extend(scope_params);
+
         let conn = self.conn.lock().await;
         let mut stmt = conn
             .prepare(&sql)
@@ -259,7 +277,17 @@ impl MemoryRepository for DuckdbStore {
                 DomainError::storage(format!("failed to decode memory: {e}"))
             })?);
         }
-        Ok(out)
+        drop(rows);
+        drop(stmt);
+        let mut with_entities = Vec::with_capacity(out.len());
+        for memory in out {
+            let entity_ids = load_entity_ids(&conn, &memory.id)?;
+            with_entities.push(Memory {
+                entity_ids,
+                ..memory
+            });
+        }
+        Ok(with_entities)
     }
 
     async fn delete_memory(&self, id: &str) -> Result<bool, DomainError> {
@@ -269,6 +297,11 @@ impl MemoryRepository for DuckdbStore {
             params![id],
         )
         .map_err(|e| DomainError::storage(format!("failed to delete memory embedding: {e}")))?;
+        conn.execute(
+            "DELETE FROM memory_entities WHERE memory_id = ?",
+            params![id],
+        )
+        .map_err(|e| DomainError::storage(format!("failed to delete memory links: {e}")))?;
         let n = conn
             .execute("DELETE FROM memories WHERE id = ?", params![id])
             .map_err(|e| DomainError::storage(format!("failed to delete memory: {e}")))?;
@@ -277,13 +310,19 @@ impl MemoryRepository for DuckdbStore {
 
     async fn delete_memories_for_session(&self, session_id: &str) -> Result<usize, DomainError> {
         let conn = self.conn.lock().await;
-        // Clear embeddings first — DuckDB has no ON DELETE CASCADE.
+        // Clear side tables first — DuckDB has no ON DELETE CASCADE.
         conn.execute(
             "DELETE FROM memory_embeddings WHERE memory_id IN \
              (SELECT id FROM memories WHERE source_session_id = ?)",
             params![session_id],
         )
         .map_err(|e| DomainError::storage(format!("failed to delete session embeddings: {e}")))?;
+        conn.execute(
+            "DELETE FROM memory_entities WHERE memory_id IN \
+             (SELECT id FROM memories WHERE source_session_id = ?)",
+            params![session_id],
+        )
+        .map_err(|e| DomainError::storage(format!("failed to delete session links: {e}")))?;
         let n = conn
             .execute(
                 "DELETE FROM memories WHERE source_session_id = ?",
@@ -295,11 +334,12 @@ impl MemoryRepository for DuckdbStore {
 
     async fn count_memories_for_session(&self, session_id: &str) -> Result<usize, DomainError> {
         let conn = self.conn.lock().await;
-        let mut stmt = conn
-            .prepare("SELECT COUNT(*) FROM memories WHERE source_session_id = ?")
-            .map_err(|e| DomainError::storage(format!("failed to count session memories: {e}")))?;
-        let count: i64 = stmt
-            .query_row(params![session_id], |row| row.get(0))
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE source_session_id = ?",
+                params![session_id],
+                |row| row.get(0),
+            )
             .map_err(|e| DomainError::storage(format!("failed to count session memories: {e}")))?;
         Ok(count as usize)
     }
@@ -392,10 +432,9 @@ impl MemoryRepository for DuckdbStore {
             .next()
             .map_err(|e| DomainError::storage(format!("failed to find entities: {e}")))?
         {
-            let entity = entity_from_row(row).map_err(|e| {
+            out.push(entity_from_row(row).map_err(|e| {
                 DomainError::storage(format!("failed to decode entity: {e}"))
-            })?;
-            out.push(entity);
+            })?);
         }
         drop(rows);
         drop(stmt);
@@ -472,13 +511,14 @@ impl MemoryRepository for DuckdbStore {
         let conn = self.conn.lock().await;
         let mut stmt = conn
             .prepare(&format!(
-                "SELECT {MEMORY_COLUMNS} FROM memories \
-                 WHERE subject_entity_id = ? OR object_entity_id = ? \
-                 ORDER BY recorded_at DESC"
+                "SELECT {MEMORY_COLUMNS} FROM memories m \
+                 JOIN memory_entities me ON me.memory_id = m.id \
+                 WHERE me.entity_id = ? \
+                 ORDER BY m.recorded_at DESC"
             ))
             .map_err(|e| DomainError::storage(format!("failed to list entity memories: {e}")))?;
         let mut rows = stmt
-            .query(params![entity_id, entity_id])
+            .query(params![entity_id])
             .map_err(|e| DomainError::storage(format!("failed to list entity memories: {e}")))?;
         let mut out = Vec::new();
         while let Some(row) = rows
@@ -489,7 +529,17 @@ impl MemoryRepository for DuckdbStore {
                 DomainError::storage(format!("failed to decode memory: {e}"))
             })?);
         }
-        Ok(out)
+        drop(rows);
+        drop(stmt);
+        let mut with_entities = Vec::with_capacity(out.len());
+        for memory in out {
+            let entity_ids = load_entity_ids(&conn, &memory.id)?;
+            with_entities.push(Memory {
+                entity_ids,
+                ..memory
+            });
+        }
+        Ok(with_entities)
     }
 
     // ── Retrieval ────────────────────────────────────────────────────────
@@ -509,8 +559,8 @@ impl MemoryRepository for DuckdbStore {
             )));
         }
         let literal = vector_literal(vector);
-        let mut params: Vec<String> = Vec::new();
-        let scope = project_scope_clause(projects, "project", &mut params);
+        let mut scope_params: Vec<String> = Vec::new();
+        let scope = project_scope_clause(projects, "project", &mut scope_params);
         let kind_clause = match kind {
             Some(_) => " AND kind = ?",
             None => "",
@@ -528,7 +578,7 @@ impl MemoryRepository for DuckdbStore {
         if let Some(k) = kind {
             ordered.push(k.as_str().to_string());
         }
-        ordered.append(&mut params);
+        ordered.extend(scope_params);
         ordered.push(limit.to_string());
 
         let conn = self.conn.lock().await;
@@ -553,7 +603,20 @@ impl MemoryRepository for DuckdbStore {
                 .map_err(|e| DomainError::storage(format!("failed to read score: {e}")))?;
             out.push((memory, score as f32));
         }
-        Ok(out)
+        drop(rows);
+        drop(stmt);
+        let mut with_entities = Vec::with_capacity(out.len());
+        for (memory, score) in out {
+            let entity_ids = load_entity_ids(&conn, &memory.id)?;
+            with_entities.push((
+                Memory {
+                    entity_ids,
+                    ..memory
+                },
+                score,
+            ));
+        }
+        Ok(with_entities)
     }
 
     async fn search_memories_keyword(
@@ -574,26 +637,23 @@ impl MemoryRepository for DuckdbStore {
         if terms.is_empty() {
             return Ok(Vec::new());
         }
-        let mut params: Vec<String> = Vec::new();
-        // One `ILIKE` per term — all must match.
+        let mut scope_params: Vec<String> = Vec::new();
         let mut term_clauses = String::new();
         for _ in &terms {
             term_clauses.push_str(" AND statement ILIKE '%' || ? || '%'");
         }
-        let scope = project_scope_clause(projects, "project", &mut params);
+        let scope = project_scope_clause(projects, "project", &mut scope_params);
         let kind_clause = match kind {
             Some(_) => " AND kind = ?",
             None => "",
         };
         // Bind order follows the SQL's textual order: terms, then kind, then
-        // scope projects, then limit. `params` currently holds the scope
-        // projects (appended by `project_scope_clause`); the kind value must
-        // come before them.
+        // scope projects, then limit.
         let mut ordered_params: Vec<String> = terms.clone();
         if let Some(k) = kind {
             ordered_params.push(k.as_str().to_string());
         }
-        ordered_params.append(&mut params);
+        ordered_params.extend(scope_params);
         ordered_params.push(limit.to_string());
 
         let sql = format!(
@@ -625,7 +685,20 @@ impl MemoryRepository for DuckdbStore {
                 .map_err(|e| DomainError::storage(format!("failed to read score: {e}")))?;
             out.push((memory, score as f32));
         }
-        Ok(out)
+        drop(rows);
+        drop(stmt);
+        let mut with_entities = Vec::with_capacity(out.len());
+        for (memory, score) in out {
+            let entity_ids = load_entity_ids(&conn, &memory.id)?;
+            with_entities.push((
+                Memory {
+                    entity_ids,
+                    ..memory
+                },
+                score,
+            ));
+        }
+        Ok(with_entities)
     }
 
     async fn list_memories_by_recency(
@@ -644,7 +717,6 @@ impl MemoryRepository for DuckdbStore {
             "SELECT {MEMORY_COLUMNS} FROM memories WHERE TRUE{kind_clause}{scope} \
              ORDER BY recorded_at DESC LIMIT ?"
         );
-        // Bind order: kind, then scope projects, then limit.
         let mut ordered: Vec<String> = Vec::new();
         if let Some(k) = kind {
             ordered.push(k.as_str().to_string());
@@ -669,7 +741,17 @@ impl MemoryRepository for DuckdbStore {
                 DomainError::storage(format!("failed to decode memory: {e}"))
             })?);
         }
-        Ok(out)
+        drop(rows);
+        drop(stmt);
+        let mut with_entities = Vec::with_capacity(out.len());
+        for memory in out {
+            let entity_ids = load_entity_ids(&conn, &memory.id)?;
+            with_entities.push(Memory {
+                entity_ids,
+                ..memory
+            });
+        }
+        Ok(with_entities)
     }
 
     // ── Resources ────────────────────────────────────────────────────────
@@ -819,8 +901,7 @@ impl MemoryRepository for DuckdbStore {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         // A namespace with no projects is still recorded — by inserting a
-        // marker row whose `project` is the sentinel `""`. Member inserts
-        // always carry the same `created_at`, read back from the sentinel.
+        // marker row whose `project` is the sentinel `""`.
         let n = conn
             .execute(
                 "INSERT OR IGNORE INTO memory_namespaces (namespace, project, created_at) \
@@ -893,13 +974,12 @@ impl MemoryRepository for DuckdbStore {
 
     async fn namespace_created_at(&self, name: &str) -> Result<Option<i64>, DomainError> {
         let conn = self.conn.lock().await;
-        let mut stmt = conn
-            .prepare(
+        let value: Option<i64> = conn
+            .query_row(
                 "SELECT MIN(created_at) FROM memory_namespaces WHERE namespace = ?",
+                params![name],
+                |row| row.get(0),
             )
-            .map_err(|e| DomainError::storage(format!("failed to read namespace cutoff: {e}")))?;
-        let value: Option<i64> = stmt
-            .query_row(params![name], |row| row.get(0))
             .map_err(|e| DomainError::storage(format!("failed to read namespace cutoff: {e}")))?;
         Ok(value)
     }
@@ -996,9 +1076,7 @@ impl MemoryRepository for DuckdbStore {
     ) -> Result<Vec<ImportedSession>, DomainError> {
         let mut params: Vec<String> = Vec::new();
         // Sessions store project as a real NULL/Optional column rather than
-        // the `''` convention the memories table uses, so the scope clause is
-        // different: `NULL` reads as "unknown project" and is included only
-        // in the unscoped listing.
+        // the `''` convention the memories table uses.
         let scope = match projects {
             None => String::new(),
             Some([]) => " AND project IS NULL".to_string(),
@@ -1040,13 +1118,6 @@ impl MemoryRepository for DuckdbStore {
     }
 }
 
-fn entity_ref_columns(r: &EntityRef) -> (Option<String>, Option<String>) {
-    match r {
-        EntityRef::Entity(id) => (Some(id.clone()), None),
-        EntityRef::Literal(v) => (None, Some(v.clone())),
-    }
-}
-
 fn load_names(conn: &Connection, entity_id: &str) -> Result<Vec<String>, DomainError> {
     let mut stmt = conn
         .prepare("SELECT name FROM entity_names WHERE entity_id = ? ORDER BY name")
@@ -1062,6 +1133,26 @@ fn load_names(conn: &Connection, entity_id: &str) -> Result<Vec<String>, DomainE
         out.push(
             row.get::<_, String>(0)
                 .map_err(|e| DomainError::storage(format!("failed to decode name: {e}")))?,
+        );
+    }
+    Ok(out)
+}
+
+fn load_entity_ids(conn: &Connection, memory_id: &str) -> Result<Vec<String>, DomainError> {
+    let mut stmt = conn
+        .prepare("SELECT entity_id FROM memory_entities WHERE memory_id = ? ORDER BY entity_id")
+        .map_err(|e| DomainError::storage(format!("failed to load memory entities: {e}")))?;
+    let mut rows = stmt
+        .query(params![memory_id])
+        .map_err(|e| DomainError::storage(format!("failed to load memory entities: {e}")))?;
+    let mut out = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| DomainError::storage(format!("failed to load memory entities: {e}")))?
+    {
+        out.push(
+            row.get::<_, String>(0)
+                .map_err(|e| DomainError::storage(format!("failed to decode entity id: {e}")))?,
         );
     }
     Ok(out)

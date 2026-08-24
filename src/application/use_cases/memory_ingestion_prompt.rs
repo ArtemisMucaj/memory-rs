@@ -2,18 +2,17 @@
 //!
 //! One bounded LLM call per session: given the conversation and a handful of
 //! prior memories prefetched by semantic similarity, the model emits atomic
-//! subject–predicate–object facts.
+//! facts plus the entity mentions that anchor them.
 //!
 //! The schema is deliberately flat. The online tier runs a small local model
 //! and not every chat backend supports structured output, so nested or
-//! polymorphic schemas measurably raise the malformed-output rate. Every
-//! field is a scalar.
+//! polymorphic schemas measurably raise the malformed-output rate.
 //!
-//! Gone: `kind` (everything is a fact), `relation` (no edges), and the
-//! ten predicate variants that were almost never the right answer. The
-//! statement carries the fact; the predicate is a coarse filter at best.
+//! There is no `predicate` and no `subject`/`object` split — the verb is in
+//! the statement, where a reader looks for it. Entities are listed as
+//! *mentions* and resolved server-side by name-key.
 
-use crate::domain::{Memory, Predicate, SessionTranscript, VALID_ENTITY_TYPES};
+use crate::domain::{Memory, SessionTranscript, VALID_ENTITY_TYPES};
 
 /// Maximum characters of conversation text sent to the extraction model.
 ///
@@ -26,14 +25,8 @@ pub const MAX_CONVERSATION_CHARS: usize = 60_000;
 /// Maximum characters quoted per prior memory in the prompt.
 const MAX_PRIOR_MEMORY_CHARS: usize = 400;
 
-/// System prompt: what a fact is, what entities are, and the closed
-/// predicate list.
+/// System prompt: what a fact is, and how to mark entity mentions.
 pub fn system_prompt() -> String {
-    let relations = Predicate::ALL
-        .iter()
-        .map(|p| format!("- `{}` — {}", p.as_str(), p.meaning()))
-        .collect::<Vec<_>>()
-        .join("\n");
     let entity_types = VALID_ENTITY_TYPES
         .iter()
         .map(|t| format!("`{t}`"))
@@ -41,36 +34,34 @@ pub fn system_prompt() -> String {
         .join(", ");
     r#"You extract what is worth remembering from a finished coding-assistant session, as atomic FACTS.
 
-A fact is ONE subject–predicate–object triple worth remembering across sessions. Keep it atomic: one fact per memory. If a sentence contains two facts, emit two memories.
+A fact is ONE self-contained English sentence worth remembering across sessions. If a sentence contains two facts, emit two memories.
 
 ## Memory shape
 
-- `subject` — what the fact is about. Set `subject_is_entity` true only when it is an entity by the test under "Entities" below.
-- `subject_type` — one of: {{ENTITY_TYPES}}, unknown. Use `unknown` only when genuinely unclear.
-- `predicate` — the relation, chosen from the CLOSED list under "Relations" below. You must use one of those exact values and nothing else.
-- `object` — the value. Set `object_is_entity` true only when it names a distinct entity by that same test; false for a literal value ("tabs", "4", "2025-01-01", a file path, an error message).
-- `object_type` — same vocabulary as `subject_type`. Ignored when `object_is_entity` is false.
-- `statement` — a short, self-contained sentence rendering the triple. This is what gets embedded and shown to a human, so it must read on its own without the subject/predicate/object fields.
-- `source_kind` — `user_stated` if the USER asserted it directly, `assistant_inferred` if you concluded it from context. Be honest.
+- `statement` — the fact as a single sentence. This is what gets embedded and shown to a reader, so it must read on its own. Include the name of the thing the fact is about, in the form it is written down ("orders-events", never "the orders-events service").
+- `source_kind` — `user_stated` if the USER asserted it directly, `extracted` for anything you produce from the transcript (whether read straight off the page or pieced together from context).
 - `confidence` — 0..1.
+- `entity_mentions` — the durable things this fact is *about*. See "Entities" below. Each mention is `{ "name": "...", "type": "..." }`. An empty array is fine — many facts are about the user or about nothing durable.
 
 ## Entities
 
-An entity is a **durable thing that recurs across sessions** — a person, a tool, a service, a library, a standing concept. It is an *anchor*: every fact about the same thing must point at the same entity.
+An entity is a **durable thing that recurs across sessions** — a person, a tool, a service, a library, a standing concept. It is an *anchor*: every fact about the same thing must mention the same entity.
 
 Apply this test: **would this still be referred to by name in six months, in a different conversation?**
 
-These are **not** entities. Mark them `is_entity: false` and let them be plain values:
+These are **not** entities. Leave them out of `entity_mentions` and let them live inside the statement as plain text:
 - a file, path, directory, function, class, variable or symbol
 - a commit, branch, pull request or ticket
 - a version number, error message, log line or environment variable
 - anything that exists only inside the change you are discussing
 
-If a fact's natural subject is a specific file or symbol, the fact is almost always really about the **service, library or tool that file belongs to**. Use that as the subject and put the specific detail in the statement.
+If a fact's natural subject is a specific file or symbol, the fact is almost always really about the **service, library or tool that file belongs to**. Mention that one instead.
 
-**Name an entity the way it is written down**, not the way the sentence refers to it. Strip the article and the role word — write `orders-events`, never "the orders-events service" or "orders-events package". Put the role in the statement, where it belongs.
+**Name an entity the way it is written down.** Strip the article and the role word — write `orders-events`, never "the orders-events service" or "orders-events package". Put the role in the statement, where it belongs.
 
 ### Picking the type
+
+{{ENTITY_TYPES}}, or `unknown` when genuinely unclear.
 
 - `person` — a human being.
 - `tool` — third-party software: Kafka, Terraform, Postgres, DuckDB, a language, a framework, a CLI.
@@ -79,15 +70,7 @@ If a fact's natural subject is a specific file or symbol, the fact is almost alw
 - `concept` — a standing idea with no artefact behind it.
 - `unknown` — genuinely unclear. Prefer it to a guess.
 
-**Projects are not entities.** The repository the session ran in is recorded on the memory itself, not as an entity. Do not emit a fact whose subject is "this repo" or the project name alone.
-
-## Relations
-
-`predicate` must be **exactly one** of these. Pick on meaning, not on which word looks closest to the sentence — an invented synonym silently stores the same fact twice.
-
-{{RELATIONS}}
-
-`relates_to` is the last resort, not the default. Before reaching for it, read the list again.
+**Projects are not entities.** The repository the session ran in is recorded on the memory itself, not as an entity. Do not mention the project name as an entity.
 
 ## The bar for emitting anything
 
@@ -103,11 +86,10 @@ User-authored messages are the source of truth for facts about the user; assista
 
 Respond with ONLY a JSON object — no prose, no markdown fence:
 
-{"memories": [{"subject": "...", "subject_is_entity": true, "subject_type": "person", "predicate": "uses", "object": "...", "object_is_entity": false, "object_type": "unknown", "statement": "...", "source_kind": "user_stated", "confidence": 0.9}]}
+{"memories": [{"statement": "...", "source_kind": "user_stated", "confidence": 0.9, "entity_mentions": [{"name": "orders-events", "type": "service"}]}]}
 
 Return `{"memories": []}` when the session contains nothing worth remembering."#
         .to_string()
-        .replace("{{RELATIONS}}", &relations)
         .replace("{{ENTITY_TYPES}}", &entity_types)
 }
 
@@ -197,8 +179,8 @@ fn render_conversation(transcript: &SessionTranscript) -> String {
 }
 
 /// Build a compact semantic query from the transcript for prefetching
-/// related prior memories: user messages first, assistant text as supporting
-/// signal.
+/// related prior memories: user messages first, assistant text as
+/// supporting signal.
 pub fn prefetch_query(transcript: &SessionTranscript) -> String {
     const MAX_QUERY_CHARS: usize = 4_000;
     const USER_PART_CHARS: usize = 800;
@@ -246,27 +228,26 @@ pub fn schema() -> serde_json::Value {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "subject": { "type": "string" },
-                        "subject_is_entity": { "type": "boolean" },
-                        "subject_type": { "type": "string", "enum": entity_types },
-                        "predicate": {
-                            "type": "string",
-                            "enum": Predicate::ALL.iter().map(|p| p.as_str()).collect::<Vec<_>>()
-                        },
-                        "object": { "type": "string" },
-                        "object_is_entity": { "type": "boolean" },
-                        "object_type": { "type": "string", "enum": entity_types },
                         "statement": { "type": "string" },
                         "source_kind": {
                             "type": "string",
-                            "enum": ["user_stated", "assistant_inferred"]
+                            "enum": ["user_stated", "extracted"]
                         },
-                        "confidence": { "type": "number" }
+                        "confidence": { "type": "number" },
+                        "entity_mentions": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": { "type": "string" },
+                                    "type": { "type": "string", "enum": entity_types }
+                                },
+                                "required": ["name", "type"],
+                                "additionalProperties": false
+                            }
+                        }
                     },
-                    "required": [
-                        "subject", "subject_is_entity", "predicate", "object",
-                        "object_is_entity", "statement", "source_kind", "confidence"
-                    ],
+                    "required": ["statement", "source_kind", "confidence"],
                     "additionalProperties": false
                 }
             }
@@ -338,49 +319,26 @@ mod tests {
         assert!(user_at < assistant_at);
     }
 
-    /// The prompt and the schema must offer the *same* closed set. If they
-    /// ever drift, a structured-output backend rejects a value the prompt
-    /// asked for — or a lenient one lets through a value the prompt never
-    /// mentioned.
     #[test]
-    fn relations_block_lists_every_predicate_and_matches_the_schema() {
-        let prompt = system_prompt();
-        for p in Predicate::ALL {
-            assert!(
-                prompt.contains(&format!("`{}`", p.as_str())),
-                "predicate '{}' missing from the prompt",
-                p.as_str(),
-            );
-        }
-        assert!(!prompt.contains("{{RELATIONS}}"));
-
-        let schema = schema();
-        let enumerated: Vec<&str> = schema["properties"]["memories"]["items"]["properties"]
-            ["predicate"]["enum"]
-            .as_array()
-            .expect("predicate must be an enum")
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        let expected: Vec<&str> = Predicate::ALL.iter().map(|p| p.as_str()).collect();
-        assert_eq!(enumerated, expected);
-    }
-
-    #[test]
-    fn schema_does_not_ask_for_kind_or_relation() {
+    fn schema_does_not_ask_for_kind_predicate_or_relation() {
         let schema = schema();
         let props = schema["properties"]["memories"]["items"]["properties"]
             .as_object()
             .unwrap();
         assert!(!props.contains_key("kind"));
+        assert!(!props.contains_key("predicate"));
         assert!(!props.contains_key("relation"));
+        assert!(!props.contains_key("subject"));
+        assert!(!props.contains_key("object"));
+        // The fields the new shape actually reads.
+        for field in ["statement", "source_kind", "confidence", "entity_mentions"] {
+            assert!(props.contains_key(field), "schema missing '{field}'");
+        }
     }
 
     #[test]
     fn prompt_does_not_list_project_as_an_entity_type() {
         let p = system_prompt();
-        // The string "project" appears in prose ("Projects are not
-        // entities"); what must not appear is a backtick-quoted enum entry.
         assert!(!p.contains("`project`"));
     }
 }

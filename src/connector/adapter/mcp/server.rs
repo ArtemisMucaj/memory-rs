@@ -418,15 +418,12 @@ fn memory_json(
     labels: &std::collections::HashMap<String, String>,
     score: Option<f32>,
 ) -> serde_json::Value {
+    let entities = controller::entity_names_for(memory, labels);
     let mut value = json!({
         "id": memory.id,
         "kind": memory.kind.as_str(),
         "statement": memory.statement,
-        // The readable subject — an entity id would be meaningless to a
-        // model deciding whether this memory answers the question.
-        "subject": controller::entity_ref_label(&memory.subject, labels),
-        "predicate": memory.predicate.as_str(),
-        "object": controller::entity_ref_label(&memory.object, labels),
+        "entities": entities,
         "project": memory.project,
         "source_kind": memory.source_kind.as_str(),
         "confidence": memory.confidence,

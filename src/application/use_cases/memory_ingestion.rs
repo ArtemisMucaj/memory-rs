@@ -8,15 +8,16 @@
 //! 2. **Prefetch** — semantic-search existing memories for context, so the
 //!    model can see what is already on record and phrase new statements
 //!    against it instead of duplicating.
-//! 3. **Extract** — one call returns atomic subject–predicate–object facts.
-//! 4. **Apply** — resolve entities (name-key only), collapse duplicates, and
-//!    write.
+//! 3. **Extract** — one call returns atomic facts plus their entity mentions.
+//! 4. **Apply** — resolve entity mentions (name-key only), collapse
+//!    duplicates, and write.
 //!
-//! There is no edge writing, no corroboration, no supersession. A duplicate
-//! detected at write time replaces the prior row outright (hard delete +
-//! insert), and entity resolution is exact-match on the normalized name key
-//! — the embedding and LLM adjudication tiers were the source of permanent
-//! duplicate anchors and are gone.
+//! Entity resolution is exact-match on the normalized name key. The
+//! embedding-similarity and LLM adjudication tiers the old path used are
+//! gone: they were the source of permanent duplicate anchors, and
+//! `entity_name_key` normalization catches the variants that matter
+//! ("orders-events", "the orders-events service", "orders events" all share
+//! one key).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -33,15 +34,14 @@ use crate::application::use_cases::llm_json::{
 };
 use crate::application::use_cases::memory_ingestion_prompt as prompt;
 use crate::domain::{
-    entity_name_key, DomainError, Entity, EntityRef, Memory, MemoryKind, Predicate,
-    SessionTranscript, SourceKind,
+    entity_name_key, DomainError, Entity, Memory, MemoryKind, SessionTranscript, SourceKind,
 };
 
 /// How many prior memories are prefetched into the extraction context.
 const PREFETCH_LIMIT: usize = 8;
 
-/// Upper bound on memories applied from a single ingestion, guarding against
-/// a runaway model flooding the store.
+/// Upper bound on memories applied from a single ingestion, guarding
+/// against a runaway model flooding the store.
 const MAX_MEMORIES_PER_RUN: usize = 32;
 
 /// Default entity type when the model does not supply a usable one.
@@ -63,11 +63,9 @@ pub(crate) fn types_conflict(existing_type: &str, new_type: &str) -> bool {
 pub struct IngestionReport {
     pub memories_written: usize,
     pub entities_created: usize,
-    /// Duplicates replaced at write time (same subject/predicate/object key).
+    /// Duplicates replaced at write time (same normalized statement text
+    /// in the same project).
     pub memories_deduped: usize,
-    /// Memories whose predicate fell outside the closed vocabulary and landed
-    /// on `relates_to`. The metric for whether [`Predicate`] needs extending.
-    pub predicates_out_of_vocabulary: usize,
 }
 
 /// Outcome of an ingestion request.
@@ -89,43 +87,30 @@ struct RawIngestion {
 #[derive(Debug, Deserialize)]
 struct RawMemory {
     #[serde(default)]
-    subject: String,
-    #[serde(default)]
-    subject_is_entity: bool,
-    #[serde(default)]
-    subject_type: String,
-    #[serde(default)]
-    predicate: String,
-    #[serde(default)]
-    object: String,
-    #[serde(default)]
-    object_is_entity: bool,
-    #[serde(default)]
-    object_type: String,
-    #[serde(default)]
     statement: String,
     #[serde(default)]
     source_kind: String,
     #[serde(default)]
     confidence: f32,
+    #[serde(default)]
+    entity_mentions: Vec<RawEntityMention>,
 }
 
-/// Identity used to collapse duplicate memories within and across sessions.
-///
-/// Entity refs contribute their resolved id, so two surface forms that
-/// resolved to the same entity produce the same key; literals are normalized.
+#[derive(Debug, Deserialize)]
+struct RawEntityMention {
+    #[serde(default)]
+    name: String,
+    #[serde(default, rename = "type")]
+    entity_type: String,
+}
+
+/// Identity used to collapse duplicate memories within and across sessions:
+/// the normalized statement text plus the project scope. Two memories with
+/// the same statement about the same project are the same fact.
 fn duplicate_key(memory: &Memory) -> String {
-    fn part(r: &EntityRef) -> String {
-        match r {
-            EntityRef::Entity(id) => format!("e:{id}"),
-            EntityRef::Literal(v) => format!("l:{}", v.trim().to_lowercase()),
-        }
-    }
     format!(
-        "{}|{}|{}|{}",
-        part(&memory.subject),
-        memory.predicate.as_str(),
-        part(&memory.object),
+        "{}|{}",
+        memory.statement.trim().to_lowercase(),
         memory.project.as_deref().unwrap_or(""),
     )
 }
@@ -193,8 +178,6 @@ impl MemoryIngestionUseCase {
         if query.trim().is_empty() {
             return Vec::new();
         }
-        // Globals plus this session's project — the same scope the memory
-        // will be written into.
         let projects: Vec<String> = transcript.project.clone().into_iter().collect();
         match self.embedder.embed_query(&query).await {
             Ok(vector) => match self
@@ -247,7 +230,7 @@ impl MemoryIngestionUseCase {
         }
     }
 
-    /// Resolve entities, collapse duplicates, write.
+    /// Resolve entity mentions, collapse duplicates, write.
     async fn apply(
         &self,
         transcript: &SessionTranscript,
@@ -258,8 +241,9 @@ impl MemoryIngestionUseCase {
         let mut entity_cache: HashMap<String, String> = HashMap::new();
         let mut report = IngestionReport::default();
 
-        // Duplicate index over the prefetched priors, plus everything written
-        // in this run so a model that emits the same triple twice writes once.
+        // Duplicate index over the prefetched priors, plus everything
+        // written in this run so a model that emits the same fact twice
+        // writes once.
         let mut seen: HashMap<String, String> = prior
             .iter()
             .map(|c| (duplicate_key(c), c.id.clone()))
@@ -276,59 +260,36 @@ impl MemoryIngestionUseCase {
             if statement.is_empty() {
                 continue;
             }
-            let predicate = match Predicate::parse(&raw_memory.predicate) {
-                Some(p) => p,
-                None => {
-                    report.predicates_out_of_vocabulary += 1;
-                    debug!(
-                        "predicate '{}' is outside the vocabulary; recorded as relates_to",
-                        raw_memory.predicate.trim()
-                    );
-                    Predicate::RelatesTo
-                }
-            };
 
-            let subject = self
-                .resolve_ref(
-                    &raw_memory.subject,
-                    raw_memory.subject_is_entity,
-                    &raw_memory.subject_type,
-                    now,
-                    &mut entity_cache,
-                    &mut report,
-                )
-                .await?;
-            let object = self
-                .resolve_ref(
-                    &raw_memory.object,
-                    raw_memory.object_is_entity,
-                    &raw_memory.object_type,
-                    now,
-                    &mut entity_cache,
-                    &mut report,
-                )
-                .await?;
+            let mut entity_ids = Vec::new();
+            for mention in &raw_memory.entity_mentions {
+                if let Some(id) = self
+                    .resolve_mention(mention, now, &mut entity_cache, &mut report)
+                    .await?
+                {
+                    if !entity_ids.contains(&id) {
+                        entity_ids.push(id);
+                    }
+                }
+            }
 
             let memory = Memory {
                 id: Uuid::new_v4().to_string(),
                 kind: MemoryKind::Fact,
-                subject,
-                predicate,
-                object,
                 statement: statement.to_string(),
+                entity_ids,
                 project: transcript.project.clone(),
                 recorded_at: now,
                 source_session_id: Some(transcript.id.clone()),
                 source_message_index: None,
                 source_kind: SourceKind::parse(&raw_memory.source_kind)
-                    .unwrap_or(SourceKind::AssistantInferred),
+                    .unwrap_or(SourceKind::Extracted),
                 confidence: raw_memory.confidence.clamp(0.0, 1.0),
             };
 
             let key = duplicate_key(&memory);
             if let Some(existing_id) = seen.get(&key).cloned() {
-                // Hard delete + insert — newest write wins. No edge, no
-                // corroboration bookkeeping.
+                // Hard delete + insert — newest write wins.
                 self.memory_repo.delete_memory(&existing_id).await?;
                 report.memories_deduped += 1;
             }
@@ -343,37 +304,32 @@ impl MemoryIngestionUseCase {
         Ok(report)
     }
 
-    /// Resolve a subject/object surface form to an [`EntityRef`].
+    /// Resolve one entity mention to an entity id, creating the entity on
+    /// first sight.
     ///
-    /// Literals pass through. Entity references hit the in-run cache, then an
-    /// exact (case-insensitive, role-word-normalized) name-key match, then a
-    /// new entity is created. The embedding-similarity and LLM adjudication
-    /// tiers the old path used are gone: they were the source of permanent
-    /// duplicate anchors, and `entity_name_key` normalization now catches the
-    /// variants that matter ("orders-events", "the orders-events service",
-    /// "orders events" all share one key).
-    async fn resolve_ref(
+    /// The only tier is exact match on the normalized name key. The
+    /// embedding and adjudication tiers the old path used were the source
+    /// of permanent duplicate anchors — `entity_name_key` normalization
+    /// now catches the variants that matter, and a miss simply creates a
+    /// new entity, which is the recoverable failure.
+    async fn resolve_mention(
         &self,
-        surface: &str,
-        is_entity: bool,
-        entity_type: &str,
+        mention: &RawEntityMention,
         now: i64,
         cache: &mut HashMap<String, String>,
         report: &mut IngestionReport,
-    ) -> Result<EntityRef, DomainError> {
-        let trimmed = surface.trim();
-        if !is_entity || trimmed.is_empty() {
-            return Ok(EntityRef::Literal(trimmed.to_string()));
+    ) -> Result<Option<String>, DomainError> {
+        let trimmed = mention.name.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
         }
-        let entity_type = match entity_type.trim() {
+        let entity_type = match mention.entity_type.trim() {
             "" => UNKNOWN_ENTITY_TYPE.to_string(),
             t => t.to_lowercase(),
         };
-        // Keyed by the same normalization the store uses, so two surface
-        // forms one session produces for one thing share a cache slot too.
         let key = format!("{}\u{0}{entity_type}", entity_name_key(trimmed));
         if let Some(id) = cache.get(&key) {
-            return Ok(EntityRef::Entity(id.clone()));
+            return Ok(Some(id.clone()));
         }
         // The key is broader than the name, so a hit can be a differently-
         // typed entity that merely shares it. Take the first the type guard
@@ -384,7 +340,7 @@ impl MemoryIngestionUseCase {
             .find(|e| !types_conflict(&e.entity_type, &entity_type))
         {
             cache.insert(key, existing.id.clone());
-            return Ok(EntityRef::Entity(existing.id));
+            return Ok(Some(existing.id));
         }
 
         let entity = Entity {
@@ -398,7 +354,7 @@ impl MemoryIngestionUseCase {
         self.memory_repo.upsert_entity(&entity).await?;
         report.entities_created += 1;
         cache.insert(key, entity.id.clone());
-        Ok(EntityRef::Entity(entity.id))
+        Ok(Some(entity.id))
     }
 
     /// Embed `text`, returning `None` when embeddings are disabled or the
@@ -440,10 +396,8 @@ mod tests {
         Memory {
             id: id.to_string(),
             kind: MemoryKind::Fact,
-            subject: EntityRef::Entity("entity-1".to_string()),
-            predicate: Predicate::Uses,
-            object: EntityRef::Literal("svc-a".to_string()),
             statement: "the team uses svc-a".to_string(),
+            entity_ids: vec!["entity-1".to_string()],
             project: Some("owner/repo".to_string()),
             recorded_at: 100,
             source_session_id: Some("session-1".to_string()),
@@ -453,13 +407,13 @@ mod tests {
         }
     }
 
-    /// A type conflict outranks any name match. Merging two differently-typed
+    /// A type conflict keeps entities apart. Merging two differently-typed
     /// entities cannot be undone — there is no supersession chain for an
     /// entity — so even a perfect name match must not do it.
     #[test]
     fn a_type_conflict_keeps_entities_apart() {
-        assert!(types_conflict("project", "tool"));
-        assert!(types_conflict("person", "project"));
+        assert!(types_conflict("service", "tool"));
+        assert!(types_conflict("person", "library"));
         assert!(!types_conflict("tool", "tool"));
     }
 
@@ -472,34 +426,17 @@ mod tests {
         assert!(!types_conflict("tool", UNKNOWN_ENTITY_TYPE));
     }
 
-    /// Predicate spelling can no longer split a duplicate: the vocabulary is
-    /// closed, so `Uses`, `utilises` and `depends_on` all *parse* to the same
-    /// variant long before the key is built.
     #[test]
-    fn predicate_synonyms_resolve_to_one_variant() {
-        for spelling in ["uses", "Uses", "  USES ", "utilises", "depends_on", "used"] {
-            assert_eq!(
-                Predicate::parse(spelling),
-                Some(Predicate::Uses),
-                "{spelling:?} should fold into `uses`",
-            );
-        }
-        assert_eq!(Predicate::parse("frobnicates"), None);
-    }
-
-    #[test]
-    fn duplicate_key_ignores_literal_case() {
+    fn duplicate_key_ignores_statement_case() {
         let mut a = memory_with("a", SourceKind::UserStated, 0.5);
-        let mut b = memory_with("b", SourceKind::Derived, 0.9);
-        a.predicate = Predicate::Uses;
-        b.predicate = Predicate::Uses;
-        a.object = EntityRef::Literal("Svc-A".to_string());
-        b.object = EntityRef::Literal("svc-a".to_string());
+        let mut b = memory_with("b", SourceKind::Extracted, 0.9);
+        a.statement = "The team uses SVC-A.".to_string();
+        b.statement = "the team uses svc-a.".to_string();
         assert_eq!(duplicate_key(&a), duplicate_key(&b));
     }
 
     #[test]
-    fn duplicate_key_separates_scopes_and_entity_from_literal() {
+    fn duplicate_key_separates_scopes() {
         let base = memory_with("a", SourceKind::UserStated, 0.5);
         let mut other_project = base.clone();
         other_project.project = Some("owner/other".to_string());
@@ -508,37 +445,30 @@ mod tests {
         let mut global = base.clone();
         global.project = None;
         assert_ne!(duplicate_key(&base), duplicate_key(&global));
-
-        // A literal "svc-a" and an entity that happens to be named "svc-a"
-        // are different memories; collapsing them would merge a resolved
-        // reference into an unresolved string.
-        let mut as_entity = base.clone();
-        as_entity.object = EntityRef::Entity("svc-a".to_string());
-        assert_ne!(duplicate_key(&base), duplicate_key(&as_entity));
     }
 
     #[test]
-    fn parses_a_memory_with_entity_type_metadata() {
+    fn parses_a_memory_with_entity_mentions() {
         let response = r#"{"memories": [
-            {"subject": "the user", "subject_is_entity": true, "subject_type": "person",
-             "predicate": "prefers", "object": "tabs", "object_is_entity": false,
-             "object_type": "unknown", "statement": "the user prefers tabs",
-             "source_kind": "user_stated", "confidence": 0.9}
+            {"statement": "the user prefers tabs",
+             "source_kind": "user_stated", "confidence": 0.9,
+             "entity_mentions": [{"name": "the user", "type": "person"}]}
         ]}"#;
         let parsed = parse_ingestion(response).unwrap();
         assert_eq!(parsed.memories.len(), 1);
         let c = &parsed.memories[0];
-        assert_eq!(c.subject_type, "person");
-        assert!(!c.object_is_entity);
+        assert_eq!(c.statement, "the user prefers tabs");
+        assert_eq!(c.entity_mentions.len(), 1);
+        assert_eq!(c.entity_mentions[0].name, "the user");
+        assert_eq!(c.entity_mentions[0].entity_type, "person");
     }
 
     #[test]
     fn parses_fenced_json() {
-        let response = "Sure! Here you go:\n```json\n{\"memories\": [\
-            {\"subject\": \"the user\", \"subject_is_entity\": true, \"predicate\": \"prefers\", \
-             \"object\": \"tabs\", \"object_is_entity\": false, \
-             \"statement\": \"prefers tabs\", \
-             \"source_kind\": \"user_stated\", \"confidence\": 0.8}]}\n```\nHope that helps!";
+        let response = "Sure!\n```json\n{\"memories\": [\
+            {\"statement\": \"prefers tabs\", \
+             \"source_kind\": \"user_stated\", \"confidence\": 0.8, \
+             \"entity_mentions\": []}]}\n```\nDone.";
         let parsed = parse_ingestion(response).unwrap();
         assert_eq!(parsed.memories.len(), 1);
     }
@@ -548,10 +478,8 @@ mod tests {
     /// session's memory.
     #[test]
     fn repairs_invalid_escapes_before_giving_up() {
-        let response = r#"{"memories": [{"subject": "the user", "subject_is_entity": true,
-            "predicate": "prefers", "object": "snake\_case", "object_is_entity": false,
-            "statement": "the user prefers snake\_case names",
-            "source_kind": "user_stated", "confidence": 0.7}]}"#;
+        let response = r#"{"memories": [{"statement": "the user prefers snake\_case names",
+            "source_kind": "user_stated", "confidence": 0.7, "entity_mentions": []}]}"#;
         let parsed = parse_ingestion(response).unwrap();
         assert_eq!(parsed.memories.len(), 1);
         assert!(parsed.memories[0].statement.contains("snake"));
@@ -560,8 +488,8 @@ mod tests {
     #[test]
     fn unknown_source_kind_falls_back_rather_than_dropping_the_memory() {
         assert_eq!(
-            SourceKind::parse("nonsense").unwrap_or(SourceKind::AssistantInferred),
-            SourceKind::AssistantInferred,
+            SourceKind::parse("nonsense").unwrap_or(SourceKind::Extracted),
+            SourceKind::Extracted,
         );
     }
 

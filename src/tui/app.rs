@@ -282,7 +282,7 @@ pub async fn run(container: Container, logs: LogCapture) -> Result<(), DomainErr
 mod tests {
     use super::*;
     use crate::connector::api::ContainerConfig;
-    use crate::domain::{MemoryKind, Predicate};
+    use crate::domain::MemoryKind;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -325,18 +325,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let container = temp_container(dir.path());
         let repo = container.memory_repository().unwrap();
-        for (id, predicate, statement) in [
-            ("m-1", "uses", "duckdb takes a file lock on the database"),
-            ("m-2", "fixes", "the release pipeline was unblocked"),
+        for (id, statement) in [
+            ("m-1", "duckdb takes a file lock on the database"),
+            ("m-2", "the release pipeline was unblocked"),
         ] {
             repo.append_memory(
                 &crate::domain::Memory {
                     id: id.into(),
                     kind: MemoryKind::Fact,
-                    subject: crate::domain::EntityRef::Literal("the project".into()),
-                    predicate: Predicate::parse(predicate).unwrap_or(Predicate::RelatesTo),
-                    object: crate::domain::EntityRef::Literal("duckdb".into()),
                     statement: statement.into(),
+                    entity_ids: Vec::new(),
                     project: None,
                     recorded_at: 1,
                     source_session_id: None,

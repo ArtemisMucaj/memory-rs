@@ -99,19 +99,16 @@ pub async fn recall_memories(
 
 /// Canonical names for every entity referenced by `memories`, keyed by id.
 ///
-/// A memory stores its subject and object as entity *ids*, which are UUIDs
-/// and mean nothing to a reader. This resolves them in one query so any
-/// surface can render "orders-events deployment" where the row would
-/// otherwise say `@c95de38f-…`.
+/// A memory stores `entity_ids`, which are UUIDs and mean nothing to a
+/// reader. This resolves them in one query so any surface can render the
+/// names alongside the statement.
 pub async fn entity_labels(
     container: &Container,
     memories: &[Memory],
 ) -> Result<std::collections::HashMap<String, String>, DomainError> {
     let mut ids: Vec<String> = memories
         .iter()
-        .flat_map(|m| [m.subject.entity_id(), m.object.entity_id()])
-        .flatten()
-        .map(str::to_string)
+        .flat_map(|m| m.entity_ids.iter().cloned())
         .collect();
     ids.sort();
     ids.dedup();
@@ -127,19 +124,18 @@ pub async fn entity_labels(
         .collect())
 }
 
-/// A memory's subject/object rendered for display: the entity's canonical
-/// name when it resolves, the literal value otherwise.
-pub fn entity_ref_label(
-    r: &crate::domain::EntityRef,
+/// Render the entity ids on a memory as their canonical names. Ids that do
+/// not resolve are passed through unchanged (they should not exist — the
+/// write path creates entities before linking them).
+pub fn entity_names_for(
+    memory: &Memory,
     labels: &std::collections::HashMap<String, String>,
-) -> Option<String> {
-    match r {
-        crate::domain::EntityRef::Entity(id) => {
-            Some(labels.get(id).cloned().unwrap_or_else(|| id.clone()))
-        }
-        crate::domain::EntityRef::Literal(v) if v.is_empty() => None,
-        crate::domain::EntityRef::Literal(v) => Some(v.clone()),
-    }
+) -> Vec<String> {
+    memory
+        .entity_ids
+        .iter()
+        .map(|id| labels.get(id).cloned().unwrap_or_else(|| id.clone()))
+        .collect()
 }
 
 /// One entity plus how many memories hang off it.

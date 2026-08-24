@@ -160,8 +160,6 @@ impl MemoryScreen {
             let mut s = String::new();
             s.push_str(&memory.statement);
             s.push_str("\n\n");
-            s.push_str(&format!("kind: {}\n", memory.kind.as_str()));
-            s.push_str(&format!("predicate: {}\n", memory.predicate.as_str()));
             s.push_str(&format!(
                 "project: {}\n",
                 memory.project.as_deref().unwrap_or("global")
@@ -171,6 +169,9 @@ impl MemoryScreen {
                 memory.source_kind.as_str(),
                 memory.confidence
             ));
+            if !memory.entity_ids.is_empty() {
+                s.push_str(&format!("entities: {} linked\n", memory.entity_ids.len()));
+            }
             if let Some(session_id) = &memory.source_session_id {
                 s.push_str(&format!("session: {session_id}\n"));
             }

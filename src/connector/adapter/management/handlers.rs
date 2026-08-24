@@ -432,17 +432,12 @@ fn memory_with_score(hit: &Recalled, labels: &HashMap<String, String>) -> Value 
     memory_json(&hit.memory, labels, Some(hit.score))
 }
 
-/// A memory as JSON, with its subject/object entity ids resolved to their
-/// canonical names.
+/// A memory as JSON, with its entity ids resolved to their canonical names.
 fn memory_json(memory: &Memory, labels: &HashMap<String, String>, score: Option<f32>) -> Value {
     let mut value = serde_json::to_value(memory).unwrap_or_default();
     if let Some(obj) = value.as_object_mut() {
-        if let Some(label) = controller::entity_ref_label(&memory.subject, labels) {
-            obj.insert("subject_label".to_string(), json!(label));
-        }
-        if let Some(label) = controller::entity_ref_label(&memory.object, labels) {
-            obj.insert("object_label".to_string(), json!(label));
-        }
+        let names = controller::entity_names_for(memory, labels);
+        obj.insert("entities".to_string(), json!(names));
         if let Some(score) = score {
             obj.insert("score".to_string(), json!(score));
         }

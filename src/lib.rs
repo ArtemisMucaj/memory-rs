@@ -40,7 +40,7 @@ pub use connector::{
 };
 
 pub use domain::{
-    cosine_similarity, entity_name_key, DiscoveredSession, DomainError, Entity, EntityRef,
-    ImportedSession, Memory, MemoryKind, MemoryResource, Predicate, SessionLocator, SessionMessage,
-    SessionSource, SessionStatus, SessionTranscript, SourceKind, VALID_ENTITY_TYPES,
+    cosine_similarity, entity_name_key, DiscoveredSession, DomainError, Entity, ImportedSession,
+    Memory, MemoryKind, MemoryResource, SessionLocator, SessionMessage, SessionSource,
+    SessionStatus, SessionTranscript, SourceKind, VALID_ENTITY_TYPES,
 };
