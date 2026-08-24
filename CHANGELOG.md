@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.2](https://github.com/ArtemisMucaj/memory-rs/compare/v0.3.1...v0.3.2) (2026-08-24)
+
+
+### Bug Fixes
+
+* **sessions:** scope an imported session to the project it ran in ([#25](https://github.com/ArtemisMucaj/memory-rs/issues/25)) ([7c08da3](https://github.com/ArtemisMucaj/memory-rs/commit/7c08da377547bec37d1efda8fb0b994062fa7730))
+
 ## [0.3.1](https://github.com/ArtemisMucaj/memory-rs/compare/v0.3.0...v0.3.1) (2026-08-13)
 
 
