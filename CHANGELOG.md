@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/ArtemisMucaj/memory-rs/compare/v0.4.0...v0.4.1) (2026-08-24)
+
+
+### Bug Fixes
+
+* **storage:** bind LIMIT as an integer so "no limit" works ([#32](https://github.com/ArtemisMucaj/memory-rs/issues/32)) ([638646a](https://github.com/ArtemisMucaj/memory-rs/commit/638646a6bdde9749d7d6d04835f70a21ff0a2174))
+
 ## [0.4.0](https://github.com/ArtemisMucaj/memory-rs/compare/v0.3.2...v0.4.0) (2026-08-24)
 
 
