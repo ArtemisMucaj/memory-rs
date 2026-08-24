@@ -735,11 +735,17 @@ mod tests {
         let mut cfg = MemoryConfig::default();
         cfg.openai_mut().endpoints.insert(
             "MLX".to_string(),
-            OpenAiEndpoint { base_url: "http://127.0.0.1:8000".to_string(), ..Default::default() },
+            OpenAiEndpoint {
+                base_url: "http://127.0.0.1:8000".to_string(),
+                ..Default::default()
+            },
         );
         cfg.openai_mut().endpoints.insert(
             "proxy".to_string(),
-            OpenAiEndpoint { base_url: "http://127.0.0.1:8080".to_string(), ..Default::default() },
+            OpenAiEndpoint {
+                base_url: "http://127.0.0.1:8080".to_string(),
+                ..Default::default()
+            },
         );
         cfg.openai_mut().active = Some("MLX".to_string());
         cfg.openai_mut().usages.insert(
@@ -762,15 +768,24 @@ mod tests {
         let mut cfg = MemoryConfig::default();
         cfg.openai_mut().endpoints.insert(
             "chosen".to_string(),
-            OpenAiEndpoint { base_url: "http://127.0.0.1:9999".to_string(), ..Default::default() },
+            OpenAiEndpoint {
+                base_url: "http://127.0.0.1:9999".to_string(),
+                ..Default::default()
+            },
         );
         cfg.openai_mut().endpoints.insert(
             "bound".to_string(),
-            OpenAiEndpoint { base_url: "http://127.0.0.1:8080".to_string(), ..Default::default() },
+            OpenAiEndpoint {
+                base_url: "http://127.0.0.1:8080".to_string(),
+                ..Default::default()
+            },
         );
         cfg.openai_mut().usages.insert(
             LlmUsage::Embedding.as_str().to_string(),
-            UsageBinding { endpoint: Some("bound".to_string()), model: None },
+            UsageBinding {
+                endpoint: Some("bound".to_string()),
+                model: None,
+            },
         );
 
         let resolved = cfg.resolve_embedding_endpoint(Some("chosen"), DEFAULT_EMBEDDING_MODEL);
