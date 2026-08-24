@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.2](https://github.com/ArtemisMucaj/memory-rs/compare/v0.4.1...v0.4.2) (2026-08-24)
+
+
+### Bug Fixes
+
+* **config:** honour the embedding usage binding ([#34](https://github.com/ArtemisMucaj/memory-rs/issues/34)) ([66711fb](https://github.com/ArtemisMucaj/memory-rs/commit/66711fb56e381bd13f869e1e31821a0a2c644d72))
+
 ## [0.4.1](https://github.com/ArtemisMucaj/memory-rs/compare/v0.4.0...v0.4.1) (2026-08-24)
 
 
