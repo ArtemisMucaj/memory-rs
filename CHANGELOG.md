@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/ArtemisMucaj/memory-rs/compare/v0.3.2...v0.4.0) (2026-08-24)
+
+
+### Features
+
+* simplify memory model to facts + entities only ([#27](https://github.com/ArtemisMucaj/memory-rs/issues/27)) ([e02942c](https://github.com/ArtemisMucaj/memory-rs/commit/e02942cb5bc9e6ee465584cfe1e1b29a07aa0685)), closes [#24](https://github.com/ArtemisMucaj/memory-rs/issues/24)
+
 ## [0.3.2](https://github.com/ArtemisMucaj/memory-rs/compare/v0.3.1...v0.3.2) (2026-08-24)
 
 
