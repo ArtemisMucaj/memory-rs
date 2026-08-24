@@ -11,7 +11,7 @@
 use crate::application::{DreamReport, ImportOutcome, IngestionOutcome, Recalled, ResumeBriefing};
 use crate::connector::adapter::{fetch_resource, parse_transcript_file};
 use crate::connector::api::Container;
-use crate::domain::{DomainError, Entity, ImportedSession, Memory, MemoryKind, MemoryResource};
+use crate::domain::{DomainError, Entity, ImportedSession, Memory, MemoryResource};
 
 /// How a memory should be scoped for a search.
 #[derive(Debug, Clone, Default)]
@@ -80,7 +80,6 @@ pub async fn ingest_memories(
 pub async fn recall_memories(
     container: &Container,
     query: &str,
-    kind: Option<MemoryKind>,
     scope: &SearchScope,
     limit: usize,
 ) -> Result<MemorySearchOutcome, DomainError> {
@@ -91,7 +90,7 @@ pub async fn recall_memories(
     };
     let hits = container
         .memory_recall_use_case()?
-        .execute(query, kind, projects.as_deref(), limit)
+        .execute(query, projects.as_deref(), limit)
         .await?;
     Ok(MemorySearchOutcome::Hits(hits))
 }
@@ -182,10 +181,7 @@ pub async fn list_memories(
     container: &Container,
     projects: Option<&[String]>,
 ) -> Result<Vec<Memory>, DomainError> {
-    container
-        .memory_repository()?
-        .list_memories(None, projects)
-        .await
+    container.memory_repository()?.list_memories(projects).await
 }
 
 /// What a `show <id>` against the memory store resolves to.
@@ -279,7 +275,7 @@ pub async fn tree(
     match uri {
         None | Some("memory://") => {
             // Root: every section, so a client can discover the shape.
-            let memories = repo.list_memories(None, None).await?;
+            let memories = repo.list_memories(None).await?;
             out.push(serde_json::json!({
                 "uri": "memory://memory",
                 "kind": "memory",
@@ -301,7 +297,7 @@ pub async fn tree(
             }
         }
         Some("memory://memory") => {
-            for m in repo.list_memories(None, None).await? {
+            for m in repo.list_memories(None).await? {
                 out.push(serde_json::json!({
                     "uri": format!("memory://memory/{}", m.id),
                     "kind": "memory",

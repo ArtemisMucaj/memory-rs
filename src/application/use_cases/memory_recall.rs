@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::application::interfaces::{Embedder, MemoryRepository};
-use crate::domain::{DomainError, Memory, MemoryKind};
+use crate::domain::{DomainError, Memory};
 
 /// RRF dampening constant (the standard value, used across the crate).
 const RRF_K: f32 = 60.0;
@@ -49,7 +49,6 @@ impl MemoryRecallUseCase {
     pub async fn execute(
         &self,
         query: &str,
-        kind: Option<MemoryKind>,
         projects: Option<&[String]>,
         limit: usize,
     ) -> Result<Vec<Recalled>, DomainError> {
@@ -65,7 +64,7 @@ impl MemoryRecallUseCase {
         let semantic: Vec<String> = if self.embedder.embeddings_enabled() {
             let vector = self.embedder.embed_query(query).await?;
             self.memory_repo
-                .search_memories_semantic(&vector, kind, projects, CANDIDATES_PER_LEG)
+                .search_memories_semantic(&vector, projects, CANDIDATES_PER_LEG)
                 .await?
                 .into_iter()
                 .map(|(m, _)| m.id)
@@ -75,14 +74,14 @@ impl MemoryRecallUseCase {
         };
         let keyword: Vec<String> = self
             .memory_repo
-            .search_memories_keyword(query, kind, projects, CANDIDATES_PER_LEG)
+            .search_memories_keyword(query, projects, CANDIDATES_PER_LEG)
             .await?
             .into_iter()
             .map(|(m, _)| m.id)
             .collect();
         let recency: Vec<String> = self
             .memory_repo
-            .list_memories_by_recency(kind, projects, CANDIDATES_PER_LEG)
+            .list_memories_by_recency(projects, CANDIDATES_PER_LEG)
             .await?
             .into_iter()
             .map(|m| m.id)

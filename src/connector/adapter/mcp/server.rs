@@ -172,15 +172,9 @@ impl MemoryMcpServer {
         let scope = scope_from(input.project, input.namespace)?;
         let limit = input.limit.min(MAX_LIMIT);
 
-        let value = match controller::recall_memories(
-            &self.container,
-            &input.query,
-            None,
-            &scope,
-            limit,
-        )
-        .await
-        .map_err(internal)?
+        let value = match controller::recall_memories(&self.container, &input.query, &scope, limit)
+            .await
+            .map_err(internal)?
         {
             MemorySearchOutcome::Hits(hits) => {
                 let found: Vec<Memory> = hits.iter().map(|h| h.memory.clone()).collect();

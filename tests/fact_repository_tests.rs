@@ -48,10 +48,7 @@ async fn delete_memory_removes_row_and_embedding() {
     assert!(store.delete_memory("m1").await.unwrap());
     assert!(store.find_memory("m1").await.unwrap().is_none());
     // Embedding gone too: semantic search returns nothing.
-    let hits = store
-        .search_memories_semantic(&v, None, None, 10)
-        .await
-        .unwrap();
+    let hits = store.search_memories_semantic(&v, None, 10).await.unwrap();
     assert!(hits.is_empty());
 }
 
@@ -61,10 +58,7 @@ async fn recency_list_is_newest_first() {
     for (id, ts) in [("a", 100), ("b", 300), ("c", 200)] {
         store.append_memory(&fact(id, "s", ts), None).await.unwrap();
     }
-    let listed = store
-        .list_memories_by_recency(None, None, 10)
-        .await
-        .unwrap();
+    let listed = store.list_memories_by_recency(None, 10).await.unwrap();
     let ids: Vec<_> = listed.iter().map(|m| m.id.as_str()).collect();
     assert_eq!(ids, ["b", "c", "a"]);
 }

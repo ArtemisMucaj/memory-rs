@@ -194,7 +194,7 @@ impl MemoryIngestionUseCase {
         match self.embedder.embed_query(&query).await {
             Ok(vector) => match self
                 .memory_repo
-                .search_memories_semantic(&vector, None, Some(&projects), PREFETCH_LIMIT)
+                .search_memories_semantic(&vector, Some(&projects), PREFETCH_LIMIT)
                 .await
             {
                 Ok(results) => results.into_iter().map(|(memory, _)| memory).collect(),

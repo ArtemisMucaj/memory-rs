@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 
-use crate::domain::{DomainError, Entity, Memory, MemoryKind, MemoryResource};
+use crate::domain::{DomainError, Entity, Memory, MemoryResource};
 
 /// Persistence port for memories, entities, and resources.
 ///
@@ -34,13 +34,9 @@ pub trait MemoryRepository: Send + Sync {
     /// Fetch many memories by id in one query. Unknown ids are skipped.
     async fn find_memories(&self, ids: &[String]) -> Result<Vec<Memory>, DomainError>;
 
-    /// Newest first, optionally filtered by kind (currently always `Fact`)
-    /// and project scope.
-    async fn list_memories(
-        &self,
-        kind: Option<MemoryKind>,
-        projects: Option<&[String]>,
-    ) -> Result<Vec<Memory>, DomainError>;
+    /// Newest first, optionally filtered by project scope. The `kind`
+    /// parameter is gone: there is only one kind.
+    async fn list_memories(&self, projects: Option<&[String]>) -> Result<Vec<Memory>, DomainError>;
 
     /// Hard-delete one memory and its embedding. Returns whether it existed.
     async fn delete_memory(&self, id: &str) -> Result<bool, DomainError>;
@@ -84,7 +80,6 @@ pub trait MemoryRepository: Send + Sync {
     async fn search_memories_semantic(
         &self,
         vector: &[f32],
-        kind: Option<MemoryKind>,
         projects: Option<&[String]>,
         limit: usize,
     ) -> Result<Vec<(Memory, f32)>, DomainError>;
@@ -94,7 +89,6 @@ pub trait MemoryRepository: Send + Sync {
     async fn search_memories_keyword(
         &self,
         query: &str,
-        kind: Option<MemoryKind>,
         projects: Option<&[String]>,
         limit: usize,
     ) -> Result<Vec<(Memory, f32)>, DomainError>;
@@ -103,7 +97,6 @@ pub trait MemoryRepository: Send + Sync {
     /// leg of recall's RRF fusion.
     async fn list_memories_by_recency(
         &self,
-        kind: Option<MemoryKind>,
         projects: Option<&[String]>,
         limit: usize,
     ) -> Result<Vec<Memory>, DomainError>;

@@ -89,7 +89,7 @@ impl MemoryResumeUseCase {
         // One pass over the memories in scope, bucketed by the session that
         // wrote them — rather than a query per session.
         let mut by_session: HashMap<String, Vec<Memory>> = HashMap::new();
-        for memory in self.memory_repo.list_memories(None, projects).await? {
+        for memory in self.memory_repo.list_memories(projects).await? {
             if let Some(session_id) = memory.source_session_id.clone() {
                 by_session.entry(session_id).or_default().push(memory);
             }

@@ -88,7 +88,7 @@ pub async fn search(
     };
     let limit = params.limit.unwrap_or(10).min(100);
 
-    match controller::recall_memories(&state.container, &params.q, None, &scope, limit).await? {
+    match controller::recall_memories(&state.container, &params.q, &scope, limit).await? {
         MemorySearchOutcome::Hits(hits) => {
             let found: Vec<Memory> = hits.iter().map(|h| h.memory.clone()).collect();
             let labels = controller::entity_labels(&state.container, &found).await?;

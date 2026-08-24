@@ -71,7 +71,7 @@ async fn search(
         (None, None) => SearchScope::All,
     };
 
-    let results = match controller::recall_memories(container, &query, None, &scope, num).await? {
+    let results = match controller::recall_memories(container, &query, &scope, num).await? {
         MemorySearchOutcome::Hits(hits) => hits,
         MemorySearchOutcome::EmptyNamespace(ns) => {
             return Ok(format!(

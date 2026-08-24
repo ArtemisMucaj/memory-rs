@@ -61,7 +61,6 @@ impl MemoryScreen {
             match controller::recall_memories(
                 container,
                 self.query.trim(),
-                None,
                 &SearchScope::All,
                 SEARCH_LIMIT,
             )
