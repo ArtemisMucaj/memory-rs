@@ -142,6 +142,54 @@ async fn sessions_record_and_list() {
     assert_eq!(listed.len(), 1);
 }
 
+/// `usize::MAX` is how every "no limit" caller spells it — `controller::
+/// sessions()` and the dream sweep both do. It used to be bound as the *text*
+/// "18446744073709551615", which DuckDB tried to coerce to INT64 and failed,
+/// so `GET /api/sessions` answered 500 and the dream sweep logged a storage
+/// error on every pass. Two call sites had worked around it with an arbitrary
+/// 10k cap that silently truncated a larger store.
+#[tokio::test]
+async fn unbounded_limit_does_not_overflow_the_bind() {
+    let store = DuckdbStore::in_memory(common::DIMS, "test-model").unwrap();
+    let s = ImportedSession {
+        id: "s1".into(),
+        source: "claude:/tmp/x.jsonl".into(),
+        imported_at: 100,
+        message_count: 10,
+        project: Some("memory-rs".into()),
+        items_written: 3,
+        status: SessionStatus::Imported,
+        last_error: None,
+    };
+    store.record_session(&s).await.unwrap();
+    store
+        .append_memory(&fact("m1", "a fact", 1), None)
+        .await
+        .unwrap();
+
+    // Every query that binds a LIMIT, at the limit callers actually pass.
+    let sessions = store.list_sessions(None, usize::MAX).await.unwrap();
+    assert_eq!(sessions.len(), 1);
+
+    let scoped = store
+        .list_sessions_by_status(SessionStatus::Imported, None, usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(scoped.len(), 1);
+
+    let recency = store
+        .list_memories_by_recency(None, usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(recency.len(), 1);
+
+    let keyword = store
+        .search_memories_keyword("fact", None, usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(keyword.len(), 1);
+}
+
 #[tokio::test]
 async fn namespaces_round_trip() {
     let store = DuckdbStore::in_memory(common::DIMS, "test-model").unwrap();

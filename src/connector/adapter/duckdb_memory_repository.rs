@@ -441,13 +441,17 @@ impl MemoryRepository for DuckdbStore {
              ORDER BY score DESC LIMIT ?",
             d = self.dimensions,
         );
-        // Bind order: scope projects, then limit.
-        let mut ordered: Vec<String> = scope_params;
-        ordered.push(limit.to_string());
-
+        // Bind order: scope projects, then limit. The limit binds as a real
+        // integer, not text: DuckDB coerces a bound string to the column type,
+        // and callers pass `usize::MAX` to mean "no limit", which overflows
+        // INT64 as the string "18446744073709551615".
         let conn = self.conn.lock().await;
-        let params_ref: Vec<&dyn duckdb::ToSql> =
-            ordered.iter().map(|s| s as &dyn duckdb::ToSql).collect();
+        let mut params_ref: Vec<&dyn duckdb::ToSql> = scope_params
+            .iter()
+            .map(|s| s as &dyn duckdb::ToSql)
+            .collect();
+        let limit = sql_limit(limit);
+        params_ref.push(&limit);
         let out = query_collect(
             &conn,
             &sql,
@@ -494,10 +498,9 @@ impl MemoryRepository for DuckdbStore {
         }
         let scope = project_scope_clause(projects, "project", &mut scope_params);
         // Bind order follows the SQL's textual order: terms, then scope
-        // projects, then limit.
+        // projects, then limit (bound as an integer — see `search_by_vector`).
         let mut ordered_params: Vec<String> = terms.clone();
         ordered_params.extend(scope_params);
-        ordered_params.push(limit.to_string());
 
         let sql = format!(
             "SELECT {MEMORY_COLUMNS}, 1.0 AS score \
@@ -506,10 +509,12 @@ impl MemoryRepository for DuckdbStore {
              ORDER BY recorded_at DESC LIMIT ?"
         );
         let conn = self.conn.lock().await;
-        let params_ref: Vec<&dyn duckdb::ToSql> = ordered_params
+        let mut params_ref: Vec<&dyn duckdb::ToSql> = ordered_params
             .iter()
             .map(|s| s as &dyn duckdb::ToSql)
             .collect();
+        let limit = sql_limit(limit);
+        params_ref.push(&limit);
         let out = query_collect(
             &conn,
             &sql,
@@ -543,13 +548,15 @@ impl MemoryRepository for DuckdbStore {
             "SELECT {MEMORY_COLUMNS} FROM memories WHERE TRUE{scope} \
              ORDER BY recorded_at DESC LIMIT ?"
         );
-        // Bind order: scope projects, then limit.
-        let mut ordered: Vec<String> = scope_params;
-        ordered.push(limit.to_string());
-
+        // Bind order: scope projects, then limit (bound as an integer — see
+        // `search_by_vector`).
         let conn = self.conn.lock().await;
-        let params_ref: Vec<&dyn duckdb::ToSql> =
-            ordered.iter().map(|s| s as &dyn duckdb::ToSql).collect();
+        let mut params_ref: Vec<&dyn duckdb::ToSql> = scope_params
+            .iter()
+            .map(|s| s as &dyn duckdb::ToSql)
+            .collect();
+        let limit = sql_limit(limit);
+        params_ref.push(&limit);
         let out = query_collect(
             &conn,
             &sql,
@@ -879,17 +886,21 @@ async fn list_sessions_inner(
              WHERE TRUE{status_clause}{scope} \
              ORDER BY imported_at DESC LIMIT ?"
     );
-    // Bind order: status (if any), scope projects, limit.
+    // Bind order: status (if any), scope projects, limit. The limit binds as a
+    // real integer, not text: DuckDB coerces a bound string to the column type,
+    // and callers pass `usize::MAX` to mean "no limit", which overflows INT64
+    // as the string "18446744073709551615" and failed the whole query.
     let mut ordered: Vec<String> = Vec::new();
     if let Some(s) = status {
         ordered.push(s.as_str().to_string());
     }
     ordered.extend(params);
-    ordered.push(limit.to_string());
 
     let conn = store.conn.lock().await;
-    let params_ref: Vec<&dyn duckdb::ToSql> =
+    let mut params_ref: Vec<&dyn duckdb::ToSql> =
         ordered.iter().map(|s| s as &dyn duckdb::ToSql).collect();
+    let limit = sql_limit(limit);
+    params_ref.push(&limit);
     query_collect(&conn, &sql, &params_ref, session_from_row, "list sessions")
 }
 
@@ -1028,6 +1039,24 @@ fn vector_literal(vector: &[f32]) -> String {
 
 /// Prepare `sql`, bind `params`, and collect every row through `decode`.
 ///
+/// The largest `LIMIT` DuckDB's binder accepts (2^62). Anything above this is
+/// rejected with "Max value … for LIMIT/OFFSET is 4611686018427387904".
+const MAX_SQL_LIMIT: i64 = 4_611_686_018_427_387_904;
+
+/// A `LIMIT` value DuckDB will accept.
+///
+/// Callers spell "no limit" as `usize::MAX`, which survives none of the obvious
+/// spellings: bound as text it overflows INT64 during coercion, cast to `i64`
+/// it wraps to -1 (a negative LIMIT is rejected), and even `i64::MAX` is past
+/// the binder's own ceiling. Clamping keeps the sentinel meaning "everything"
+/// while staying inside the range DuckDB will take — 2^62 rows is unreachable
+/// for any real store.
+fn sql_limit(limit: usize) -> i64 {
+    i64::try_from(limit)
+        .unwrap_or(MAX_SQL_LIMIT)
+        .min(MAX_SQL_LIMIT)
+}
+
 /// Every read method on this adapter used to spell the same six lines of
 /// prepare/query/loop inline; the shape was identical, only the SQL, the
 /// binds, and the row decoder varied. One helper keeps the variations

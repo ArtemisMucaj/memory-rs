@@ -131,10 +131,7 @@ impl ImportScreen {
         // Read the imported set off-thread and feed each id back as an
         // AlreadyImported marker.
         tokio::spawn(async move {
-            // A large-but-finite cap rather than `usize::MAX`: the SQL binds
-            // `limit` as text, and an oversized number can confuse the
-            // adapter's type coercion. 10k is far past any realistic store.
-            if let Ok(sessions) = repo.list_sessions(None, 10_000).await {
+            if let Ok(sessions) = repo.list_sessions(None, usize::MAX).await {
                 for s in sessions {
                     let _ = events_tx.send(ImportEvent::AlreadyImported(s.id));
                 }
