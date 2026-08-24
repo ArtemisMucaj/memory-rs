@@ -80,6 +80,8 @@ Drop and recreate `memory.duckdb`. **No migration.** New tables:
 - `entities` — id, entity_type, canonical_name, created_at, updated_at.
 - `entity_names` — (entity_id, name, name_key) for alias resolution.
 - `memory_embeddings` — (memory_id, embedding VECTOR).
+- `memory_resources` — (uri, source, name, content, created_at) with the
+  embedding in a side table `memory_resource_embeddings(uri, vector)`.
 - `memory_sessions` — unchanged from current.
 - `memory_meta` — schema version.
 
@@ -103,12 +105,27 @@ Optional `project` filter. No kind filter (only one kind). No tree traversal.
 
 ### MCP tools
 
-Three tools:
-- `memory_recall(query, project?, limit?)` — flat list of facts.
-- `memory_entity(name)` — entity drill-down: canonical entity + all facts
-  where it appears as subject or object.
-- `memory_sessions(limit?)` — recent sessions.
-- `memory_resume(project?)` — existing resume briefing, kept.
+Tool names stay — external clients depend on them. Internals are reimplemented
+over the new model and some parameters become no-ops:
+
+- `search_memories(query, limit, kind?, project?, namespace?)` — `kind` accepted
+  but ignored (only `Fact` exists). Returns flat facts ranked by
+  RRF(cosine, recency). No more `provenance` block (no edges).
+- `list_memories(kind?, status?)` — both parameters accepted, both ignored.
+  Returns all memories newest first.
+- `resume_work(project?, namespace?, limit?)` — unchanged.
+- `read_memory(id)` — returns the memory, no `edges` array. `memory://` URI
+  form is accepted for resources only (returns the resource row); sessions and
+  the old memory digest return not_found.
+- `browse_memory(uri?)` — kept as a thin listing over the three remaining
+  roots: `memory://memory` (fact count), `memory://sessions` (recent
+  sessions), `memory://resources` (stored resources). No L0/L1/L2 abstracts.
+- `forget_memory(id)` — hard delete now. Returns `{ "deleted": true }`.
+- `add_resource(source, name?)` — kept, backed by a new minimal
+  `memory_resources(uri, source, name, content, content_embedding, created_at)`
+  table. No L0/L1/L2 abstracts — content is embedded raw and returned with the
+  same RRF(cosine, recency) ranking as memories, just in a separate tool.
+- `list_namespaces`, `create_namespace`, `assign_project` — unchanged.
 
 ### Dream cycle
 
