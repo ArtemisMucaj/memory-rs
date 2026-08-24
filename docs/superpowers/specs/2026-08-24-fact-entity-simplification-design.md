@@ -80,8 +80,9 @@ Drop and recreate `memory.duckdb`. **No migration.** New tables:
 - `entities` — id, entity_type, canonical_name, created_at, updated_at.
 - `entity_names` — (entity_id, name, name_key) for alias resolution.
 - `memory_embeddings` — (memory_id, embedding VECTOR).
-- `memory_resources` — (uri, source, name, content, created_at) with the
-  embedding in a side table `memory_resource_embeddings(uri, vector)`.
+- `memory_resources` — (uri, source, name, abstract, overview, content,
+  created_at) with the embedding (over `abstract + overview`) in
+  `memory_resource_embeddings(uri, vector)`.
 - `memory_sessions` — unchanged from current.
 - `memory_meta` — schema version.
 
@@ -122,9 +123,11 @@ over the new model and some parameters become no-ops:
   sessions), `memory://resources` (stored resources). No L0/L1/L2 abstracts.
 - `forget_memory(id)` — hard delete now. Returns `{ "deleted": true }`.
 - `add_resource(source, name?)` — kept, backed by a new minimal
-  `memory_resources(uri, source, name, content, content_embedding, created_at)`
-  table. No L0/L1/L2 abstracts — content is embedded raw and returned with the
-  same RRF(cosine, recency) ranking as memories, just in a separate tool.
+  `memory_resources(uri, source, name, abstract, overview, content, created_at)`
+  table. The LLM still writes both the one-line `abstract` (L0, used for
+  display + embedding) and the longer `overview` (L1, an orientation read
+  before deciding whether to open `content`). What goes away is the
+  `memory://` *tree* and the `MemoryNode` type, not the summaries.
 - `list_namespaces`, `create_namespace`, `assign_project` — unchanged.
 
 ### Dream cycle
