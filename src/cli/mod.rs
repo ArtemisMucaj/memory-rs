@@ -9,7 +9,6 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::application::DEFAULT_SESSION_LIMIT;
 use crate::connector::adapter::DEFAULT_EMBEDDING_DIMENSIONS;
-use crate::domain::{MemoryKind, NodeKind};
 
 /// clap needs a `const fn`-able default; the constant lives with the use case
 /// so the CLI, MCP and HTTP surfaces all brief over the same window.
@@ -18,7 +17,7 @@ const fn memory_rs_default_resume_limit() -> usize {
 }
 
 /// Long-term memory for coding assistants: import sessions, ingest durable
-/// memories, recall by hybrid search over an append-only memory graph.
+/// facts, recall by hybrid semantic+keyword+recency search.
 #[derive(Debug, Parser)]
 #[command(name = "memory-rs", version, about)]
 pub struct Cli {
@@ -27,8 +26,8 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub data_dir: Option<String>,
 
-    /// Embedding dimension the database is pinned to on first open. The default
-    /// matches the built-in LM Studio embedding model.
+    /// Embedding dimension the database is pinned to on first open. The
+    /// default matches the built-in LM Studio embedding model.
     #[arg(long, global = true, default_value_t = DEFAULT_EMBEDDING_DIMENSIONS)]
     pub embedding_dimensions: usize,
 
@@ -48,69 +47,26 @@ pub enum OutputFormat {
     Json,
 }
 
-/// A memory kind as a CLI value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum MemoryKindArg {
-    Preference,
-    Experience,
-    Skill,
-    Fact,
-}
-
-impl From<MemoryKindArg> for MemoryKind {
-    fn from(k: MemoryKindArg) -> Self {
-        match k {
-            MemoryKindArg::Preference => MemoryKind::Preference,
-            MemoryKindArg::Experience => MemoryKind::Experience,
-            MemoryKindArg::Skill => MemoryKind::Skill,
-            MemoryKindArg::Fact => MemoryKind::Fact,
-        }
-    }
-}
-
-/// A node kind as a CLI value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum NodeKindArg {
-    Memory,
-    Project,
-    Session,
-    Resource,
-}
-
-impl From<NodeKindArg> for NodeKind {
-    fn from(k: NodeKindArg) -> Self {
-        match k {
-            NodeKindArg::Memory => NodeKind::Memory,
-            NodeKindArg::Project => NodeKind::Project,
-            NodeKindArg::Session => NodeKind::Session,
-            NodeKindArg::Resource => NodeKind::Resource,
-        }
-    }
-}
-
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Import a finished session transcript and ingest memories from it.
+    /// Import a finished session transcript and extract facts from it.
     ///
     /// PATH is a Claude Code session log
-    /// (`~/.claude/projects/<project>/<id>.jsonl`) or a generic JSONL chat log
-    /// (`{"role": "...", "content": "..."}` per line). Ingestion calls the
-    /// configured LLM.
+    /// (`~/.claude/projects/<project>/<id>.jsonl`) or a generic JSONL chat
+    /// log (`{"role": "...", "content": "..."}` per line). Extraction calls
+    /// the configured LLM.
     Import {
         /// Path to a transcript file (JSONL).
         path: String,
 
         /// Re-import even if this session was already imported. This clears
-        /// the session's prior memories first — the one destructive operation in
-        /// the store.
+        /// the session's prior memories first — the one destructive
+        /// operation in the store.
         #[arg(short, long)]
         force: bool,
     },
 
-    /// Recall stored memories (hybrid semantic + keyword, then a graph walk).
-    ///
-    /// Only current memories are returned — superseded, retracted and unsettled
-    /// ones never surface.
+    /// Recall stored memories (RRF over semantic, keyword, and recency).
     Search {
         query: String,
 
@@ -118,17 +74,13 @@ pub enum Command {
         #[arg(long, default_value = "10")]
         num: usize,
 
-        /// Restrict to one memory kind.
-        #[arg(short, long, value_enum)]
-        kind: Option<MemoryKindArg>,
-
         /// Restrict to memories relevant in this project (its memories plus
         /// globals). Omit to search everything.
         #[arg(long)]
         project: Option<String>,
 
-        /// Restrict to a namespace: the union of its member projects' memories,
-        /// plus globals. Mutually exclusive with --project.
+        /// Restrict to a namespace: the union of its member projects'
+        /// memories, plus globals. Mutually exclusive with --project.
         #[arg(long, conflicts_with = "project")]
         namespace: Option<String>,
 
@@ -139,30 +91,26 @@ pub enum Command {
 
     /// List stored memories, newest first.
     List {
-        /// Restrict to one memory kind.
-        #[arg(short, long, value_enum)]
-        kind: Option<MemoryKindArg>,
+        /// Restrict to one project.
+        #[arg(long)]
+        project: Option<String>,
 
-        /// Lifecycle status: active (default), superseded, retracted, or all.
-        #[arg(long, default_value = "active")]
-        status: String,
+        /// Restrict to a namespace. Mutually exclusive with --project.
+        #[arg(long, conflicts_with = "project")]
+        namespace: Option<String>,
 
         /// Output format: text or json.
         #[arg(short = 'F', long, value_enum, default_value = "text")]
         format: OutputFormat,
     },
 
-    /// Show one memory with its typed edges, or a virtual-filesystem node.
+    /// Show one memory by id.
     Show {
-        /// A memory ID, or a `memory://` node URI (e.g. `memory://memory`,
-        /// `memory://sessions/<id>`).
+        /// A memory ID, or a `memory://resources/<name>` URI.
         id: String,
     },
 
-    /// Forget a memory: mark it as never having been true.
-    ///
-    /// The memory is retracted, not deleted — an append-only store keeps it for
-    /// provenance, and it simply stops being recalled.
+    /// Forget a memory: hard delete. There is no tombstone — the row is gone.
     Delete {
         /// A memory ID.
         id: String,
@@ -177,10 +125,6 @@ pub enum Command {
 
     /// Brief yourself on recent work: the latest sessions and what they left
     /// behind, so you can pick up where you stopped without re-explaining.
-    ///
-    /// Each entry is the session's summary, the arc of what happened, and the
-    /// durable memories it produced. No LLM call — every part was written when
-    /// the session was imported.
     Resume {
         /// Restrict to sessions worked in this project.
         #[arg(long)]
@@ -200,59 +144,39 @@ pub enum Command {
         format: OutputFormat,
     },
 
-    /// Add a resource (a file or a URL) to the memory virtual filesystem.
+    /// Add a resource (a file or a URL) to the memory store.
     ///
-    /// Fetches the content, generates an L0 abstract + L1 overview, and stores
-    /// it at `memory://resources/<name>` with the full text as L2. Uses the
-    /// configured LLM for the summary.
+    /// Fetches the content, generates a one-line abstract and a longer
+    /// overview, and stores it with the full text. Uses the configured LLM
+    /// for the summaries.
     Add {
         /// A local file path or an http(s):// URL.
         source: String,
 
-        /// Name (slug) for the resource node; derived from the source when
+        /// Name (slug) for the resource; derived from the source when
         /// omitted. Reusing a name overwrites that resource.
         #[arg(long)]
         name: Option<String>,
     },
 
-    /// Run one dream cycle: harvest finished sessions, then consolidate the
-    /// memory store.
+    /// Run one harvest cycle: import finished sessions.
     Dream {
         /// Minutes a session must be inactive to count as finished.
         #[arg(long, default_value = "60")]
         idle_minutes: u64,
     },
 
-    /// Browse the memory virtual filesystem (L0/L1 abstracts).
-    ///
-    /// With no URI, lists the top-level roots. With a directory URI, lists its
-    /// children with their one-line abstracts.
-    Tree {
-        /// Directory URI to list (e.g. `memory://sessions`). Omit for the root.
-        uri: Option<String>,
-
+    /// List entities known to the store, with their facts.
+    Entities {
         /// Output format: text or json.
         #[arg(short = 'F', long, value_enum, default_value = "text")]
         format: OutputFormat,
     },
 
-    /// Show memory-store statistics, including the unresolved-conflict count.
-    Stats {
-        /// Output format: text or json.
-        #[arg(short = 'F', long, value_enum, default_value = "text")]
-        format: OutputFormat,
-    },
-
-    /// List unresolved disagreements: pairs of memories that contradict each
-    /// other and are both still current.
-    ///
-    /// Both sides keep answering queries — nothing is hidden while a conflict
-    /// stands. The consolidation pass reconciles a pair by writing a new memory
-    /// that supersedes both, at which point it drops off this list.
-    Conflicts {
-        /// Output format: text or json.
-        #[arg(short = 'F', long, value_enum, default_value = "text")]
-        format: OutputFormat,
+    /// Show one entity with the facts that anchor to it.
+    Entity {
+        /// Entity name (or alias).
+        name: String,
     },
 
     /// Manage namespaces — cohesive groups of projects that focus retrieval
@@ -265,8 +189,8 @@ pub enum Command {
         command: NamespaceCommand,
     },
 
-    /// Serve the HTTP management API (and MCP over HTTP) so a native app or any
-    /// client can drive memory operations.
+    /// Serve the HTTP management API (and MCP over HTTP) so a native app or
+    /// any client can drive memory operations.
     Serve {
         /// Port to listen on.
         #[arg(long, default_value = "8766")]
@@ -281,7 +205,7 @@ pub enum Command {
     /// Run the MCP server over stdio (for direct assistant integration).
     Mcp,
 
-    /// Launch the interactive terminal UI (Memory browser + Import).
+    /// Launch the interactive terminal UI.
     Tui,
 }
 
@@ -293,7 +217,7 @@ pub enum NamespaceCommand {
         name: String,
     },
 
-    /// Delete a namespace and its project memberships (member items are kept).
+    /// Delete a namespace and its project memberships.
     Delete {
         /// Namespace name.
         name: String,

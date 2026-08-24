@@ -1,7 +1,7 @@
 //! Memory-specific adapters.
 //!
 //! Implements the port traits defined in the application layer:
-//! - [`DuckdbStore`] — DuckDB-backed [`NodeRepository`](crate::application::NodeRepository)
+//! - [`DuckdbStore`] — DuckDB-backed [`MemoryRepository`](crate::application::MemoryRepository)
 //! - [`LocalSessionDiscovery`] — session discovery over Claude/OpenCode/Zed stores
 //! - `parse_transcript_file` / `parse_transcript` — JSONL transcript parsing
 //! - `fetch_resource` — URL/file fetch with HTML-to-Markdown cleaning
@@ -21,7 +21,7 @@ pub mod mcp;
 /// Working-directory → project-name derivation, shared by session discovery
 /// and the transcript parser so both scope a session identically.
 mod project;
-mod resource_fetch;
+pub mod resource_fetch;
 mod session_discovery;
 mod transcript;
 

@@ -12,11 +12,11 @@ use serde_json::{json, Value};
 
 use super::error::{ApiError, ApiResult};
 use super::server::AppState;
-use crate::application::{MemoryRef, Recalled, DEFAULT_SESSION_LIMIT};
+use crate::application::{Recalled, DEFAULT_SESSION_LIMIT};
 use crate::connector::api::controller::{
     self, ForgetOutcome, MemorySearchOutcome, MemoryShowOutcome, ResumeOutcome, SearchScope,
 };
-use crate::domain::{Memory, MemoryKind, MemoryNode, MemoryStatus};
+use crate::domain::Memory;
 use std::collections::HashMap;
 
 /// `GET /health` — liveness + version.
@@ -31,11 +31,10 @@ pub async fn index() -> Json<Value> {
         "version": env!("CARGO_PKG_VERSION"),
         "endpoints": [
             "GET  /health",
-            "GET  /api/search?q=&kind=&project=&namespace=&limit=",
-            "GET  /api/memory?kind=&status=  (status: active|superseded|retracted|all; default active)",
-            "GET  /api/memory/{id}  -> {type: memory, memory, edges} | {type: node, node}",
-            "DELETE /api/memory/{id}  -> {retracted: true}",
-            "GET  /api/conflicts",
+            "GET  /api/search?q=&project=&namespace=&limit=",
+            "GET  /api/memory",
+            "GET  /api/memory/{id}  -> {type: memory, memory} | {type: resource, resource}",
+            "DELETE /api/memory/{id}  -> {deleted: true}",
             "GET  /api/entities",
             "GET  /api/entities/{id}",
             "GET  /api/tree?uri=",
@@ -45,7 +44,6 @@ pub async fn index() -> Json<Value> {
             "GET  /api/sessions/transcript?source=&id=",
             "POST /api/sessions/import  {source, id, force?}",
             "GET  /api/sessions/import",
-            "GET  /api/stats",
             "GET  /api/namespaces",
             "POST /api/namespaces  {name}",
             "DELETE /api/namespaces/{name}",
@@ -71,8 +69,6 @@ pub struct SearchParams {
     /// Query string (`q`).
     pub q: String,
     #[serde(default)]
-    pub kind: Option<String>,
-    #[serde(default)]
     pub project: Option<String>,
     #[serde(default)]
     pub namespace: Option<String>,
@@ -85,7 +81,6 @@ pub async fn search(
     State(state): State<AppState>,
     Query(params): Query<SearchParams>,
 ) -> ApiResult<Json<Value>> {
-    let kind = parse_kind(params.kind.as_deref())?;
     let scope = match (params.namespace, params.project) {
         (Some(ns), _) => SearchScope::Namespace(ns),
         (None, Some(p)) => SearchScope::Project(p),
@@ -93,7 +88,7 @@ pub async fn search(
     };
     let limit = params.limit.unwrap_or(10).min(100);
 
-    match controller::recall_memories(&state.container, &params.q, kind, &scope, limit).await? {
+    match controller::recall_memories(&state.container, &params.q, &scope, limit).await? {
         MemorySearchOutcome::Hits(hits) => {
             let found: Vec<Memory> = hits.iter().map(|h| h.memory.clone()).collect();
             let labels = controller::entity_labels(&state.container, &found).await?;
@@ -114,26 +109,32 @@ pub async fn search(
 #[derive(Debug, Deserialize)]
 pub struct ListParams {
     #[serde(default)]
-    pub kind: Option<String>,
-    /// Lifecycle status. Defaults to `active`; pass `all` for the full log
-    /// including history. Unresolved conflicts live at `GET /api/conflicts`,
-    /// not behind a status — both sides of a disagreement stay active.
+    pub project: Option<String>,
     #[serde(default)]
-    pub status: Option<String>,
+    pub namespace: Option<String>,
 }
 
-/// `GET /api/memory` — list memories, optionally filtered by kind and status.
-///
-/// Defaults to `active` rather than every status: the log holds superseded and
-/// retracted memories forever, and a client that rendered the raw list would show
-/// a user things the store has already decided are not true.
+/// `GET /api/memory` — list memories, newest first.
 pub async fn list_memories(
     State(state): State<AppState>,
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<Value>> {
-    let kind = parse_kind(params.kind.as_deref())?;
-    let status = parse_status(params.status.as_deref())?;
-    let memories = controller::list_memories(&state.container, kind, status).await?;
+    let scope = match (params.namespace, params.project) {
+        (Some(ns), _) => SearchScope::Namespace(ns),
+        (None, Some(p)) => SearchScope::Project(p),
+        (None, None) => SearchScope::All,
+    };
+    let projects = match controller::resolve_scope(&state.container, &scope).await? {
+        controller::ScopeResolution::All => None,
+        controller::ScopeResolution::Projects(p) => Some(p),
+        controller::ScopeResolution::EmptyNamespace(ns) => {
+            return Ok(Json(json!({
+                "memories": [],
+                "note": format!("namespace '{ns}' has no member projects"),
+            })));
+        }
+    };
+    let memories = controller::list_memories(&state.container, projects.as_deref()).await?;
     let labels = controller::entity_labels(&state.container, &memories).await?;
     let rendered: Vec<Value> = memories
         .iter()
@@ -142,18 +143,26 @@ pub async fn list_memories(
     Ok(Json(json!({ "memories": rendered })))
 }
 
-/// `GET /api/memory/{id}` — show a memory with its edges, or a node URI.
+/// `GET /api/memory/{id}` — show a memory, or a resource URI.
 pub async fn show(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     match controller::show_memory(&state.container, &id).await? {
-        MemoryShowOutcome::Node(node) => {
-            Ok(Json(json!({ "type": "node", "node": node_json(&node) })))
-        }
-        MemoryShowOutcome::Memory { memory, edges } => {
+        MemoryShowOutcome::Resource(resource) => Ok(Json(json!({
+            "type": "resource",
+            "resource": {
+                "uri": resource.uri,
+                "source": resource.source,
+                "name": resource.name,
+                "abstract": resource.abstract_,
+                "overview": resource.overview,
+                "content": resource.content,
+                "created_at": resource.created_at,
+            }
+        }))),
+        MemoryShowOutcome::Memory(memory) => {
             let labels = controller::entity_labels(&state.container, &[*memory.clone()]).await?;
             Ok(Json(json!({
                 "type": "memory",
                 "memory": memory_json(&memory, &labels, None),
-                "edges": edges,
             })))
         }
         MemoryShowOutcome::NotFound => Err(ApiError::from(crate::domain::DomainError::not_found(
@@ -162,18 +171,13 @@ pub async fn show(State(state): State<AppState>, Path(id): Path<String>) -> ApiR
     }
 }
 
-/// `DELETE /api/memory/{id}` — retract a memory.
-///
-/// The response says `retracted`, not `deleted`, because nothing is removed:
-/// the memory stays in the log with `status = retracted` and simply stops
-/// answering queries. A client that showed "deleted" would be lying about what
-/// it just did.
+/// `DELETE /api/memory/{id}` — hard-delete a memory.
 pub async fn delete(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
     match controller::forget_memory(&state.container, &id).await? {
-        ForgetOutcome::Retracted => Ok(Json(json!({ "retracted": true }))),
+        ForgetOutcome::Deleted => Ok(Json(json!({ "deleted": true }))),
         ForgetOutcome::NotFound => Err(ApiError::from(crate::domain::DomainError::not_found(
             format!("no memory '{id}'"),
         ))),
@@ -210,10 +214,6 @@ pub async fn entity(
             "canonical_name": entity.canonical_name,
             "entity_type": entity.entity_type,
             "names": entity.names,
-            // Same shape as the list endpoint, deliberately. A client decoding
-            // both into one type would otherwise fail on the detail response
-            // for a field it never needed — and a lenient client would just
-            // render an empty pane instead.
             "memory_count": memories.len(),
             "created_at": entity.created_at,
             "updated_at": entity.updated_at,
@@ -227,33 +227,19 @@ fn entity_json(summary: &controller::EntitySummary) -> Value {
         "id": summary.entity.id,
         "canonical_name": summary.entity.canonical_name,
         "entity_type": summary.entity.entity_type,
-        // Every name the entity answers to, canonical included. Under "known
-        // as" that reads correctly, and it is also the honest picture of what
-        // the lookup index holds.
         "names": summary.entity.names,
         "memory_count": summary.memory_count,
     })
 }
 
-/// `GET /api/conflicts` — unresolved disagreements, both sides still active.
-pub async fn conflicts(State(state): State<AppState>) -> ApiResult<Json<Value>> {
-    let conflicts = controller::memory_conflicts(&state.container).await?;
-    let list: Vec<Value> = conflicts
-        .iter()
-        .map(|c| json!({ "recorded_at": c.recorded_at, "a": c.a, "b": c.b }))
-        .collect();
-    Ok(Json(json!({ "conflicts": list })))
-}
-
-/// `GET /api/tree` — list a directory's children (root when `uri` is omitted).
+/// `GET /api/tree` — list sessions and resources (the old L0/L1/L2 tree is
+/// gone; this is the minimum that still answers "what is in here").
 pub async fn tree(
     State(state): State<AppState>,
     Query(params): Query<TreeParams>,
 ) -> ApiResult<Json<Value>> {
     let nodes = controller::tree(&state.container, params.uri.as_deref()).await?;
-    Ok(Json(json!({
-        "nodes": nodes.iter().map(node_json).collect::<Vec<_>>(),
-    })))
+    Ok(Json(json!({ "nodes": nodes })))
 }
 
 /// `GET /api/sessions` — imported sessions.
@@ -272,8 +258,8 @@ pub struct ResumeParams {
     pub limit: Option<usize>,
 }
 
-/// `GET /api/resume` — recent work in scope: the latest sessions, what each was
-/// about, and the memories it produced.
+/// `GET /api/resume` — recent work in scope: the latest sessions, what each
+/// was about, and the memories it produced.
 pub async fn resume(
     State(state): State<AppState>,
     Query(params): Query<ResumeParams>,
@@ -296,8 +282,6 @@ pub async fn resume(
                     "project": recap.session.project,
                     "imported_at": recap.session.imported_at,
                     "message_count": recap.session.message_count,
-                    "summary": recap.summary,
-                    "overview": recap.overview,
                     "memories": recap
                         .memories
                         .iter()
@@ -316,26 +300,6 @@ pub async fn resume(
             "note": format!("namespace '{ns}' has no member projects"),
         }))),
     }
-}
-
-/// `GET /api/stats` — store statistics.
-pub async fn stats(State(state): State<AppState>) -> ApiResult<Json<Value>> {
-    let stats = controller::stats(&state.container).await?;
-    let memories = controller::memory_stats(&state.container).await?;
-    Ok(Json(json!({
-        "total_memories": memories.total_memories,
-        "memories_by_kind": memories.memories_by_kind,
-        // Everything outside `active` is history: superseded links and
-        // retractions. Unresolved conflicts are not a status — see
-        // `GET /api/conflicts`.
-        "memories_by_status": memories.memories_by_status,
-        "total_entities": memories.total_entities,
-        "total_edges": memories.total_edges,
-        "total_sessions": stats.total_sessions,
-        "total_nodes": stats.total_nodes,
-        "nodes_by_kind": stats.nodes_by_kind,
-        "data_dir": state.container.data_dir(),
-    })))
 }
 
 // ── Namespaces ───────────────────────────────────────────────────────────────
@@ -428,14 +392,8 @@ pub async fn import(
             "session_id": session.id,
             "message_count": session.message_count,
             "memories_written": report.memories_written,
-            "memories_corroborated": report.memories_corroborated,
-            "memories_superseded": report.memories_superseded,
-            // Both sides of a contradiction stay recallable, so this is not a
-            // "something went missing" counter — it is how much disagreement
-            // this session introduced for consolidation to reconcile.
-            "conflicts_recorded": report.conflicts_recorded,
+            "memories_deduped": report.memories_deduped,
             "entities_created": report.entities_created,
-            "edges_added": report.edges_added,
         }),
         ImportOutcome::AlreadyImported { session } => json!({
             "imported": false,
@@ -460,109 +418,29 @@ pub async fn add_resource(
     let added =
         controller::add_resource(&state.container, &body.source, body.name.as_deref()).await?;
     Ok(Json(json!({
-        "uri": added.node.uri(),
+        "uri": added.resource.uri,
         "source": added.source,
         "chars": added.chars,
-        "abstract": added.node.abstract_(),
+        "abstract": added.resource.abstract_,
     })))
 }
 
-// `POST /api/dream` used to run a cycle synchronously here. It now lives in
-// `dream_routes`, which starts the cycle in the background and returns 202 — a
-// full consolidation is many minutes of LLM calls, far too long to hold an HTTP
-// connection open. The synchronous path is still the CLI's `memory-rs dream`,
-// which goes through `controller::dream` directly.
-
 // ── JSON helpers ─────────────────────────────────────────────────────────────
 
-/// A search hit with a **compact** provenance summary.
-///
-/// Search returns many rows, and a full supersession chain per row would bury
-/// the answers in their own history. Counts plus the live disagreements are
-/// enough for a client to badge a result; `GET /api/memory/{id}` carries the
-/// full path for the one the user then opens.
+/// A search hit with its fused score.
 fn memory_with_score(hit: &Recalled, labels: &HashMap<String, String>) -> Value {
-    let mut value = memory_json(&hit.memory, labels, Some(hit.score));
-    if let Some(obj) = value.as_object_mut() {
-        obj.insert(
-            "provenance".to_string(),
-            json!({
-                "supersedes_count": hit.provenance.supersedes.len(),
-                "chain_truncated": hit.provenance.chain_truncated,
-                "corroborations": hit.provenance.corroborations,
-                "contradicted_by": hit.provenance.contradicted_by
-                    .iter().map(memory_ref_json).collect::<Vec<_>>(),
-                "refinements_count": hit.provenance.refinements.len(),
-            }),
-        );
-    }
-    value
+    memory_json(&hit.memory, labels, Some(hit.score))
 }
 
-/// A memory as JSON, with its subject/object entity ids resolved to their
-/// canonical names.
-///
-/// The raw `subject`/`object` fields are left exactly as the domain has them —
-/// a client that wants the id still gets it — and the readable form is added
-/// alongside. Replacing them would strip information a caller may need to
-/// follow the graph.
+/// A memory as JSON, with its entity ids resolved to their canonical names.
 fn memory_json(memory: &Memory, labels: &HashMap<String, String>, score: Option<f32>) -> Value {
     let mut value = serde_json::to_value(memory).unwrap_or_default();
     if let Some(obj) = value.as_object_mut() {
-        if let Some(label) = controller::entity_ref_label(&memory.subject, labels) {
-            obj.insert("subject_label".to_string(), json!(label));
-        }
-        if let Some(label) = controller::entity_ref_label(&memory.object, labels) {
-            obj.insert("object_label".to_string(), json!(label));
-        }
+        let names = controller::entity_names_for(memory, labels);
+        obj.insert("entities".to_string(), json!(names));
         if let Some(score) = score {
             obj.insert("score".to_string(), json!(score));
         }
     }
     value
-}
-
-fn memory_ref_json(r: &MemoryRef) -> Value {
-    json!({ "id": r.id, "statement": r.statement, "recorded_at": r.recorded_at })
-}
-
-/// A node as JSON, masking the internal manifest of Project digest nodes.
-fn node_json(node: &MemoryNode) -> Value {
-    let content = if controller::node_has_visible_content(node) {
-        node.content()
-    } else {
-        ""
-    };
-    json!({
-        "uri": node.uri(),
-        "kind": node.kind().to_string(),
-        "abstract": node.abstract_(),
-        "overview": node.overview(),
-        "content": content,
-    })
-}
-
-/// Parse the `status` filter. Absent means `active`; the explicit string `all`
-/// is the only way to see the whole log, so history has to be asked for.
-fn parse_status(status: Option<&str>) -> ApiResult<Option<MemoryStatus>> {
-    match status {
-        None => Ok(Some(MemoryStatus::Active)),
-        Some(s) if s.eq_ignore_ascii_case("all") => Ok(None),
-        Some(s) => MemoryStatus::parse(s).map(Some).ok_or_else(|| {
-            ApiError::from(crate::domain::DomainError::invalid_input(format!(
-                "unknown memory status '{s}' (expected active, superseded, retracted, or all)"
-            )))
-        }),
-    }
-}
-
-fn parse_kind(kind: Option<&str>) -> ApiResult<Option<MemoryKind>> {
-    match kind {
-        None => Ok(None),
-        Some(k) => MemoryKind::parse(k).map(Some).ok_or_else(|| {
-            ApiError::from(crate::domain::DomainError::invalid_input(format!(
-                "unknown memory kind '{k}'"
-            )))
-        }),
-    }
 }

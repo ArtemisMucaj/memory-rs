@@ -6,10 +6,8 @@
 
 mod embedder;
 mod memory_repository;
-mod node_repository;
 mod session_discovery;
 
 pub use embedder::*;
 pub use memory_repository::*;
-pub use node_repository::*;
 pub use session_discovery::*;

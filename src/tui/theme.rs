@@ -16,11 +16,6 @@ pub const SELECTION_BG: Color = Color::Rgb(38, 40, 46);
 /// Dim grey for metadata (timestamps, counts, hints).
 pub const MUTED: Color = Color::DarkGray;
 
-/// Colour for something the store is knowingly unsure about — currently a live
-/// contradiction between two memories. Deliberately the only warm colour in the
-/// palette, so an unresolved disagreement reads as one at a glance.
-pub const WARN: Color = Color::Yellow;
-
 /// Colour for a session's source badge — matching the app:
 /// claude = magenta, opencode = green, zed (and anything else) = blue.
 pub fn source_color(source: &str) -> Color {
@@ -28,17 +23,6 @@ pub fn source_color(source: &str) -> Color {
         "claude" => Color::Magenta,
         "opencode" => Color::Green,
         _ => Color::Blue,
-    }
-}
-
-/// Accent colour for a memory kind label (`preference`, `skill`, …).
-pub fn kind_color(kind: &str) -> Color {
-    match kind {
-        "preference" => Color::Blue,
-        "experience" => Color::Magenta,
-        "skill" => Color::Green,
-        "fact" => Color::Yellow,
-        _ => Color::Cyan,
     }
 }
 
