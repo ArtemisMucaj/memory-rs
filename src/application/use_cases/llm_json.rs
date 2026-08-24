@@ -4,21 +4,14 @@
 //! it in prose or a markdown fence, and small local models emit escapes that
 //! are valid Markdown but illegal JSON (`\_`, `\(`) plus raw newlines inside
 //! string literals — all of which strict `serde_json` rejects outright.
-//! [`extract_json_object`] and [`repair_json_string_escapes`] are the tolerant
-//! recovery pass every one of those call sites needs; defining them once means
-//! a model quirk gets fixed in one place instead of in each parser separately.
-//! [`normalize_name`] sits with them for the same reason: model-supplied names
-//! arrive in whatever shape the model felt like, and every writer must agree on
-//! the canonical form or the same memory lands twice under two spellings.
+//! [`extract_json_object`] and [`repair_json_string_escapes`] are the
+//! tolerant recovery pass every one of those call sites needs; defining them
+//! once means a model quirk gets fixed in one place instead of in each
+//! parser separately.
 //!
 //! [`unix_now`] is not JSON and does not belong here on merit. It is here
-//! because it shares a fate: its previous home is one of the modules the
-//! memory-graph migration deletes, every use case needs a clock, and four lines
-//! do not justify a module of their own. Saying that plainly beats pretending
-//! the grouping is tighter than it is.
-
-/// Maximum length of a normalized item name.
-const MAX_NAME_CHARS: usize = 64;
+//! because every use case needs a clock and four lines do not justify a
+//! module of their own.
 
 /// Repair invalid backslash escapes inside JSON string literals.
 ///
@@ -99,28 +92,6 @@ pub(crate) fn extract_json_object(text: &str) -> Option<&str> {
         }
     }
     None
-}
-
-/// Normalize an item name to lowercase snake_case; `None` when empty.
-pub(crate) fn normalize_name(raw: &str) -> Option<String> {
-    let name: String = raw
-        .trim()
-        .to_lowercase()
-        .chars()
-        .map(|c| {
-            if c.is_whitespace() || c == '-' {
-                '_'
-            } else {
-                c
-            }
-        })
-        .filter(|c| c.is_alphanumeric() || *c == '_')
-        .collect();
-    let name = name.trim_matches('_').to_string();
-    if name.is_empty() {
-        return None;
-    }
-    Some(name.chars().take(MAX_NAME_CHARS).collect())
 }
 
 /// Current Unix time in seconds.
@@ -205,35 +176,6 @@ mod tests {
         assert_eq!(extract_json_object("I cannot help with that"), None);
         // An opening brace that never closes is not a usable object either.
         assert_eq!(extract_json_object(r#"{"a": 1"#), None);
-    }
-
-    #[test]
-    fn normalizes_names_to_snake_case() {
-        assert_eq!(normalize_name("Rust Style"), Some("rust_style".to_string()));
-        assert_eq!(
-            normalize_name("  Prefers-Tabs!  "),
-            Some("prefers_tabs".to_string())
-        );
-        assert_eq!(
-            normalize_name("Already_Snake"),
-            Some("already_snake".to_string())
-        );
-    }
-
-    #[test]
-    fn normalize_name_rejects_names_that_reduce_to_nothing() {
-        // Punctuation-only model output must be skipped, not stored under an
-        // empty name that no lookup can ever address.
-        assert_eq!(normalize_name(""), None);
-        assert_eq!(normalize_name("   "), None);
-        assert_eq!(normalize_name("!!!"), None);
-        assert_eq!(normalize_name("___"), None);
-    }
-
-    #[test]
-    fn normalize_name_truncates_runaway_names() {
-        let long = normalize_name(&"a".repeat(MAX_NAME_CHARS * 2)).unwrap();
-        assert_eq!(long.chars().count(), MAX_NAME_CHARS);
     }
 
     #[test]

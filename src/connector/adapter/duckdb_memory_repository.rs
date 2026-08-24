@@ -1,87 +1,67 @@
 //! DuckDB-backed [`MemoryRepository`](crate::application::MemoryRepository).
 //!
-//! Implemented **on [`DuckdbStore`]** rather than as a second store,
-//! so memories, nodes, sessions and namespaces all share one connection to one
-//! `memory.duckdb`. A separate handle would mean two writers on one file, and
-//! DuckDB allows a single writer — the lock conflict that produces is a startup
-//! failure the desktop app has to explain to a user.
+//! Implemented on [`DuckdbStore`] rather than as a second store, so memories,
+//! sessions and namespaces all share one connection to one `memory.duckdb`.
 //!
-//! Storage conventions are inherited from the memory adapter rather than
-//! reinvented: vectors are `FLOAT[dimensions]` literals scanned with
-//! `array_cosine_distance`, read back through `to_json(...)::VARCHAR` (duckdb-rs
-//! cannot fetch fixed-width arrays natively), and global scope is the **empty
-//! string**, never `NULL` — SQL treats `NULL`s as distinct, which is precisely
-//! how the item store once ended up holding the same memory twice.
+//! Storage conventions: vectors are `FLOAT[dimensions]` literals scanned with
+//! `array_cosine_distance`, and global scope is the **empty string**, never
+//! `NULL` — SQL treats `NULL`s as distinct, which is precisely how the
+//! store would otherwise end up holding the same global memory twice.
+//!
+//! The memory↔entity link is a join table (`memory_entities`), not a column
+//! pair: a memory mentions zero or more entities, and an entity is mentioned
+//! by zero or more memories.
 
 use async_trait::async_trait;
-use duckdb::{params, Row};
+use duckdb::{params, Connection, Row};
 
 use crate::application::MemoryRepository;
 use crate::domain::{
-    entity_name_key, DomainError, EdgeOrigin, EdgeType, Entity, EntityRef, Memory, MemoryEdge,
-    MemoryKind, MemoryStatus, MemoryStoreStats, Predicate, SourceKind,
+    entity_name_key, DomainError, Entity, ImportedSession, Memory, MemoryKind, MemoryResource,
+    SessionStatus, SourceKind,
 };
 
 use super::duckdb_store::{
-    project_from_column, project_scope_clause, project_to_column, sql_quote, DuckdbStore,
+    project_from_column, project_scope_clause, project_to_column, DuckdbStore,
 };
 
-/// Memory columns in DDL order. [`memory_from_row`] reads by position, so the two
-/// must stay in lockstep — the indices there are annotated with these names.
-const MEMORY_COLUMNS: &str = "id, kind, subject_entity_id, subject_literal, predicate, \
-     object_entity_id, object_literal, statement, project, recorded_at, valid_from, valid_to, \
-     source_session_id, source_message_index, source_kind, confidence, status, derived, \
-     derived_from";
+/// Memory columns in DDL order. [`memory_from_row`] reads by position, so
+/// the two must stay in lockstep.
+const MEMORY_COLUMNS: &str = "id, kind, statement, project, recorded_at, \
+     source_session_id, source_message_index, source_kind, confidence";
 
 /// Number of columns in [`MEMORY_COLUMNS`], and therefore the position of the
 /// `score` column the two search queries append after them.
-///
-/// Kept as a named constant rather than a literal because adding a column
-/// shifts every index in [`memory_from_row`] *and* the score index in both
-/// search legs — and a stale score index reads a memory field as a float instead
-/// of failing, which is a silently wrong ranking rather than an error. The
-/// count is checked against the string itself in the tests below.
-const MEMORY_COLUMN_COUNT: usize = 19;
+const MEMORY_COLUMN_COUNT: usize = 9;
 
 const ENTITY_COLUMNS: &str = "id, entity_type, canonical_name, created_at, updated_at";
 
-/// Number of columns in [`ENTITY_COLUMNS`]; the score index for
-/// `search_entities_semantic`, for the same reason as [`MEMORY_COLUMN_COUNT`].
-const ENTITY_COLUMN_COUNT: usize = 5;
+const RESOURCE_COLUMNS: &str = "uri, source, name, abstract, overview, content, created_at";
+const RESOURCE_COLUMN_COUNT: usize = 7;
 
-const EDGE_COLUMNS: &str = "from_memory, to_memory, edge_type, created_at, created_by, confidence";
+const SESSION_COLUMNS: &str =
+    "id, source, imported_at, message_count, items_written, status, last_error, project";
 
-/// Most query terms honoured by keyword search (mirrors the item store).
+/// Most query terms honoured by keyword search.
 const MAX_KEYWORD_TERMS: usize = 16;
 
 fn memory_from_row(row: &Row<'_>) -> Result<Memory, duckdb::Error> {
-    // An unparseable enum falls back rather than failing the read: a row written
-    // by a newer build must not make the whole store unreadable by an older one.
+    // An unparseable enum falls back rather than failing the read: a row
+    // written by a newer build must not make the whole store unreadable by
+    // an older one.
     let kind: String = row.get(1)?;
-    let source_kind: String = row.get(14)?;
-    let status: String = row.get(16)?;
-    let derived_from: String = row.get(18)?;
-    let predicate: String = row.get(4)?;
+    let source_kind: String = row.get(7)?;
     Ok(Memory {
-        id: row.get(0)?,                                            // 0  id
-        kind: MemoryKind::parse(&kind).unwrap_or(MemoryKind::Fact), // 1  kind
-        subject: EntityRef::from_columns(row.get(2)?, row.get(3)?), // 2,3 subject
-        // Falls back to the escape hatch rather than failing the read: a row
-        // written by a build with a wider vocabulary must stay readable.
-        predicate: Predicate::parse(&predicate).unwrap_or(Predicate::RelatesTo), // 4 predicate
-        object: EntityRef::from_columns(row.get(5)?, row.get(6)?),               // 5,6 object
-        statement: row.get(7)?,                                                  // 7  statement
-        project: project_from_column(row.get::<_, String>(8)?),                  // 8  project
-        recorded_at: row.get(9)?,                                                // 9  recorded_at
-        valid_from: row.get(10)?,                                                // 10 valid_from
-        valid_to: row.get(11)?,                                                  // 11 valid_to
-        source_session_id: row.get(12)?,    // 12 source_session_id
-        source_message_index: row.get(13)?, // 13 source_message_index
-        source_kind: SourceKind::parse(&source_kind).unwrap_or(SourceKind::AssistantInferred), // 14
-        confidence: row.get::<_, f64>(15)? as f32, // 15 confidence
-        status: MemoryStatus::parse(&status).unwrap_or(MemoryStatus::Active), // 16 status
-        derived: row.get(17)?,              // 17 derived
-        derived_from: serde_json::from_str(&derived_from).unwrap_or_default(), // 18 derived_from
+        id: row.get(0)?,                                                               // 0 id
+        kind: MemoryKind::parse(&kind).unwrap_or(MemoryKind::Fact),                    // 1 kind
+        statement: row.get(2)?,                                 // 2 statement
+        entity_ids: Vec::new(), // filled by a second query; see `load_entity_ids`
+        project: project_from_column(row.get::<_, String>(3)?), // 3 project
+        recorded_at: row.get(4)?, // 4 recorded_at
+        source_session_id: row.get(5)?, // 5 source_session_id
+        source_message_index: row.get(6)?, // 6 source_message_index
+        source_kind: SourceKind::parse(&source_kind).unwrap_or(SourceKind::Extracted), // 7
+        confidence: row.get::<_, f64>(8)? as f32, // 8 confidence
     })
 }
 
@@ -96,392 +76,235 @@ fn entity_from_row(row: &Row<'_>) -> Result<Entity, duckdb::Error> {
     })
 }
 
-fn edge_from_row(row: &Row<'_>) -> Result<MemoryEdge, duckdb::Error> {
-    let edge_type: String = row.get(2)?;
-    let created_by: String = row.get(4)?;
-    Ok(MemoryEdge {
-        from_memory: row.get(0)?,
-        to_memory: row.get(1)?,
-        edge_type: EdgeType::parse(&edge_type).unwrap_or(EdgeType::RelatesTo),
-        created_at: row.get(3)?,
-        created_by: EdgeOrigin::parse(&created_by).unwrap_or(EdgeOrigin::Ingestion),
-        confidence: row.get::<_, f64>(5)? as f32,
+fn resource_from_row(row: &Row<'_>) -> Result<MemoryResource, duckdb::Error> {
+    Ok(MemoryResource {
+        uri: row.get(0)?,
+        source: row.get(1)?,
+        name: row.get(2)?,
+        abstract_: row.get(3)?,
+        overview: row.get(4)?,
+        content: row.get(5)?,
+        created_at: row.get(6)?,
     })
 }
 
-/// `IN ('a', 'b')` list from ids, or `None` when there is nothing to match.
-fn id_in_list(ids: &[String]) -> Option<String> {
-    if ids.is_empty() {
-        return None;
-    }
-    Some(
-        ids.iter()
-            .map(|id| format!("'{}'", sql_quote(id)))
-            .collect::<Vec<_>>()
-            .join(", "),
-    )
-}
-
-/// `AND <column> = '…'`, or empty when unfiltered. The column is passed in
-/// because the semantic search aliases the table, and rewriting a finished
-/// clause by string replacement would also hit any project *value* containing
-/// the column's name.
-fn kind_clause(column: &str, kind: Option<MemoryKind>) -> String {
-    match kind {
-        Some(k) => format!(" AND {column} = '{}'", k.as_str()),
-        None => String::new(),
-    }
-}
-
-/// `AND (<column> = '' OR <column> IN (…))`, or empty when unscoped.
-fn scope_clause(column: &str, projects: Option<&[String]>) -> String {
-    match project_scope_clause(column, projects) {
-        Some(clause) => format!(" AND {clause}"),
-        None => String::new(),
-    }
-}
-
-impl DuckdbStore {
-    /// Every name one entity goes by, ordered for stable output.
-    fn load_names(conn: &duckdb::Connection, id: &str) -> Result<Vec<String>, DomainError> {
-        let mut stmt = conn
-            .prepare("SELECT name FROM entity_names WHERE entity_id = ?1 ORDER BY name")
-            .map_err(|e| DomainError::storage(format!("Failed to prepare name query: {e}")))?;
-        let rows = stmt
-            .query_map(params![id], |row| row.get::<_, String>(0))
-            .map_err(|e| DomainError::storage(format!("Failed to query names: {e}")))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| DomainError::storage(format!("Failed to read names: {e}")))
-    }
+fn session_from_row(row: &Row<'_>) -> Result<ImportedSession, duckdb::Error> {
+    let status: String = row.get(5)?;
+    Ok(ImportedSession {
+        id: row.get(0)?,
+        source: row.get(1)?,
+        imported_at: row.get(2)?,
+        message_count: row.get::<_, i64>(3)? as usize,
+        items_written: row.get::<_, i64>(4)? as usize,
+        status: SessionStatus::parse(&status),
+        last_error: row.get(6)?,
+        project: row.get(7)?,
+    })
 }
 
 #[async_trait]
 impl MemoryRepository for DuckdbStore {
-    // ── Memories ───────────────────────────────────────────────────────────
+    // ── Memories ─────────────────────────────────────────────────────────
 
     async fn append_memory(
         &self,
         memory: &Memory,
         vector: Option<&[f32]>,
     ) -> Result<(), DomainError> {
-        let literal = vector.map(|v| self.vector_literal(v)).transpose()?;
-        let derived_from = serde_json::to_string(&memory.derived_from)
-            .map_err(|e| DomainError::storage(format!("Failed to encode derived_from: {e}")))?;
-        let conn = self.conn.lock().await;
+        // Validate before opening the transaction: a wrong-width vector must
+        // fail the call without having touched the store.
+        if let Some(vector) = vector {
+            if vector.len() != self.dimensions {
+                return Err(DomainError::invalid_input(format!(
+                    "vector width {} does not match pinned dimensions {}",
+                    vector.len(),
+                    self.dimensions
+                )));
+            }
+        }
+        let mut conn = self.conn.lock().await;
+        // Atomic: a crash between the row write and the link / embedding
+        // writes must not leave a memory without its entities. DuckDB's
+        // `Transaction` rolls back on drop if not committed.
+        let tx = conn
+            .transaction()
+            .map_err(|e| DomainError::storage(format!("failed to begin transaction: {e}")))?;
 
-        // Re-appending the same id replaces the row; the ingestion path always
-        // mints a fresh id, so this only fires on a deliberate rewrite.
-        conn.execute(
-            "DELETE FROM memory_embeddings WHERE memory_id = ?1",
-            params![memory.id],
-        )
-        .map_err(|e| DomainError::storage(format!("Failed to clear memory vector: {e}")))?;
-        conn.execute("DELETE FROM memories WHERE id = ?1", params![memory.id])
-            .map_err(|e| DomainError::storage(format!("Failed to clear memory: {e}")))?;
-
-        conn.execute(
+        tx.execute(
             &format!(
-                "INSERT INTO memories ({MEMORY_COLUMNS}) VALUES \
-                 (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)"
+                "INSERT OR REPLACE INTO memories ({MEMORY_COLUMNS}) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
             ),
             params![
                 memory.id,
                 memory.kind.as_str(),
-                memory.subject.entity_id(),
-                memory.subject.literal(),
-                memory.predicate.as_str(),
-                memory.object.entity_id(),
-                memory.object.literal(),
                 memory.statement,
                 project_to_column(memory.project.as_deref()),
                 memory.recorded_at,
-                memory.valid_from,
-                memory.valid_to,
                 memory.source_session_id,
                 memory.source_message_index,
                 memory.source_kind.as_str(),
                 memory.confidence as f64,
-                memory.status.as_str(),
-                memory.derived,
-                derived_from,
             ],
         )
-        .map_err(|e| DomainError::storage(format!("Failed to insert memory: {e}")))?;
+        .map_err(|e| DomainError::storage(format!("failed to append memory: {e}")))?;
 
-        if let Some(literal) = literal {
-            conn.execute(
-                &format!(
-                    "INSERT INTO memory_embeddings (memory_id, vector) VALUES (?1, {literal})"
-                ),
+        // Replace the entity links wholesale.
+        tx.execute(
+            "DELETE FROM memory_entities WHERE memory_id = ?",
+            params![memory.id],
+        )
+        .map_err(|e| DomainError::storage(format!("failed to clear memory entities: {e}")))?;
+        for entity_id in &memory.entity_ids {
+            tx.execute(
+                "INSERT OR IGNORE INTO memory_entities (memory_id, entity_id) VALUES (?, ?)",
+                params![memory.id, entity_id],
+            )
+            .map_err(|e| DomainError::storage(format!("failed to link memory to entity: {e}")))?;
+        }
+
+        tx.execute(
+            "DELETE FROM memory_embeddings WHERE memory_id = ?",
+            params![memory.id],
+        )
+        .map_err(|e| DomainError::storage(format!("failed to clear memory embedding: {e}")))?;
+        if let Some(vector) = vector {
+            let literal = vector_literal(vector);
+            tx.execute(
+                &format!("INSERT INTO memory_embeddings (memory_id, vector) VALUES (?, {literal})"),
                 params![memory.id],
             )
-            .map_err(|e| DomainError::storage(format!("Failed to insert memory vector: {e}")))?;
+            .map_err(|e| DomainError::storage(format!("failed to write memory embedding: {e}")))?;
         }
+
+        tx.commit()
+            .map_err(|e| DomainError::storage(format!("failed to commit memory write: {e}")))?;
         Ok(())
     }
 
     async fn find_memory(&self, id: &str) -> Result<Option<Memory>, DomainError> {
         let conn = self.conn.lock().await;
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT {MEMORY_COLUMNS} FROM memories WHERE id = ?1"
-            ))
-            .map_err(|e| DomainError::storage(format!("Failed to prepare memory query: {e}")))?;
-        let mut rows = stmt
-            .query_map(params![id], memory_from_row)
-            .map_err(|e| DomainError::storage(format!("Failed to query memory: {e}")))?;
-        match rows.next() {
-            Some(row) => Ok(Some(row.map_err(|e| {
-                DomainError::storage(format!("Failed to read memory: {e}"))
-            })?)),
-            None => Ok(None),
-        }
+        let sql = format!("SELECT {MEMORY_COLUMNS} FROM memories WHERE id = ?");
+        let out = query_collect(
+            &conn,
+            &sql,
+            &[&id as &dyn duckdb::ToSql],
+            memory_from_row,
+            "find memory",
+        )?;
+        let Some(memory) = out.into_iter().next() else {
+            return Ok(None);
+        };
+        let mut by_memory = load_entity_ids_for(&conn, std::slice::from_ref(&memory.id))?;
+        let entity_ids = by_memory.remove(&memory.id).unwrap_or_default();
+        Ok(Some(Memory {
+            entity_ids,
+            ..memory
+        }))
     }
 
     async fn find_memories(&self, ids: &[String]) -> Result<Vec<Memory>, DomainError> {
-        let Some(in_list) = id_in_list(ids) else {
+        if ids.is_empty() {
             return Ok(Vec::new());
-        };
+        }
+        let placeholders = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
         let conn = self.conn.lock().await;
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT {MEMORY_COLUMNS} FROM memories WHERE id IN ({in_list})"
-            ))
-            .map_err(|e| DomainError::storage(format!("Failed to prepare memory batch: {e}")))?;
-        let rows = stmt
-            .query_map([], memory_from_row)
-            .map_err(|e| DomainError::storage(format!("Failed to query memory batch: {e}")))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| DomainError::storage(format!("Failed to read memory batch: {e}")))
+        let sql = format!("SELECT {MEMORY_COLUMNS} FROM memories WHERE id IN ({placeholders})");
+        let params: Vec<&dyn duckdb::ToSql> = ids.iter().map(|s| s as &dyn duckdb::ToSql).collect();
+        let out = query_collect(&conn, &sql, &params, memory_from_row, "find memories")?;
+        attach_entity_ids(&conn, out)
     }
 
-    async fn list_memories(
-        &self,
-        kind: Option<MemoryKind>,
-        status: Option<MemoryStatus>,
-        projects: Option<&[String]>,
-    ) -> Result<Vec<Memory>, DomainError> {
-        let status_clause = match status {
-            Some(s) => format!(" AND status = '{}'", s.as_str()),
-            None => String::new(),
-        };
+    async fn list_memories(&self, projects: Option<&[String]>) -> Result<Vec<Memory>, DomainError> {
+        let mut scope_params: Vec<String> = Vec::new();
+        let scope = project_scope_clause(projects, "project", &mut scope_params);
         let sql = format!(
-            "SELECT {MEMORY_COLUMNS} FROM memories WHERE 1 = 1{}{}{} ORDER BY recorded_at DESC",
-            kind_clause("kind", kind),
-            status_clause,
-            scope_clause("project", projects),
+            "SELECT {MEMORY_COLUMNS} FROM memories WHERE TRUE{scope} ORDER BY recorded_at DESC"
         );
         let conn = self.conn.lock().await;
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| DomainError::storage(format!("Failed to prepare memory list: {e}")))?;
-        let rows = stmt
-            .query_map([], memory_from_row)
-            .map_err(|e| DomainError::storage(format!("Failed to list memories: {e}")))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| DomainError::storage(format!("Failed to read memories: {e}")))
+        let params_ref: Vec<&dyn duckdb::ToSql> = scope_params
+            .iter()
+            .map(|s| s as &dyn duckdb::ToSql)
+            .collect();
+        let out = query_collect(&conn, &sql, &params_ref, memory_from_row, "list memories")?;
+        attach_entity_ids(&conn, out)
     }
 
-    async fn set_memory_status(
-        &self,
-        id: &str,
-        status: MemoryStatus,
-        valid_to: Option<i64>,
-    ) -> Result<bool, DomainError> {
-        let conn = self.conn.lock().await;
-        // `valid_to = None` leaves the stored value alone (see the port docs):
-        // retracting a memory must not rewrite when it stopped being true.
-        let updated = match valid_to {
-            Some(ts) => conn.execute(
-                "UPDATE memories SET status = ?1, valid_to = ?2 WHERE id = ?3",
-                params![status.as_str(), ts, id],
-            ),
-            None => conn.execute(
-                "UPDATE memories SET status = ?1 WHERE id = ?2",
-                params![status.as_str(), id],
-            ),
-        }
-        .map_err(|e| DomainError::storage(format!("Failed to set memory status: {e}")))?;
-        Ok(updated > 0)
-    }
-
-    async fn set_memory_confidence(&self, id: &str, confidence: f32) -> Result<bool, DomainError> {
-        let conn = self.conn.lock().await;
-        let updated = conn
-            .execute(
-                "UPDATE memories SET confidence = ?1 WHERE id = ?2",
-                params![confidence as f64, id],
-            )
-            .map_err(|e| DomainError::storage(format!("Failed to set memory confidence: {e}")))?;
-        Ok(updated > 0)
-    }
-
-    async fn reopen_memory(&self, id: &str) -> Result<bool, DomainError> {
-        let conn = self.conn.lock().await;
-        let updated = conn
-            .execute(
-                "UPDATE memories SET status = ?1, valid_to = NULL WHERE id = ?2",
-                params![MemoryStatus::Active.as_str(), id],
-            )
-            .map_err(|e| DomainError::storage(format!("Failed to reopen memory: {e}")))?;
-        Ok(updated > 0)
+    async fn delete_memory(&self, id: &str) -> Result<bool, DomainError> {
+        let mut conn = self.conn.lock().await;
+        let tx = conn
+            .transaction()
+            .map_err(|e| DomainError::storage(format!("failed to begin transaction: {e}")))?;
+        tx.execute(
+            "DELETE FROM memory_embeddings WHERE memory_id = ?",
+            params![id],
+        )
+        .map_err(|e| DomainError::storage(format!("failed to delete memory embedding: {e}")))?;
+        tx.execute(
+            "DELETE FROM memory_entities WHERE memory_id = ?",
+            params![id],
+        )
+        .map_err(|e| DomainError::storage(format!("failed to delete memory links: {e}")))?;
+        let n = tx
+            .execute("DELETE FROM memories WHERE id = ?", params![id])
+            .map_err(|e| DomainError::storage(format!("failed to delete memory: {e}")))?;
+        tx.commit()
+            .map_err(|e| DomainError::storage(format!("failed to commit memory delete: {e}")))?;
+        Ok(n > 0)
     }
 
     async fn delete_memories_for_session(&self, session_id: &str) -> Result<usize, DomainError> {
-        let conn = self.conn.lock().await;
-        // Edges and vectors first, so nothing is left pointing at a memory that
-        // is about to disappear.
-        conn.execute(
-            "DELETE FROM memory_edges WHERE from_memory IN \
-             (SELECT id FROM memories WHERE source_session_id = ?1) \
-                OR to_memory IN (SELECT id FROM memories WHERE source_session_id = ?1)",
-            params![session_id],
-        )
-        .map_err(|e| DomainError::storage(format!("Failed to clear session edges: {e}")))?;
-        conn.execute(
+        let mut conn = self.conn.lock().await;
+        let tx = conn
+            .transaction()
+            .map_err(|e| DomainError::storage(format!("failed to begin transaction: {e}")))?;
+        tx.execute(
             "DELETE FROM memory_embeddings WHERE memory_id IN \
-             (SELECT id FROM memories WHERE source_session_id = ?1)",
+             (SELECT id FROM memories WHERE source_session_id = ?)",
             params![session_id],
         )
-        .map_err(|e| DomainError::storage(format!("Failed to clear session vectors: {e}")))?;
-        let deleted = conn
+        .map_err(|e| DomainError::storage(format!("failed to delete session embeddings: {e}")))?;
+        tx.execute(
+            "DELETE FROM memory_entities WHERE memory_id IN \
+             (SELECT id FROM memories WHERE source_session_id = ?)",
+            params![session_id],
+        )
+        .map_err(|e| DomainError::storage(format!("failed to delete session links: {e}")))?;
+        let n = tx
             .execute(
-                "DELETE FROM memories WHERE source_session_id = ?1",
+                "DELETE FROM memories WHERE source_session_id = ?",
                 params![session_id],
             )
-            .map_err(|e| DomainError::storage(format!("Failed to delete session memories: {e}")))?;
-        Ok(deleted)
+            .map_err(|e| DomainError::storage(format!("failed to delete session memories: {e}")))?;
+        tx.commit()
+            .map_err(|e| DomainError::storage(format!("failed to commit session delete: {e}")))?;
+        Ok(n)
     }
 
     async fn count_memories_for_session(&self, session_id: &str) -> Result<usize, DomainError> {
         let conn = self.conn.lock().await;
         let count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM memories WHERE source_session_id = ?1",
+                "SELECT COUNT(*) FROM memories WHERE source_session_id = ?",
                 params![session_id],
                 |row| row.get(0),
             )
-            .map_err(|e| DomainError::storage(format!("Failed to count session memories: {e}")))?;
+            .map_err(|e| DomainError::storage(format!("failed to count session memories: {e}")))?;
         Ok(count as usize)
-    }
-
-    // ── Edges ────────────────────────────────────────────────────────────
-
-    async fn add_edge(&self, edge: &MemoryEdge) -> Result<(), DomainError> {
-        let conn = self.conn.lock().await;
-        conn.execute(
-            "DELETE FROM memory_edges WHERE from_memory = ?1 AND to_memory = ?2 AND edge_type = ?3",
-            params![edge.from_memory, edge.to_memory, edge.edge_type.as_str()],
-        )
-        .map_err(|e| DomainError::storage(format!("Failed to clear edge: {e}")))?;
-        conn.execute(
-            &format!("INSERT INTO memory_edges ({EDGE_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"),
-            params![
-                edge.from_memory,
-                edge.to_memory,
-                edge.edge_type.as_str(),
-                edge.created_at,
-                edge.created_by.as_str(),
-                edge.confidence as f64,
-            ],
-        )
-        .map_err(|e| DomainError::storage(format!("Failed to insert edge: {e}")))?;
-        Ok(())
-    }
-
-    async fn edges_from(&self, memory_id: &str) -> Result<Vec<MemoryEdge>, DomainError> {
-        let conn = self.conn.lock().await;
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT {EDGE_COLUMNS} FROM memory_edges WHERE from_memory = ?1 ORDER BY created_at"
-            ))
-            .map_err(|e| DomainError::storage(format!("Failed to prepare edge query: {e}")))?;
-        let rows = stmt
-            .query_map(params![memory_id], edge_from_row)
-            .map_err(|e| DomainError::storage(format!("Failed to query edges: {e}")))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| DomainError::storage(format!("Failed to read edges: {e}")))
-    }
-
-    async fn edges_to(&self, memory_id: &str) -> Result<Vec<MemoryEdge>, DomainError> {
-        let conn = self.conn.lock().await;
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT {EDGE_COLUMNS} FROM memory_edges WHERE to_memory = ?1 ORDER BY created_at"
-            ))
-            .map_err(|e| DomainError::storage(format!("Failed to prepare edge query: {e}")))?;
-        let rows = stmt
-            .query_map(params![memory_id], edge_from_row)
-            .map_err(|e| DomainError::storage(format!("Failed to query edges: {e}")))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| DomainError::storage(format!("Failed to read edges: {e}")))
-    }
-
-    async fn edges_for(&self, ids: &[String]) -> Result<Vec<MemoryEdge>, DomainError> {
-        let Some(in_list) = id_in_list(ids) else {
-            return Ok(Vec::new());
-        };
-        let conn = self.conn.lock().await;
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT {EDGE_COLUMNS} FROM memory_edges \
-                 WHERE from_memory IN ({in_list}) OR to_memory IN ({in_list}) \
-                 ORDER BY created_at"
-            ))
-            .map_err(|e| DomainError::storage(format!("Failed to prepare edge batch: {e}")))?;
-        let rows = stmt
-            .query_map([], edge_from_row)
-            .map_err(|e| DomainError::storage(format!("Failed to query edge batch: {e}")))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| DomainError::storage(format!("Failed to read edge batch: {e}")))
-    }
-
-    async fn list_edges(
-        &self,
-        edge_type: Option<EdgeType>,
-    ) -> Result<Vec<MemoryEdge>, DomainError> {
-        let filter = match edge_type {
-            Some(t) => format!(" WHERE edge_type = '{}'", t.as_str()),
-            None => String::new(),
-        };
-        let conn = self.conn.lock().await;
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT {EDGE_COLUMNS} FROM memory_edges{filter} ORDER BY created_at"
-            ))
-            .map_err(|e| DomainError::storage(format!("Failed to prepare edge list: {e}")))?;
-        let rows = stmt
-            .query_map([], edge_from_row)
-            .map_err(|e| DomainError::storage(format!("Failed to list edges: {e}")))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| DomainError::storage(format!("Failed to read edges: {e}")))
     }
 
     // ── Entities ─────────────────────────────────────────────────────────
 
-    async fn upsert_entity(
-        &self,
-        entity: &Entity,
-        vector: Option<&[f32]>,
-    ) -> Result<(), DomainError> {
-        let literal = vector.map(|v| self.vector_literal(v)).transpose()?;
-        let conn = self.conn.lock().await;
-
-        conn.execute(
-            "DELETE FROM entity_vectors WHERE entity_id = ?1",
-            params![entity.id],
-        )
-        .map_err(|e| DomainError::storage(format!("Failed to clear entity vector: {e}")))?;
-        conn.execute(
-            "DELETE FROM entity_names WHERE entity_id = ?1",
-            params![entity.id],
-        )
-        .map_err(|e| DomainError::storage(format!("Failed to clear entity names: {e}")))?;
-        conn.execute("DELETE FROM entities WHERE id = ?1", params![entity.id])
-            .map_err(|e| DomainError::storage(format!("Failed to clear entity: {e}")))?;
-
-        conn.execute(
-            &format!("INSERT INTO entities ({ENTITY_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5)"),
+    async fn upsert_entity(&self, entity: &Entity) -> Result<(), DomainError> {
+        let mut conn = self.conn.lock().await;
+        let tx = conn
+            .transaction()
+            .map_err(|e| DomainError::storage(format!("failed to begin transaction: {e}")))?;
+        tx.execute(
+            "INSERT OR REPLACE INTO entities (id, entity_type, canonical_name, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?)",
             params![
                 entity.id,
                 entity.entity_type,
@@ -490,224 +313,106 @@ impl MemoryRepository for DuckdbStore {
                 entity.updated_at,
             ],
         )
-        .map_err(|e| DomainError::storage(format!("Failed to insert entity: {e}")))?;
+        .map_err(|e| DomainError::storage(format!("failed to upsert entity: {e}")))?;
 
-        // The canonical name is a name like any other — it is what makes the
-        // lookup one query instead of "the canonical column OR the names
-        // table". Duplicates fold away on the primary key rather than erroring.
-        let mut seen = std::collections::HashSet::new();
-        for name in std::iter::once(&entity.canonical_name).chain(entity.names.iter()) {
-            let name = name.trim();
-            let key = entity_name_key(name);
-            if name.is_empty() || !seen.insert(key.clone()) {
-                continue;
+        // Replace the name rows wholesale: canonical + every alias.
+        tx.execute(
+            "DELETE FROM entity_names WHERE entity_id = ?",
+            params![entity.id],
+        )
+        .map_err(|e| DomainError::storage(format!("failed to clear entity names: {e}")))?;
+        let mut names = vec![entity.canonical_name.clone()];
+        for alias in &entity.names {
+            if !names.iter().any(|n| n.eq_ignore_ascii_case(alias)) {
+                names.push(alias.clone());
             }
-            conn.execute(
-                "INSERT OR IGNORE INTO entity_names (name, name_key, entity_id) \
-                 VALUES (?1, ?2, ?3)",
-                params![name, key, entity.id],
-            )
-            .map_err(|e| DomainError::storage(format!("Failed to insert entity name: {e}")))?;
         }
-
-        if let Some(literal) = literal {
-            conn.execute(
-                &format!("INSERT INTO entity_vectors (entity_id, vector) VALUES (?1, {literal})"),
-                params![entity.id],
+        for name in names {
+            tx.execute(
+                "INSERT OR REPLACE INTO entity_names (name, name_key, entity_id) \
+                 VALUES (?, ?, ?)",
+                params![name, entity_name_key(&name), entity.id],
             )
-            .map_err(|e| DomainError::storage(format!("Failed to insert entity vector: {e}")))?;
+            .map_err(|e| DomainError::storage(format!("failed to write entity name: {e}")))?;
         }
+        tx.commit()
+            .map_err(|e| DomainError::storage(format!("failed to commit entity write: {e}")))?;
         Ok(())
     }
 
     async fn find_entity(&self, id: &str) -> Result<Option<Entity>, DomainError> {
         let conn = self.conn.lock().await;
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT {ENTITY_COLUMNS} FROM entities WHERE id = ?1"
-            ))
-            .map_err(|e| DomainError::storage(format!("Failed to prepare entity query: {e}")))?;
-        let mut rows = stmt
-            .query_map(params![id], entity_from_row)
-            .map_err(|e| DomainError::storage(format!("Failed to query entity: {e}")))?;
-        let Some(row) = rows.next() else {
+        let sql = format!("SELECT {ENTITY_COLUMNS} FROM entities WHERE id = ?");
+        let out = query_collect(
+            &conn,
+            &sql,
+            &[&id as &dyn duckdb::ToSql],
+            entity_from_row,
+            "find entity",
+        )?;
+        let Some(entity) = out.into_iter().next() else {
             return Ok(None);
         };
-        let mut entity =
-            row.map_err(|e| DomainError::storage(format!("Failed to read entity: {e}")))?;
-        drop(rows);
-        drop(stmt);
-        entity.names = Self::load_names(&conn, id)?;
-        Ok(Some(entity))
-    }
-
-    async fn find_entities_by_name(&self, name: &str) -> Result<Vec<Entity>, DomainError> {
-        let conn = self.conn.lock().await;
-        let ids: Vec<String> = {
-            let mut stmt = conn
-                .prepare(
-                    // Matches the pre-normalized key so the index is usable;
-                    // normalizing the column here would force a scan.
-                    "SELECT entity_id FROM entity_names WHERE name_key = ?1",
-                )
-                .map_err(|e| DomainError::storage(format!("Failed to prepare name lookup: {e}")))?;
-            let rows = stmt
-                .query_map(params![entity_name_key(name)], |row| {
-                    row.get::<_, String>(0)
-                })
-                .map_err(|e| DomainError::storage(format!("Failed to query name: {e}")))?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|e| DomainError::storage(format!("Failed to read name: {e}")))?
-        };
-        drop(conn);
-        // Every id, not the first: the key is normalized, so one key can front
-        // two entities of different types ("foo" the tool, "foo" the project).
-        // Picking arbitrarily here would hand the caller the wrong-typed one
-        // and it would create a third entity behind the same key, forever.
-        let mut entities = Vec::with_capacity(ids.len());
-        for id in ids {
-            if let Some(entity) = self.find_entity(&id).await? {
-                entities.push(entity);
-            }
-        }
-        Ok(entities)
-    }
-
-    async fn memories_for_entity(&self, entity_id: &str) -> Result<Vec<Memory>, DomainError> {
-        let conn = self.conn.lock().await;
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT {MEMORY_COLUMNS} FROM memories \
-                 WHERE subject_entity_id = ?1 OR object_entity_id = ?1 \
-                 ORDER BY recorded_at DESC"
-            ))
-            .map_err(|e| {
-                DomainError::storage(format!("Failed to prepare entity memory query: {e}"))
-            })?;
-        let rows = stmt
-            .query_map(params![entity_id], memory_from_row)
-            .map_err(|e| DomainError::storage(format!("Failed to query entity memories: {e}")))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| DomainError::storage(format!("Failed to read entity memories: {e}")))
+        let names = load_names(&conn, &entity.id)?;
+        Ok(Some(Entity { names, ..entity }))
     }
 
     async fn find_entities(&self, ids: &[String]) -> Result<Vec<Entity>, DomainError> {
-        let Some(in_list) = id_in_list(ids) else {
+        if ids.is_empty() {
             return Ok(Vec::new());
-        };
-        let conn = self.conn.lock().await;
-        let mut entities: Vec<Entity> = {
-            let mut stmt = conn
-                .prepare(&format!(
-                    "SELECT {ENTITY_COLUMNS} FROM entities WHERE id IN ({in_list})"
-                ))
-                .map_err(|e| {
-                    DomainError::storage(format!("Failed to prepare entity batch: {e}"))
-                })?;
-            let rows = stmt
-                .query_map([], entity_from_row)
-                .map_err(|e| DomainError::storage(format!("Failed to query entity batch: {e}")))?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|e| DomainError::storage(format!("Failed to read entity batch: {e}")))?
-        };
-        for entity in &mut entities {
-            entity.names = Self::load_names(&conn, &entity.id)?;
         }
-        Ok(entities)
+        let placeholders = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let conn = self.conn.lock().await;
+        let sql = format!("SELECT {ENTITY_COLUMNS} FROM entities WHERE id IN ({placeholders})");
+        let params_ref: Vec<&dyn duckdb::ToSql> =
+            ids.iter().map(|s| s as &dyn duckdb::ToSql).collect();
+        let out = query_collect(&conn, &sql, &params_ref, entity_from_row, "find entities")?;
+        attach_names(&conn, out)
+    }
+
+    async fn find_entities_by_name(&self, name: &str) -> Result<Vec<Entity>, DomainError> {
+        let key = entity_name_key(name);
+        let conn = self.conn.lock().await;
+        let sql = format!(
+            "SELECT DISTINCT {ENTITY_COLUMNS} FROM entities e \
+             JOIN entity_names n ON n.entity_id = e.id \
+             WHERE n.name_key = ?"
+        );
+        let out = query_collect(
+            &conn,
+            &sql,
+            &[&key as &dyn duckdb::ToSql],
+            entity_from_row,
+            "find entities by name",
+        )?;
+        attach_names(&conn, out)
     }
 
     async fn list_entities(&self) -> Result<Vec<Entity>, DomainError> {
         let conn = self.conn.lock().await;
-        let mut entities: Vec<Entity> = {
-            let mut stmt = conn
-                .prepare(&format!(
-                    "SELECT {ENTITY_COLUMNS} FROM entities ORDER BY created_at DESC"
-                ))
-                .map_err(|e| DomainError::storage(format!("Failed to prepare entity list: {e}")))?;
-            let rows = stmt
-                .query_map([], entity_from_row)
-                .map_err(|e| DomainError::storage(format!("Failed to list entities: {e}")))?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|e| DomainError::storage(format!("Failed to read entities: {e}")))?
-        };
-        for entity in &mut entities {
-            entity.names = Self::load_names(&conn, &entity.id)?;
-        }
-        Ok(entities)
+        let sql = format!("SELECT {ENTITY_COLUMNS} FROM entities ORDER BY updated_at DESC");
+        let out = query_collect(&conn, &sql, &[], entity_from_row, "list entities")?;
+        attach_names(&conn, out)
     }
 
-    async fn search_entities_semantic(
-        &self,
-        vector: &[f32],
-        limit: usize,
-    ) -> Result<Vec<(Entity, f32)>, DomainError> {
-        let literal = self.vector_literal(vector)?;
+    async fn memories_for_entity(&self, entity_id: &str) -> Result<Vec<Memory>, DomainError> {
+        let conn = self.conn.lock().await;
         let sql = format!(
-            "SELECT {ENTITY_COLUMNS}, 1.0 - array_cosine_distance(v.vector, {literal}) AS score \
-             FROM entities e JOIN entity_vectors v ON v.entity_id = e.id \
-             ORDER BY score DESC LIMIT {limit}"
+            "SELECT {MEMORY_COLUMNS} FROM memories m \
+             JOIN memory_entities me ON me.memory_id = m.id \
+             WHERE me.entity_id = ? \
+             ORDER BY m.recorded_at DESC"
         );
-        // The scan is O(rows); it must not run on a Tokio worker thread.
-        let scored: Vec<(Entity, f32)> = self
-            .query_blocking(move |conn| {
-                let mut stmt = conn.prepare(&sql).map_err(|e| {
-                    DomainError::storage(format!("Failed to prepare entity search: {e}"))
-                })?;
-                let rows = stmt
-                    .query_map([], |row| {
-                        Ok((
-                            entity_from_row(row)?,
-                            row.get::<_, f64>(ENTITY_COLUMN_COUNT)? as f32,
-                        ))
-                    })
-                    .map_err(|e| DomainError::storage(format!("Failed to search entities: {e}")))?;
-                rows.collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| DomainError::storage(format!("Failed to read entities: {e}")))
-            })
-            .await?;
-
-        let conn = self.conn.lock().await;
-        let mut out = Vec::with_capacity(scored.len());
-        for (mut entity, score) in scored {
-            entity.names = Self::load_names(&conn, &entity.id)?;
-            out.push((entity, score));
-        }
-        Ok(out)
-    }
-
-    async fn repoint_entity(&self, from: &str, to: &str) -> Result<usize, DomainError> {
-        let conn = self.conn.lock().await;
-        // Both ref columns: an entity can be the subject of one memory and the
-        // object of another, and a merge that moved only one would silently
-        // strand half the graph.
-        let subjects = conn
-            .execute(
-                "UPDATE memories SET subject_entity_id = ?1 WHERE subject_entity_id = ?2",
-                params![to, from],
-            )
-            .map_err(|e| DomainError::storage(format!("Failed to repoint subjects: {e}")))?;
-        let objects = conn
-            .execute(
-                "UPDATE memories SET object_entity_id = ?1 WHERE object_entity_id = ?2",
-                params![to, from],
-            )
-            .map_err(|e| DomainError::storage(format!("Failed to repoint objects: {e}")))?;
-        Ok(subjects + objects)
-    }
-
-    async fn delete_entity(&self, id: &str) -> Result<bool, DomainError> {
-        let conn = self.conn.lock().await;
-        conn.execute(
-            "DELETE FROM entity_vectors WHERE entity_id = ?1",
-            params![id],
-        )
-        .map_err(|e| DomainError::storage(format!("Failed to delete entity vector: {e}")))?;
-        conn.execute("DELETE FROM entity_names WHERE entity_id = ?1", params![id])
-            .map_err(|e| DomainError::storage(format!("Failed to delete entity names: {e}")))?;
-        let deleted = conn
-            .execute("DELETE FROM entities WHERE id = ?1", params![id])
-            .map_err(|e| DomainError::storage(format!("Failed to delete entity: {e}")))?;
-        Ok(deleted > 0)
+        let out = query_collect(
+            &conn,
+            &sql,
+            &[&entity_id as &dyn duckdb::ToSql],
+            memory_from_row,
+            "list entity memories",
+        )?;
+        attach_entity_ids(&conn, out)
     }
 
     // ── Retrieval ────────────────────────────────────────────────────────
@@ -715,245 +420,640 @@ impl MemoryRepository for DuckdbStore {
     async fn search_memories_semantic(
         &self,
         vector: &[f32],
-        kind: Option<MemoryKind>,
         projects: Option<&[String]>,
         limit: usize,
     ) -> Result<Vec<(Memory, f32)>, DomainError> {
-        let literal = self.vector_literal(vector)?;
-        // Only `active` memories surface. Superseded, retracted and — critically —
-        // Retired memories are excluded here rather than downstream, so
-        // no caller can forget to filter an unsettled conflict out of recall.
+        if vector.len() != self.dimensions {
+            return Err(DomainError::invalid_input(format!(
+                "query vector width {} does not match pinned dimensions {}",
+                vector.len(),
+                self.dimensions
+            )));
+        }
+        let literal = vector_literal(vector);
+        let mut scope_params: Vec<String> = Vec::new();
+        let scope = project_scope_clause(projects, "project", &mut scope_params);
         let sql = format!(
-            "SELECT {}, 1.0 - array_cosine_distance(v.vector, {literal}) AS score \
-             FROM memories c JOIN memory_embeddings v ON v.memory_id = c.id \
-             WHERE c.status = 'active'{}{} \
-             ORDER BY score DESC LIMIT {limit}",
-            MEMORY_COLUMNS
-                .split(", ")
-                .map(|c| format!("c.{c}"))
-                .collect::<Vec<_>>()
-                .join(", "),
-            kind_clause("c.kind", kind),
-            scope_clause("c.project", projects),
+            "SELECT {MEMORY_COLUMNS}, \
+                    1.0 - array_cosine_distance(e.vector, {literal}::FLOAT[{d}]) AS score \
+             FROM memories m JOIN memory_embeddings e ON e.memory_id = m.id \
+             WHERE TRUE{scope} \
+             ORDER BY score DESC LIMIT ?",
+            d = self.dimensions,
         );
-        self.query_blocking(move |conn| {
-            let mut stmt = conn.prepare(&sql).map_err(|e| {
-                DomainError::storage(format!("Failed to prepare memory search: {e}"))
-            })?;
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok((
-                        memory_from_row(row)?,
-                        row.get::<_, f64>(MEMORY_COLUMN_COUNT)? as f32,
-                    ))
-                })
-                .map_err(|e| DomainError::storage(format!("Failed to search memories: {e}")))?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|e| DomainError::storage(format!("Failed to read memories: {e}")))
-        })
-        .await
+        // Bind order: scope projects, then limit.
+        let mut ordered: Vec<String> = scope_params;
+        ordered.push(limit.to_string());
+
+        let conn = self.conn.lock().await;
+        let params_ref: Vec<&dyn duckdb::ToSql> =
+            ordered.iter().map(|s| s as &dyn duckdb::ToSql).collect();
+        let out = query_collect(
+            &conn,
+            &sql,
+            &params_ref,
+            |row| {
+                let memory = memory_from_row(row)?;
+                let score: f64 = row.get(MEMORY_COLUMN_COUNT)?;
+                Ok((memory, score as f32))
+            },
+            "search memories",
+        )?;
+        let ids: Vec<String> = out.iter().map(|(m, _)| m.id.clone()).collect();
+        let mut by_memory = load_entity_ids_for(&conn, &ids)?;
+        Ok(out
+            .into_iter()
+            .map(|(m, score)| {
+                let entity_ids = by_memory.remove(&m.id).unwrap_or_default();
+                (Memory { entity_ids, ..m }, score)
+            })
+            .collect())
     }
 
     async fn search_memories_keyword(
         &self,
         query: &str,
-        kind: Option<MemoryKind>,
         projects: Option<&[String]>,
         limit: usize,
     ) -> Result<Vec<(Memory, f32)>, DomainError> {
+        // Split into lowercase terms; each term must appear in the statement
+        // for the row to score at all.
         let terms: Vec<String> = query
-            .split_whitespace()
-            .map(|t| t.to_lowercase())
+            .split(|c: char| !c.is_alphanumeric())
             .filter(|t| !t.is_empty())
             .take(MAX_KEYWORD_TERMS)
+            .map(|t| t.to_lowercase())
             .collect();
         if terms.is_empty() {
             return Ok(Vec::new());
         }
-        // Score = fraction of query terms found in the statement.
-        let escape = |t: &str| {
-            t.replace('\\', "\\\\")
-                .replace('\'', "''")
-                .replace('%', "\\%")
-                .replace('_', "\\_")
-        };
-        let match_cases: Vec<String> = terms
-            .iter()
-            .map(|t| {
-                let e = escape(t);
-                format!("(CASE WHEN lower(statement) LIKE '%{e}%' ESCAPE '\\' THEN 1 ELSE 0 END)")
-            })
-            .collect();
-        let score_expr = format!("({}) / {}.0", match_cases.join(" + "), terms.len());
+        let mut scope_params: Vec<String> = Vec::new();
+        let mut term_clauses = String::new();
+        for _ in &terms {
+            term_clauses.push_str(" AND statement ILIKE '%' || ? || '%'");
+        }
+        let scope = project_scope_clause(projects, "project", &mut scope_params);
+        // Bind order follows the SQL's textual order: terms, then scope
+        // projects, then limit.
+        let mut ordered_params: Vec<String> = terms.clone();
+        ordered_params.extend(scope_params);
+        ordered_params.push(limit.to_string());
+
         let sql = format!(
-            "SELECT {MEMORY_COLUMNS}, {score_expr} AS score FROM memories \
-             WHERE status = 'active' AND {score_expr} > 0{}{} \
-             ORDER BY score DESC, recorded_at DESC LIMIT {limit}",
-            kind_clause("kind", kind),
-            scope_clause("project", projects),
+            "SELECT {MEMORY_COLUMNS}, 1.0 AS score \
+             FROM memories \
+             WHERE TRUE{term_clauses}{scope} \
+             ORDER BY recorded_at DESC LIMIT ?"
         );
         let conn = self.conn.lock().await;
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| DomainError::storage(format!("Failed to prepare keyword search: {e}")))?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    memory_from_row(row)?,
-                    row.get::<_, f64>(MEMORY_COLUMN_COUNT)? as f32,
-                ))
+        let params_ref: Vec<&dyn duckdb::ToSql> = ordered_params
+            .iter()
+            .map(|s| s as &dyn duckdb::ToSql)
+            .collect();
+        let out = query_collect(
+            &conn,
+            &sql,
+            &params_ref,
+            |row| {
+                let memory = memory_from_row(row)?;
+                let score: f64 = row.get(MEMORY_COLUMN_COUNT)?;
+                Ok((memory, score as f32))
+            },
+            "keyword-search memories",
+        )?;
+        let ids: Vec<String> = out.iter().map(|(m, _)| m.id.clone()).collect();
+        let mut by_memory = load_entity_ids_for(&conn, &ids)?;
+        Ok(out
+            .into_iter()
+            .map(|(m, score)| {
+                let entity_ids = by_memory.remove(&m.id).unwrap_or_default();
+                (Memory { entity_ids, ..m }, score)
             })
-            .map_err(|e| DomainError::storage(format!("Failed to keyword-search memories: {e}")))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| DomainError::storage(format!("Failed to read memories: {e}")))
+            .collect())
     }
 
-    async fn list_memory_embeddings(&self) -> Result<Vec<(String, Vec<f32>)>, DomainError> {
-        // duckdb-rs cannot fetch a `FLOAT[n]` column natively, so the array is
-        // rendered to JSON in SQL and parsed back here.
-        self.query_blocking(|conn| {
-            let mut stmt = conn
-                .prepare("SELECT memory_id, to_json(vector)::VARCHAR FROM memory_embeddings")
-                .map_err(|e| DomainError::storage(format!("Failed to prepare vector list: {e}")))?;
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })
-                .map_err(|e| DomainError::storage(format!("Failed to list memory vectors: {e}")))?;
-            let mut out = Vec::new();
-            for row in rows {
-                let (id, json) =
-                    row.map_err(|e| DomainError::storage(format!("Failed to read vector: {e}")))?;
-                let vector: Vec<f32> = serde_json::from_str(&json)
-                    .map_err(|e| DomainError::storage(format!("Failed to parse vector: {e}")))?;
-                out.push((id, vector));
-            }
-            Ok(out)
-        })
-        .await
-    }
+    async fn list_memories_by_recency(
+        &self,
+        projects: Option<&[String]>,
+        limit: usize,
+    ) -> Result<Vec<Memory>, DomainError> {
+        let mut scope_params: Vec<String> = Vec::new();
+        let scope = project_scope_clause(projects, "project", &mut scope_params);
+        let sql = format!(
+            "SELECT {MEMORY_COLUMNS} FROM memories WHERE TRUE{scope} \
+             ORDER BY recorded_at DESC LIMIT ?"
+        );
+        // Bind order: scope projects, then limit.
+        let mut ordered: Vec<String> = scope_params;
+        ordered.push(limit.to_string());
 
-    async fn memory_stats(&self) -> Result<MemoryStoreStats, DomainError> {
         let conn = self.conn.lock().await;
-        let total_memories: i64 = conn
-            .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
-            .map_err(|e| DomainError::storage(format!("Failed to count memories: {e}")))?;
-        let total_entities: i64 = conn
-            .query_row("SELECT COUNT(*) FROM entities", [], |row| row.get(0))
-            .map_err(|e| DomainError::storage(format!("Failed to count entities: {e}")))?;
-        let total_edges: i64 = conn
-            .query_row("SELECT COUNT(*) FROM memory_edges", [], |row| row.get(0))
-            .map_err(|e| DomainError::storage(format!("Failed to count edges: {e}")))?;
+        let params_ref: Vec<&dyn duckdb::ToSql> =
+            ordered.iter().map(|s| s as &dyn duckdb::ToSql).collect();
+        let out = query_collect(
+            &conn,
+            &sql,
+            &params_ref,
+            memory_from_row,
+            "list memories by recency",
+        )?;
+        attach_entity_ids(&conn, out)
+    }
 
-        let by = |column: &str| -> Result<Vec<(String, u64)>, DomainError> {
-            let mut stmt = conn
-                .prepare(&format!(
-                    "SELECT {column}, COUNT(*) FROM memories GROUP BY {column} ORDER BY {column}"
-                ))
-                .map_err(|e| DomainError::storage(format!("Failed to prepare grouping: {e}")))?;
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
-                })
-                .map_err(|e| DomainError::storage(format!("Failed to group memories: {e}")))?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|e| DomainError::storage(format!("Failed to read grouping: {e}")))
-        };
-        let memories_by_status = by("status")?;
-        let memories_by_kind = by("kind")?;
+    // ── Resources ────────────────────────────────────────────────────────
 
-        Ok(MemoryStoreStats {
-            total_memories: total_memories as u64,
-            memories_by_status,
-            memories_by_kind,
-            total_entities: total_entities as u64,
-            total_edges: total_edges as u64,
-        })
+    async fn upsert_resource(
+        &self,
+        resource: &MemoryResource,
+        vector: Option<&[f32]>,
+    ) -> Result<(), DomainError> {
+        // Validate before opening the transaction.
+        if let Some(vector) = vector {
+            if vector.len() != self.dimensions {
+                return Err(DomainError::invalid_input(format!(
+                    "vector width {} does not match pinned dimensions {}",
+                    vector.len(),
+                    self.dimensions
+                )));
+            }
+        }
+        let mut conn = self.conn.lock().await;
+        let tx = conn
+            .transaction()
+            .map_err(|e| DomainError::storage(format!("failed to begin transaction: {e}")))?;
+        tx.execute(
+            &format!(
+                "INSERT OR REPLACE INTO memory_resources ({RESOURCE_COLUMNS}) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?)"
+            ),
+            params![
+                resource.uri,
+                resource.source,
+                resource.name,
+                resource.abstract_,
+                resource.overview,
+                resource.content,
+                resource.created_at,
+            ],
+        )
+        .map_err(|e| DomainError::storage(format!("failed to upsert resource: {e}")))?;
+
+        tx.execute(
+            "DELETE FROM memory_resource_embeddings WHERE uri = ?",
+            params![resource.uri],
+        )
+        .map_err(|e| DomainError::storage(format!("failed to clear resource embedding: {e}")))?;
+        if let Some(vector) = vector {
+            let literal = vector_literal(vector);
+            tx.execute(
+                &format!(
+                    "INSERT INTO memory_resource_embeddings (uri, vector) VALUES (?, {literal})"
+                ),
+                params![resource.uri],
+            )
+            .map_err(|e| {
+                DomainError::storage(format!("failed to write resource embedding: {e}"))
+            })?;
+        }
+        tx.commit()
+            .map_err(|e| DomainError::storage(format!("failed to commit resource write: {e}")))?;
+        Ok(())
+    }
+
+    async fn find_resource(&self, uri: &str) -> Result<Option<MemoryResource>, DomainError> {
+        let conn = self.conn.lock().await;
+        let sql = format!("SELECT {RESOURCE_COLUMNS} FROM memory_resources WHERE uri = ?");
+        let out = query_collect(
+            &conn,
+            &sql,
+            &[&uri as &dyn duckdb::ToSql],
+            resource_from_row,
+            "find resource",
+        )?;
+        Ok(out.into_iter().next())
+    }
+
+    async fn list_resources(&self) -> Result<Vec<MemoryResource>, DomainError> {
+        let conn = self.conn.lock().await;
+        let sql =
+            format!("SELECT {RESOURCE_COLUMNS} FROM memory_resources ORDER BY created_at DESC");
+        query_collect(&conn, &sql, &[], resource_from_row, "list resources")
+    }
+
+    async fn search_resources_semantic(
+        &self,
+        vector: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(MemoryResource, f32)>, DomainError> {
+        if vector.len() != self.dimensions {
+            return Err(DomainError::invalid_input(format!(
+                "query vector width {} does not match pinned dimensions {}",
+                vector.len(),
+                self.dimensions
+            )));
+        }
+        let literal = vector_literal(vector);
+        let sql = format!(
+            "SELECT {RESOURCE_COLUMNS}, \
+                    1.0 - array_cosine_distance(e.vector, {literal}::FLOAT[{d}]) AS score \
+             FROM memory_resources r JOIN memory_resource_embeddings e ON e.uri = r.uri \
+             ORDER BY score DESC LIMIT ?",
+            d = self.dimensions,
+        );
+        let conn = self.conn.lock().await;
+        query_collect(
+            &conn,
+            &sql,
+            &[&(limit as i64) as &dyn duckdb::ToSql],
+            |row| {
+                let resource = resource_from_row(row)?;
+                let score: f64 = row.get(RESOURCE_COLUMN_COUNT)?;
+                Ok((resource, score as f32))
+            },
+            "search resources",
+        )
+    }
+
+    // ── Namespaces ───────────────────────────────────────────────────────
+
+    async fn create_namespace(&self, name: &str) -> Result<bool, DomainError> {
+        let conn = self.conn.lock().await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        // A namespace with no projects is still recorded — by inserting a
+        // marker row whose `project` is the sentinel `""`.
+        let n = conn
+            .execute(
+                "INSERT OR IGNORE INTO memory_namespaces (namespace, project, created_at) \
+                 VALUES (?, '', ?)",
+                params![name, now],
+            )
+            .map_err(|e| DomainError::storage(format!("failed to create namespace: {e}")))?;
+        Ok(n > 0)
+    }
+
+    async fn delete_namespace(&self, name: &str) -> Result<bool, DomainError> {
+        let conn = self.conn.lock().await;
+        let n = conn
+            .execute(
+                "DELETE FROM memory_namespaces WHERE namespace = ?",
+                params![name],
+            )
+            .map_err(|e| DomainError::storage(format!("failed to delete namespace: {e}")))?;
+        Ok(n > 0)
+    }
+
+    async fn list_namespaces(&self) -> Result<Vec<(String, u64)>, DomainError> {
+        let conn = self.conn.lock().await;
+        query_collect(
+            &conn,
+            "SELECT namespace, COUNT(*) FILTER (project <> '') AS count \
+             FROM memory_namespaces GROUP BY namespace ORDER BY namespace",
+            &[],
+            |row| {
+                let name: String = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                Ok((name, count as u64))
+            },
+            "list namespaces",
+        )
+    }
+
+    async fn namespace_projects(&self, name: &str) -> Result<Vec<String>, DomainError> {
+        let conn = self.conn.lock().await;
+        query_collect(
+            &conn,
+            "SELECT project FROM memory_namespaces \
+             WHERE namespace = ? AND project <> '' ORDER BY project",
+            &[&name as &dyn duckdb::ToSql],
+            |row| row.get::<_, String>(0),
+            "list namespace projects",
+        )
+    }
+
+    async fn namespace_created_at(&self, name: &str) -> Result<Option<i64>, DomainError> {
+        let conn = self.conn.lock().await;
+        let value: Option<i64> = conn
+            .query_row(
+                "SELECT MIN(created_at) FROM memory_namespaces WHERE namespace = ?",
+                params![name],
+                |row| row.get(0),
+            )
+            .map_err(|e| DomainError::storage(format!("failed to read namespace cutoff: {e}")))?;
+        Ok(value)
+    }
+
+    async fn assign_project(&self, namespace: &str, project: &str) -> Result<bool, DomainError> {
+        let conn = self.conn.lock().await;
+        // Inherit the namespace's existing cutoff so re-adding a project does
+        // not silently widen the auto-import window. Fresh namespaces use now.
+        // Inline the cutoff read rather than calling `namespace_created_at`:
+        // that method takes the same lock, and we already hold it.
+        let cutoff: Option<i64> = conn
+            .query_row(
+                "SELECT MIN(created_at) FROM memory_namespaces WHERE namespace = ?",
+                params![namespace],
+                |row| row.get(0),
+            )
+            .map_err(|e| DomainError::storage(format!("failed to read namespace cutoff: {e}")))?;
+        let cutoff = cutoff.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0)
+        });
+        let n = conn
+            .execute(
+                "INSERT OR IGNORE INTO memory_namespaces (namespace, project, created_at) \
+                 VALUES (?, ?, ?)",
+                params![namespace, project, cutoff],
+            )
+            .map_err(|e| DomainError::storage(format!("failed to assign project: {e}")))?;
+        Ok(n > 0)
+    }
+
+    async fn unassign_project(&self, namespace: &str, project: &str) -> Result<bool, DomainError> {
+        let conn = self.conn.lock().await;
+        let n = conn
+            .execute(
+                "DELETE FROM memory_namespaces WHERE namespace = ? AND project = ?",
+                params![namespace, project],
+            )
+            .map_err(|e| DomainError::storage(format!("failed to unassign project: {e}")))?;
+        Ok(n > 0)
+    }
+
+    // ── Sessions ─────────────────────────────────────────────────────────
+
+    async fn record_session(&self, session: &ImportedSession) -> Result<(), DomainError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            &format!(
+                "INSERT OR REPLACE INTO memory_sessions ({SESSION_COLUMNS}) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            ),
+            params![
+                session.id,
+                session.source,
+                session.imported_at,
+                session.message_count as i64,
+                session.items_written as i64,
+                session.status.as_str(),
+                session.last_error,
+                session.project,
+            ],
+        )
+        .map_err(|e| DomainError::storage(format!("failed to record session: {e}")))?;
+        Ok(())
+    }
+
+    async fn find_session(
+        &self,
+        source: &str,
+        id: &str,
+    ) -> Result<Option<ImportedSession>, DomainError> {
+        let conn = self.conn.lock().await;
+        let sql =
+            format!("SELECT {SESSION_COLUMNS} FROM memory_sessions WHERE source = ? AND id = ?");
+        let out = query_collect(
+            &conn,
+            &sql,
+            &[&source as &dyn duckdb::ToSql, &id as &dyn duckdb::ToSql],
+            session_from_row,
+            "find session",
+        )?;
+        Ok(out.into_iter().next())
+    }
+
+    async fn list_sessions(
+        &self,
+        projects: Option<&[String]>,
+        limit: usize,
+    ) -> Result<Vec<ImportedSession>, DomainError> {
+        list_sessions_inner(self, None, projects, limit).await
+    }
+
+    async fn list_sessions_by_status(
+        &self,
+        status: SessionStatus,
+        projects: Option<&[String]>,
+        limit: usize,
+    ) -> Result<Vec<ImportedSession>, DomainError> {
+        list_sessions_inner(self, Some(status), projects, limit).await
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The column-list constants are interpolated into SQL and then read back
-    /// **by position**, so they encode an invariant no type check can see: the
-    /// Nth name in the string must be the Nth `row.get` in the mapper. Adding
-    /// `kind` to the memory list already shifted seventeen indices once. These
-    /// assertions turn the next such shift into a failing unit test rather than
-    /// a mis-mapped field.
-    #[test]
-    fn column_counts_match_their_column_lists() {
-        assert_eq!(
-            MEMORY_COLUMNS.split(", ").count(),
-            MEMORY_COLUMN_COUNT,
-            "MEMORY_COLUMNS changed without updating MEMORY_COLUMN_COUNT — the \
-             score index in both search legs is now wrong",
-        );
-        assert_eq!(
-            ENTITY_COLUMNS.split(", ").count(),
-            ENTITY_COLUMN_COUNT,
-            "ENTITY_COLUMNS changed without updating ENTITY_COLUMN_COUNT",
-        );
-    }
-
-    /// `MEMORY_COLUMNS` is written as a multi-line literal joined by `\`
-    /// line-continuations. Rust strips the newline *and* the following
-    /// indentation, but if that ever stopped holding, `split(", ")` would yield
-    /// names with leading spaces — and `search_memories_semantic`, which builds
-    /// its select list by prefixing each with `c.`, would emit `c. object_id`.
-    /// That is a SQL error rather than a wrong answer, but it would only show
-    /// up at runtime on the semantic path.
-    #[test]
-    fn column_lists_have_no_stray_whitespace() {
-        for (label, columns) in [
-            ("MEMORY_COLUMNS", MEMORY_COLUMNS),
-            ("ENTITY_COLUMNS", ENTITY_COLUMNS),
-            ("EDGE_COLUMNS", EDGE_COLUMNS),
-        ] {
-            for column in columns.split(", ") {
-                assert_eq!(
-                    column,
-                    column.trim(),
-                    "{label} column {column:?} carries whitespace",
-                );
-                assert!(
-                    !column.is_empty(),
-                    "{label} has an empty column — a doubled separator?",
-                );
+/// Shared body of `list_sessions` / `list_sessions_by_status` — free
+/// function rather than an inherent method, so the trait impl stays a list
+/// of port methods.
+async fn list_sessions_inner(
+    store: &DuckdbStore,
+    status: Option<SessionStatus>,
+    projects: Option<&[String]>,
+    limit: usize,
+) -> Result<Vec<ImportedSession>, DomainError> {
+    let mut params: Vec<String> = Vec::new();
+    // Sessions store project as a real NULL/Optional column rather than
+    // the `''` convention the memories table uses.
+    let scope = match projects {
+        None => String::new(),
+        Some([]) => " AND project IS NULL".to_string(),
+        Some(ps) => {
+            let placeholders = std::iter::repeat_n("?", ps.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            for p in ps {
+                params.push(p.clone());
             }
+            format!(" AND project IN ({placeholders})")
         }
+    };
+    let status_clause = match status {
+        Some(_) => " AND status = ?",
+        None => "",
+    };
+    let sql = format!(
+        "SELECT {SESSION_COLUMNS} FROM memory_sessions \
+             WHERE TRUE{status_clause}{scope} \
+             ORDER BY imported_at DESC LIMIT ?"
+    );
+    // Bind order: status (if any), scope projects, limit.
+    let mut ordered: Vec<String> = Vec::new();
+    if let Some(s) = status {
+        ordered.push(s.as_str().to_string());
     }
+    ordered.extend(params);
+    ordered.push(limit.to_string());
 
-    /// The memory mapper's field order is load-bearing documentation; if the
-    /// list and the DDL ever disagree on *which* columns exist, every
-    /// `SELECT {MEMORY_COLUMNS}` fails at once. Pin the names so a rename has to
-    /// be deliberate.
-    #[test]
-    fn memory_columns_are_the_expected_names_in_order() {
-        assert_eq!(
-            MEMORY_COLUMNS.split(", ").collect::<Vec<_>>(),
-            [
-                "id",
-                "kind",
-                "subject_entity_id",
-                "subject_literal",
-                "predicate",
-                "object_entity_id",
-                "object_literal",
-                "statement",
-                "project",
-                "recorded_at",
-                "valid_from",
-                "valid_to",
-                "source_session_id",
-                "source_message_index",
-                "source_kind",
-                "confidence",
-                "status",
-                "derived",
-                "derived_from",
-            ],
+    let conn = store.conn.lock().await;
+    let params_ref: Vec<&dyn duckdb::ToSql> =
+        ordered.iter().map(|s| s as &dyn duckdb::ToSql).collect();
+    query_collect(&conn, &sql, &params_ref, session_from_row, "list sessions")
+}
+
+fn load_names(conn: &Connection, entity_id: &str) -> Result<Vec<String>, DomainError> {
+    let mut by_entity = load_names_for(conn, std::slice::from_ref(&entity_id.to_string()))?;
+    Ok(by_entity.remove(entity_id).unwrap_or_default())
+}
+
+/// Load every alias for a batch of entities in one query, grouped by entity
+/// id. The per-row `load_names` was the N+1 half of every list/find method
+/// on this adapter.
+fn load_names_for(
+    conn: &Connection,
+    entity_ids: &[String],
+) -> Result<std::collections::HashMap<String, Vec<String>>, DomainError> {
+    use std::collections::HashMap;
+    let mut by_entity: HashMap<String, Vec<String>> = HashMap::new();
+    if entity_ids.is_empty() {
+        return Ok(by_entity);
+    }
+    let placeholders = std::iter::repeat_n("?", entity_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT entity_id, name FROM entity_names \
+         WHERE entity_id IN ({placeholders}) ORDER BY entity_id, name"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| DomainError::storage(format!("failed to load entity names: {e}")))?;
+    let params_ref: Vec<&dyn duckdb::ToSql> =
+        entity_ids.iter().map(|s| s as &dyn duckdb::ToSql).collect();
+    let mut rows = stmt
+        .query(&params_ref[..])
+        .map_err(|e| DomainError::storage(format!("failed to load entity names: {e}")))?;
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| DomainError::storage(format!("failed to load entity names: {e}")))?
+    {
+        let entity_id: String = row
+            .get(0)
+            .map_err(|e| DomainError::storage(format!("failed to decode entity id: {e}")))?;
+        let name: String = row
+            .get(1)
+            .map_err(|e| DomainError::storage(format!("failed to decode name: {e}")))?;
+        by_entity.entry(entity_id).or_default().push(name);
+    }
+    Ok(by_entity)
+}
+
+/// Attach `names` to a list of entities, in place. One query for the whole
+/// batch.
+fn attach_names(conn: &Connection, entities: Vec<Entity>) -> Result<Vec<Entity>, DomainError> {
+    let ids: Vec<String> = entities.iter().map(|e| e.id.clone()).collect();
+    let mut by_entity = load_names_for(conn, &ids)?;
+    Ok(entities
+        .into_iter()
+        .map(|e| {
+            let names = by_entity.remove(&e.id).unwrap_or_default();
+            Entity { names, ..e }
+        })
+        .collect())
+}
+
+/// Load `entity_ids` for many memories in one query, grouped by memory id.
+///
+/// Callers handing out `Vec<Memory>` were resolving the link one row at a
+/// time — an N+1 against a connection every other table shares. One
+/// `WHERE memory_id IN (…)` and a hash-map group replaces that.
+fn load_entity_ids_for(
+    conn: &Connection,
+    memory_ids: &[String],
+) -> Result<std::collections::HashMap<String, Vec<String>>, DomainError> {
+    use std::collections::HashMap;
+    let mut by_memory: HashMap<String, Vec<String>> = HashMap::new();
+    if memory_ids.is_empty() {
+        return Ok(by_memory);
+    }
+    let placeholders = std::iter::repeat_n("?", memory_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT memory_id, entity_id FROM memory_entities \
+         WHERE memory_id IN ({placeholders}) ORDER BY memory_id, entity_id"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| DomainError::storage(format!("failed to load memory entities: {e}")))?;
+    let params_ref: Vec<&dyn duckdb::ToSql> =
+        memory_ids.iter().map(|s| s as &dyn duckdb::ToSql).collect();
+    let mut rows = stmt
+        .query(&params_ref[..])
+        .map_err(|e| DomainError::storage(format!("failed to load memory entities: {e}")))?;
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| DomainError::storage(format!("failed to load memory entities: {e}")))?
+    {
+        let memory_id: String = row
+            .get(0)
+            .map_err(|e| DomainError::storage(format!("failed to decode memory id: {e}")))?;
+        let entity_id: String = row
+            .get(1)
+            .map_err(|e| DomainError::storage(format!("failed to decode entity id: {e}")))?;
+        by_memory.entry(memory_id).or_default().push(entity_id);
+    }
+    Ok(by_memory)
+}
+
+/// Attach entity ids to a list of memories, in place. One query for the
+/// whole batch.
+fn attach_entity_ids(conn: &Connection, memories: Vec<Memory>) -> Result<Vec<Memory>, DomainError> {
+    let ids: Vec<String> = memories.iter().map(|m| m.id.clone()).collect();
+    let mut by_memory = load_entity_ids_for(conn, &ids)?;
+    Ok(memories
+        .into_iter()
+        .map(|m| {
+            let entity_ids = by_memory.remove(&m.id).unwrap_or_default();
+            Memory { entity_ids, ..m }
+        })
+        .collect())
+}
+
+/// Render a `&[f32]` as a DuckDB array literal `[x, y, z]`. Used because
+/// duckdb-rs cannot bind fixed-width arrays natively.
+fn vector_literal(vector: &[f32]) -> String {
+    let mut s = String::from("[");
+    for (i, v) in vector.iter().enumerate() {
+        if i > 0 {
+            s.push_str(", ");
+        }
+        s.push_str(&format!("{v}"));
+    }
+    s.push(']');
+    s
+}
+
+/// Prepare `sql`, bind `params`, and collect every row through `decode`.
+///
+/// Every read method on this adapter used to spell the same six lines of
+/// prepare/query/loop inline; the shape was identical, only the SQL, the
+/// binds, and the row decoder varied. One helper keeps the variations
+/// visible instead of repeating the ritual.
+fn query_collect<T>(
+    conn: &Connection,
+    sql: &str,
+    params: &[&dyn duckdb::ToSql],
+    decode: impl Fn(&Row<'_>) -> Result<T, duckdb::Error>,
+    op: &'static str,
+) -> Result<Vec<T>, DomainError> {
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|e| DomainError::storage(format!("failed to {op}: {e}")))?;
+    let mut rows = stmt
+        .query(params)
+        .map_err(|e| DomainError::storage(format!("failed to {op}: {e}")))?;
+    let mut out = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| DomainError::storage(format!("failed to {op}: {e}")))?
+    {
+        out.push(
+            decode(row)
+                .map_err(|e| DomainError::storage(format!("failed to decode {op} row: {e}")))?,
         );
     }
+    Ok(out)
 }
