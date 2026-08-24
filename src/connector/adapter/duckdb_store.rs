@@ -75,6 +75,15 @@ impl DuckdbStore {
                 "embedding dimensions must be greater than 0",
             ));
         }
+
+        // Fail fast on a pre-simplification database. `CREATE TABLE IF NOT
+        // EXISTS` would silently keep the old 14-column `memories` table
+        // (with `predicate`, `subject_*`, `object_*`) — SELECTs on the new
+        // explicit column list still work, but every INSERT fails with a
+        // confusing storage error. Detecting the shape here lets the error
+        // name the fix.
+        reject_legacy_schema(&conn)?;
+
         conn.execute_batch(&format!(
             r#"
             CREATE TABLE IF NOT EXISTS memory_meta (
@@ -274,4 +283,44 @@ pub(crate) fn project_scope_clause(
             format!(" AND ({column} = '' OR {column} IN ({placeholders}))")
         }
     }
+}
+
+/// Reject a database written by the pre-simplification schema (the one with
+/// `predicate`, `subject_*`, `object_*` columns on `memories`). The old
+/// store cannot be upgraded in place — there is no meaningful mapping of
+/// `subject/predicate/object` onto a mention list — so the fix is to wipe
+/// the file and re-import. Saying that here beats failing at first write
+/// with a confusing type error.
+fn reject_legacy_schema(conn: &Connection) -> Result<(), DomainError> {
+    // `PRAGMA table_info` errors when the table does not exist, which is
+    // exactly the fresh-database case — treat that as fine.
+    let mut stmt = match conn.prepare("PRAGMA table_info(memories)") {
+        Ok(s) => s,
+        Err(_) => return Ok(()),
+    };
+    let mut rows = match stmt.query([]) {
+        Ok(r) => r,
+        Err(_) => return Ok(()),
+    };
+    let mut columns: Vec<String> = Vec::new();
+    while let Ok(Some(row)) = rows.next() {
+        if let Ok(name) = row.get::<_, String>(1) {
+            columns.push(name);
+        }
+    }
+    if columns.is_empty() {
+        return Ok(());
+    }
+    // The legacy schema carries `predicate` and `subject_entity_id`; the
+    // simplified one does not. Either is proof of a pre-simplification file.
+    if columns.iter().any(|c| c == "predicate" || c == "subject_entity_id") {
+        return Err(DomainError::storage(
+            "this memory database was written by an older version of memory-rs \
+             and cannot be upgraded in place. Delete `memory.duckdb` and \
+             re-import your sessions (e.g. `memory-rs import <transcript>` or \
+             `memory-rs dream` to harvest)."
+                .to_string(),
+        ));
+    }
+    Ok(())
 }

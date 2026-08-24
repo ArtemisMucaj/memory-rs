@@ -164,6 +164,40 @@ async fn namespaces_round_trip() {
 }
 
 #[tokio::test]
+async fn legacy_schema_is_rejected_at_open() {
+    // Build a store with the pre-simplification shape: a `memories` table
+    // carrying `predicate` / `subject_entity_id` / `object_*`. Opening it
+    // with the new build must fail with the wipe-and-reimport message, not
+    // at first write with a type error.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("memory.duckdb");
+    {
+        let conn = duckdb::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE memories (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                subject_entity_id TEXT,
+                subject_literal TEXT,
+                predicate TEXT NOT NULL,
+                object_entity_id TEXT,
+                object_literal TEXT,
+                statement TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+    }
+    let err = DuckdbStore::new(&db_path, common::DIMS, "test-model")
+        .err()
+        .expect("legacy store must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("older version") && msg.contains("Delete `memory.duckdb`"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[tokio::test]
 async fn fresh_db_has_only_the_new_tables() {
     let store = DuckdbStore::in_memory(common::DIMS, "test-model").unwrap();
     let conn = store.conn.lock().await;

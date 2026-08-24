@@ -111,8 +111,15 @@ impl MemoryRepository for DuckdbStore {
         memory: &Memory,
         vector: Option<&[f32]>,
     ) -> Result<(), DomainError> {
-        let conn = self.conn.lock().await;
-        conn.execute(
+        let mut conn = self.conn.lock().await;
+        // Atomic: a crash between the row write and the link / embedding
+        // writes must not leave a memory without its entities. DuckDB's
+        // `Transaction` rolls back on drop if not committed.
+        let tx = conn
+            .transaction()
+            .map_err(|e| DomainError::storage(format!("failed to begin transaction: {e}")))?;
+
+        tx.execute(
             &format!(
                 "INSERT OR REPLACE INTO memories ({MEMORY_COLUMNS}) \
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -132,20 +139,20 @@ impl MemoryRepository for DuckdbStore {
         .map_err(|e| DomainError::storage(format!("failed to append memory: {e}")))?;
 
         // Replace the entity links wholesale.
-        conn.execute(
+        tx.execute(
             "DELETE FROM memory_entities WHERE memory_id = ?",
             params![memory.id],
         )
         .map_err(|e| DomainError::storage(format!("failed to clear memory entities: {e}")))?;
         for entity_id in &memory.entity_ids {
-            conn.execute(
+            tx.execute(
                 "INSERT OR IGNORE INTO memory_entities (memory_id, entity_id) VALUES (?, ?)",
                 params![memory.id, entity_id],
             )
             .map_err(|e| DomainError::storage(format!("failed to link memory to entity: {e}")))?;
         }
 
-        conn.execute(
+        tx.execute(
             "DELETE FROM memory_embeddings WHERE memory_id = ?",
             params![memory.id],
         )
@@ -159,7 +166,7 @@ impl MemoryRepository for DuckdbStore {
                 )));
             }
             let literal = vector_literal(vector);
-            conn.execute(
+            tx.execute(
                 &format!(
                     "INSERT INTO memory_embeddings (memory_id, vector) VALUES (?, {literal})"
                 ),
@@ -167,6 +174,9 @@ impl MemoryRepository for DuckdbStore {
             )
             .map_err(|e| DomainError::storage(format!("failed to write memory embedding: {e}")))?;
         }
+
+        tx.commit()
+            .map_err(|e| DomainError::storage(format!("failed to commit memory write: {e}")))?;
         Ok(())
     }
 
@@ -191,7 +201,8 @@ impl MemoryRepository for DuckdbStore {
         };
         drop(rows);
         drop(stmt);
-        let entity_ids = load_entity_ids(&conn, &memory.id)?;
+        let mut by_memory = load_entity_ids_for(&conn, std::slice::from_ref(&memory.id))?;
+        let entity_ids = by_memory.remove(&memory.id).unwrap_or_default();
         Ok(Some(Memory {
             entity_ids,
             ..memory
@@ -227,15 +238,7 @@ impl MemoryRepository for DuckdbStore {
         }
         drop(rows);
         drop(stmt);
-        let mut with_entities = Vec::with_capacity(out.len());
-        for memory in out {
-            let entity_ids = load_entity_ids(&conn, &memory.id)?;
-            with_entities.push(Memory {
-                entity_ids,
-                ..memory
-            });
-        }
-        Ok(with_entities)
+        attach_entity_ids(&conn, out)
     }
 
     async fn list_memories(
@@ -279,56 +282,57 @@ impl MemoryRepository for DuckdbStore {
         }
         drop(rows);
         drop(stmt);
-        let mut with_entities = Vec::with_capacity(out.len());
-        for memory in out {
-            let entity_ids = load_entity_ids(&conn, &memory.id)?;
-            with_entities.push(Memory {
-                entity_ids,
-                ..memory
-            });
-        }
-        Ok(with_entities)
+        attach_entity_ids(&conn, out)
     }
 
     async fn delete_memory(&self, id: &str) -> Result<bool, DomainError> {
-        let conn = self.conn.lock().await;
-        conn.execute(
+        let mut conn = self.conn.lock().await;
+        let tx = conn
+            .transaction()
+            .map_err(|e| DomainError::storage(format!("failed to begin transaction: {e}")))?;
+        tx.execute(
             "DELETE FROM memory_embeddings WHERE memory_id = ?",
             params![id],
         )
         .map_err(|e| DomainError::storage(format!("failed to delete memory embedding: {e}")))?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM memory_entities WHERE memory_id = ?",
             params![id],
         )
         .map_err(|e| DomainError::storage(format!("failed to delete memory links: {e}")))?;
-        let n = conn
+        let n = tx
             .execute("DELETE FROM memories WHERE id = ?", params![id])
             .map_err(|e| DomainError::storage(format!("failed to delete memory: {e}")))?;
+        tx.commit()
+            .map_err(|e| DomainError::storage(format!("failed to commit memory delete: {e}")))?;
         Ok(n > 0)
     }
 
     async fn delete_memories_for_session(&self, session_id: &str) -> Result<usize, DomainError> {
-        let conn = self.conn.lock().await;
-        // Clear side tables first — DuckDB has no ON DELETE CASCADE.
-        conn.execute(
+        let mut conn = self.conn.lock().await;
+        let tx = conn
+            .transaction()
+            .map_err(|e| DomainError::storage(format!("failed to begin transaction: {e}")))?;
+        tx.execute(
             "DELETE FROM memory_embeddings WHERE memory_id IN \
              (SELECT id FROM memories WHERE source_session_id = ?)",
             params![session_id],
         )
         .map_err(|e| DomainError::storage(format!("failed to delete session embeddings: {e}")))?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM memory_entities WHERE memory_id IN \
              (SELECT id FROM memories WHERE source_session_id = ?)",
             params![session_id],
         )
         .map_err(|e| DomainError::storage(format!("failed to delete session links: {e}")))?;
-        let n = conn
+        let n = tx
             .execute(
                 "DELETE FROM memories WHERE source_session_id = ?",
                 params![session_id],
             )
             .map_err(|e| DomainError::storage(format!("failed to delete session memories: {e}")))?;
+        tx.commit()
+            .map_err(|e| DomainError::storage(format!("failed to commit session delete: {e}")))?;
         Ok(n)
     }
 
@@ -347,8 +351,11 @@ impl MemoryRepository for DuckdbStore {
     // ── Entities ─────────────────────────────────────────────────────────
 
     async fn upsert_entity(&self, entity: &Entity) -> Result<(), DomainError> {
-        let conn = self.conn.lock().await;
-        conn.execute(
+        let mut conn = self.conn.lock().await;
+        let tx = conn
+            .transaction()
+            .map_err(|e| DomainError::storage(format!("failed to begin transaction: {e}")))?;
+        tx.execute(
             "INSERT OR REPLACE INTO entities (id, entity_type, canonical_name, created_at, updated_at) \
              VALUES (?, ?, ?, ?, ?)",
             params![
@@ -362,7 +369,7 @@ impl MemoryRepository for DuckdbStore {
         .map_err(|e| DomainError::storage(format!("failed to upsert entity: {e}")))?;
 
         // Replace the name rows wholesale: canonical + every alias.
-        conn.execute(
+        tx.execute(
             "DELETE FROM entity_names WHERE entity_id = ?",
             params![entity.id],
         )
@@ -374,13 +381,15 @@ impl MemoryRepository for DuckdbStore {
             }
         }
         for name in names {
-            conn.execute(
+            tx.execute(
                 "INSERT OR REPLACE INTO entity_names (name, name_key, entity_id) \
                  VALUES (?, ?, ?)",
                 params![name, entity_name_key(&name), entity.id],
             )
             .map_err(|e| DomainError::storage(format!("failed to write entity name: {e}")))?;
         }
+        tx.commit()
+            .map_err(|e| DomainError::storage(format!("failed to commit entity write: {e}")))?;
         Ok(())
     }
 
@@ -531,15 +540,7 @@ impl MemoryRepository for DuckdbStore {
         }
         drop(rows);
         drop(stmt);
-        let mut with_entities = Vec::with_capacity(out.len());
-        for memory in out {
-            let entity_ids = load_entity_ids(&conn, &memory.id)?;
-            with_entities.push(Memory {
-                entity_ids,
-                ..memory
-            });
-        }
-        Ok(with_entities)
+        attach_entity_ids(&conn, out)
     }
 
     // ── Retrieval ────────────────────────────────────────────────────────
@@ -605,18 +606,15 @@ impl MemoryRepository for DuckdbStore {
         }
         drop(rows);
         drop(stmt);
-        let mut with_entities = Vec::with_capacity(out.len());
-        for (memory, score) in out {
-            let entity_ids = load_entity_ids(&conn, &memory.id)?;
-            with_entities.push((
-                Memory {
-                    entity_ids,
-                    ..memory
-                },
-                score,
-            ));
-        }
-        Ok(with_entities)
+        let ids: Vec<String> = out.iter().map(|(m, _)| m.id.clone()).collect();
+        let mut by_memory = load_entity_ids_for(&conn, &ids)?;
+        Ok(out
+            .into_iter()
+            .map(|(m, score)| {
+                let entity_ids = by_memory.remove(&m.id).unwrap_or_default();
+                (Memory { entity_ids, ..m }, score)
+            })
+            .collect())
     }
 
     async fn search_memories_keyword(
@@ -687,18 +685,15 @@ impl MemoryRepository for DuckdbStore {
         }
         drop(rows);
         drop(stmt);
-        let mut with_entities = Vec::with_capacity(out.len());
-        for (memory, score) in out {
-            let entity_ids = load_entity_ids(&conn, &memory.id)?;
-            with_entities.push((
-                Memory {
-                    entity_ids,
-                    ..memory
-                },
-                score,
-            ));
-        }
-        Ok(with_entities)
+        let ids: Vec<String> = out.iter().map(|(m, _)| m.id.clone()).collect();
+        let mut by_memory = load_entity_ids_for(&conn, &ids)?;
+        Ok(out
+            .into_iter()
+            .map(|(m, score)| {
+                let entity_ids = by_memory.remove(&m.id).unwrap_or_default();
+                (Memory { entity_ids, ..m }, score)
+            })
+            .collect())
     }
 
     async fn list_memories_by_recency(
@@ -743,15 +738,7 @@ impl MemoryRepository for DuckdbStore {
         }
         drop(rows);
         drop(stmt);
-        let mut with_entities = Vec::with_capacity(out.len());
-        for memory in out {
-            let entity_ids = load_entity_ids(&conn, &memory.id)?;
-            with_entities.push(Memory {
-                entity_ids,
-                ..memory
-            });
-        }
-        Ok(with_entities)
+        attach_entity_ids(&conn, out)
     }
 
     // ── Resources ────────────────────────────────────────────────────────
@@ -761,8 +748,11 @@ impl MemoryRepository for DuckdbStore {
         resource: &MemoryResource,
         vector: Option<&[f32]>,
     ) -> Result<(), DomainError> {
-        let conn = self.conn.lock().await;
-        conn.execute(
+        let mut conn = self.conn.lock().await;
+        let tx = conn
+            .transaction()
+            .map_err(|e| DomainError::storage(format!("failed to begin transaction: {e}")))?;
+        tx.execute(
             &format!(
                 "INSERT OR REPLACE INTO memory_resources ({RESOURCE_COLUMNS}) \
                  VALUES (?, ?, ?, ?, ?, ?, ?)"
@@ -779,7 +769,7 @@ impl MemoryRepository for DuckdbStore {
         )
         .map_err(|e| DomainError::storage(format!("failed to upsert resource: {e}")))?;
 
-        conn.execute(
+        tx.execute(
             "DELETE FROM memory_resource_embeddings WHERE uri = ?",
             params![resource.uri],
         )
@@ -793,7 +783,7 @@ impl MemoryRepository for DuckdbStore {
                 )));
             }
             let literal = vector_literal(vector);
-            conn.execute(
+            tx.execute(
                 &format!(
                     "INSERT INTO memory_resource_embeddings (uri, vector) VALUES (?, {literal})"
                 ),
@@ -803,6 +793,8 @@ impl MemoryRepository for DuckdbStore {
                 DomainError::storage(format!("failed to write resource embedding: {e}"))
             })?;
         }
+        tx.commit()
+            .map_err(|e| DomainError::storage(format!("failed to commit resource write: {e}")))?;
         Ok(())
     }
 
@@ -1138,24 +1130,70 @@ fn load_names(conn: &Connection, entity_id: &str) -> Result<Vec<String>, DomainE
     Ok(out)
 }
 
-fn load_entity_ids(conn: &Connection, memory_id: &str) -> Result<Vec<String>, DomainError> {
+/// Load `entity_ids` for many memories in one query, grouped by memory id.
+///
+/// Callers handing out `Vec<Memory>` were resolving the link one row at a
+/// time — an N+1 against a connection every other table shares. One
+/// `WHERE memory_id IN (…)` and a hash-map group replaces that.
+fn load_entity_ids_for(
+    conn: &Connection,
+    memory_ids: &[String],
+) -> Result<std::collections::HashMap<String, Vec<String>>, DomainError> {
+    use std::collections::HashMap;
+    let mut by_memory: HashMap<String, Vec<String>> = HashMap::new();
+    if memory_ids.is_empty() {
+        return Ok(by_memory);
+    }
+    let placeholders = std::iter::repeat_n("?", memory_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT memory_id, entity_id FROM memory_entities \
+         WHERE memory_id IN ({placeholders}) ORDER BY memory_id, entity_id"
+    );
     let mut stmt = conn
-        .prepare("SELECT entity_id FROM memory_entities WHERE memory_id = ? ORDER BY entity_id")
+        .prepare(&sql)
         .map_err(|e| DomainError::storage(format!("failed to load memory entities: {e}")))?;
+    let params_ref: Vec<&dyn duckdb::ToSql> = memory_ids
+        .iter()
+        .map(|s| s as &dyn duckdb::ToSql)
+        .collect();
     let mut rows = stmt
-        .query(params![memory_id])
+        .query(&params_ref[..])
         .map_err(|e| DomainError::storage(format!("failed to load memory entities: {e}")))?;
-    let mut out = Vec::new();
     while let Some(row) = rows
         .next()
         .map_err(|e| DomainError::storage(format!("failed to load memory entities: {e}")))?
     {
-        out.push(
-            row.get::<_, String>(0)
-                .map_err(|e| DomainError::storage(format!("failed to decode entity id: {e}")))?,
-        );
+        let memory_id: String = row
+            .get(0)
+            .map_err(|e| DomainError::storage(format!("failed to decode memory id: {e}")))?;
+        let entity_id: String = row
+            .get(1)
+            .map_err(|e| DomainError::storage(format!("failed to decode entity id: {e}")))?;
+        by_memory.entry(memory_id).or_default().push(entity_id);
     }
-    Ok(out)
+    Ok(by_memory)
+}
+
+/// Attach entity ids to a list of memories, in place. One query for the
+/// whole batch.
+fn attach_entity_ids(
+    conn: &Connection,
+    memories: Vec<Memory>,
+) -> Result<Vec<Memory>, DomainError> {
+    let ids: Vec<String> = memories.iter().map(|m| m.id.clone()).collect();
+    let mut by_memory = load_entity_ids_for(conn, &ids)?;
+    Ok(memories
+        .into_iter()
+        .map(|m| {
+            let entity_ids = by_memory.remove(&m.id).unwrap_or_default();
+            Memory {
+                entity_ids,
+                ..m
+            }
+        })
+        .collect())
 }
 
 /// Render a `&[f32]` as a DuckDB array literal `[x, y, z]`. Used because

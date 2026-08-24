@@ -149,8 +149,9 @@ pub fn entity_name_key(name: &str) -> String {
 /// Fields are public because a memory is a record-like value, constructed
 /// by the ingestion path and read back by retrieval.
 ///
-/// Field order is load-bearing for the storage adapter, which builds its
-/// `INSERT`/`SELECT` column lists in this order.
+/// The storage adapter maps the columnar fields by name; `entity_ids` is
+/// *not* a column — it lives in the `memory_entities` join table and is
+/// loaded by a separate query.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Memory {
     pub id: String,
