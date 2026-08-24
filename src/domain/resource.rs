@@ -49,7 +49,10 @@ mod tests {
             content: "hello world".into(),
             created_at: 0,
         };
-        assert_eq!(r.embedding_text(), "A note about x\n\nLonger context about x.");
+        assert_eq!(
+            r.embedding_text(),
+            "A note about x\n\nLonger context about x."
+        );
     }
 
     #[test]

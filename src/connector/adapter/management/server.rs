@@ -62,7 +62,13 @@ pub fn routes(state: AppState) -> Router {
         .route("/health", get(handlers::health))
         .route("/api/search", get(handlers::search))
         .route("/api/memory", get(handlers::list_memories))
-        .route("/api/memory/{id}", get(handlers::show).delete(handlers::delete))
+        // The wildcard tail is load-bearing: a resource URI like
+        // `memory://resources/<name>` contains slashes after the id segment
+        // and would not match a plain `{id}` pattern.
+        .route(
+            "/api/memory/{*id}",
+            get(handlers::show).delete(handlers::delete),
+        )
         .route("/api/entities", get(handlers::entities))
         .route("/api/entities/{id}", get(handlers::entity))
         .route("/api/tree", get(handlers::tree))

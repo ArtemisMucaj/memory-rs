@@ -59,12 +59,12 @@ async fn delete_memory_removes_row_and_embedding() {
 async fn recency_list_is_newest_first() {
     let store = DuckdbStore::in_memory(common::DIMS, "test-model").unwrap();
     for (id, ts) in [("a", 100), ("b", 300), ("c", 200)] {
-        store
-            .append_memory(&fact(id, "s", ts), None)
-            .await
-            .unwrap();
+        store.append_memory(&fact(id, "s", ts), None).await.unwrap();
     }
-    let listed = store.list_memories_by_recency(None, None, 10).await.unwrap();
+    let listed = store
+        .list_memories_by_recency(None, None, 10)
+        .await
+        .unwrap();
     let ids: Vec<_> = listed.iter().map(|m| m.id.as_str()).collect();
     assert_eq!(ids, ["b", "c", "a"]);
 }
@@ -136,7 +136,11 @@ async fn sessions_record_and_list() {
         last_error: None,
     };
     store.record_session(&s).await.unwrap();
-    let got = store.find_session("s1").await.unwrap().unwrap();
+    let got = store
+        .find_session("claude:/tmp/x.jsonl", "s1")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(got.id, "s1");
     assert_eq!(got.project.as_deref(), Some("memory-rs"));
 
@@ -161,6 +165,29 @@ async fn namespaces_round_trip() {
     assert!(store.namespace_created_at("work").await.unwrap().is_some());
     assert!(store.unassign_project("work", "memory-rs").await.unwrap());
     assert!(!store.unassign_project("work", "memory-rs").await.unwrap());
+}
+
+#[tokio::test]
+async fn sessions_with_colliding_ids_from_different_sources_coexist() {
+    // Claude, OpenCode and Zed mint ids from independent namespaces. The
+    // composite `(source, id)` key is what keeps two sources reusing the
+    // same session id from clobbering each other's markers.
+    let store = DuckdbStore::in_memory(common::DIMS, "test-model").unwrap();
+    for source in ["claude:proj/s.jsonl", "opencode:s", "zed:s"] {
+        let s = ImportedSession {
+            id: "s".into(),
+            source: source.into(),
+            imported_at: 100,
+            message_count: 10,
+            project: None,
+            items_written: 0,
+            status: SessionStatus::Imported,
+            last_error: None,
+        };
+        store.record_session(&s).await.unwrap();
+    }
+    let listed = store.list_sessions(None, 10).await.unwrap();
+    assert_eq!(listed.len(), 3, "each source keeps its own marker");
 }
 
 #[tokio::test]

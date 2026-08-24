@@ -240,7 +240,10 @@ impl Container {
             self.memory_repository()?,
             self.embedder()?,
         );
-        Ok(ImportSessionUseCase::new(self.memory_repository()?, ingestion))
+        Ok(ImportSessionUseCase::new(
+            self.memory_repository()?,
+            ingestion,
+        ))
     }
 
     /// Memory ingestion, driven by the extraction model.

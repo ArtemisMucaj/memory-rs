@@ -52,16 +52,16 @@ fn memory_from_row(row: &Row<'_>) -> Result<Memory, duckdb::Error> {
     let kind: String = row.get(1)?;
     let source_kind: String = row.get(7)?;
     Ok(Memory {
-        id: row.get(0)?,                                            // 0 id
-        kind: MemoryKind::parse(&kind).unwrap_or(MemoryKind::Fact), // 1 kind
-        statement: row.get(2)?,                                     // 2 statement
+        id: row.get(0)?,                                                               // 0 id
+        kind: MemoryKind::parse(&kind).unwrap_or(MemoryKind::Fact),                    // 1 kind
+        statement: row.get(2)?,                                 // 2 statement
         entity_ids: Vec::new(), // filled by a second query; see `load_entity_ids`
-        project: project_from_column(row.get::<_, String>(3)?),     // 3 project
-        recorded_at: row.get(4)?,                                   // 4 recorded_at
+        project: project_from_column(row.get::<_, String>(3)?), // 3 project
+        recorded_at: row.get(4)?, // 4 recorded_at
         source_session_id: row.get(5)?, // 5 source_session_id
         source_message_index: row.get(6)?, // 6 source_message_index
         source_kind: SourceKind::parse(&source_kind).unwrap_or(SourceKind::Extracted), // 7
-        confidence: row.get::<_, f64>(8)? as f32,                   // 8 confidence
+        confidence: row.get::<_, f64>(8)? as f32, // 8 confidence
     })
 }
 
@@ -111,6 +111,17 @@ impl MemoryRepository for DuckdbStore {
         memory: &Memory,
         vector: Option<&[f32]>,
     ) -> Result<(), DomainError> {
+        // Validate before opening the transaction: a wrong-width vector must
+        // fail the call without having touched the store.
+        if let Some(vector) = vector {
+            if vector.len() != self.dimensions {
+                return Err(DomainError::invalid_input(format!(
+                    "vector width {} does not match pinned dimensions {}",
+                    vector.len(),
+                    self.dimensions
+                )));
+            }
+        }
         let mut conn = self.conn.lock().await;
         // Atomic: a crash between the row write and the link / embedding
         // writes must not leave a memory without its entities. DuckDB's
@@ -158,18 +169,9 @@ impl MemoryRepository for DuckdbStore {
         )
         .map_err(|e| DomainError::storage(format!("failed to clear memory embedding: {e}")))?;
         if let Some(vector) = vector {
-            if vector.len() != self.dimensions {
-                return Err(DomainError::invalid_input(format!(
-                    "vector width {} does not match pinned dimensions {}",
-                    vector.len(),
-                    self.dimensions
-                )));
-            }
             let literal = vector_literal(vector);
             tx.execute(
-                &format!(
-                    "INSERT INTO memory_embeddings (memory_id, vector) VALUES (?, {literal})"
-                ),
+                &format!("INSERT INTO memory_embeddings (memory_id, vector) VALUES (?, {literal})"),
                 params![memory.id],
             )
             .map_err(|e| DomainError::storage(format!("failed to write memory embedding: {e}")))?;
@@ -194,9 +196,8 @@ impl MemoryRepository for DuckdbStore {
             .next()
             .map_err(|e| DomainError::storage(format!("failed to find memory: {e}")))?
         {
-            Some(row) => memory_from_row(row).map_err(|e| {
-                DomainError::storage(format!("failed to decode memory: {e}"))
-            })?,
+            Some(row) => memory_from_row(row)
+                .map_err(|e| DomainError::storage(format!("failed to decode memory: {e}")))?,
             None => return Ok(None),
         };
         drop(rows);
@@ -222,8 +223,7 @@ impl MemoryRepository for DuckdbStore {
                 "SELECT {MEMORY_COLUMNS} FROM memories WHERE id IN ({placeholders})"
             ))
             .map_err(|e| DomainError::storage(format!("failed to find memories: {e}")))?;
-        let params: Vec<&dyn duckdb::ToSql> =
-            ids.iter().map(|s| s as &dyn duckdb::ToSql).collect();
+        let params: Vec<&dyn duckdb::ToSql> = ids.iter().map(|s| s as &dyn duckdb::ToSql).collect();
         let mut rows = stmt
             .query(&params[..])
             .map_err(|e| DomainError::storage(format!("failed to find memories: {e}")))?;
@@ -232,9 +232,10 @@ impl MemoryRepository for DuckdbStore {
             .next()
             .map_err(|e| DomainError::storage(format!("failed to find memories: {e}")))?
         {
-            out.push(memory_from_row(row).map_err(|e| {
-                DomainError::storage(format!("failed to decode memory: {e}"))
-            })?);
+            out.push(
+                memory_from_row(row)
+                    .map_err(|e| DomainError::storage(format!("failed to decode memory: {e}")))?,
+            );
         }
         drop(rows);
         drop(stmt);
@@ -276,9 +277,10 @@ impl MemoryRepository for DuckdbStore {
             .next()
             .map_err(|e| DomainError::storage(format!("failed to list memories: {e}")))?
         {
-            out.push(memory_from_row(row).map_err(|e| {
-                DomainError::storage(format!("failed to decode memory: {e}"))
-            })?);
+            out.push(
+                memory_from_row(row)
+                    .map_err(|e| DomainError::storage(format!("failed to decode memory: {e}")))?,
+            );
         }
         drop(rows);
         drop(stmt);
@@ -407,9 +409,8 @@ impl MemoryRepository for DuckdbStore {
             .next()
             .map_err(|e| DomainError::storage(format!("failed to find entity: {e}")))?
         {
-            Some(row) => entity_from_row(row).map_err(|e| {
-                DomainError::storage(format!("failed to decode entity: {e}"))
-            })?,
+            Some(row) => entity_from_row(row)
+                .map_err(|e| DomainError::storage(format!("failed to decode entity: {e}")))?,
             None => return Ok(None),
         };
         drop(rows);
@@ -441,9 +442,10 @@ impl MemoryRepository for DuckdbStore {
             .next()
             .map_err(|e| DomainError::storage(format!("failed to find entities: {e}")))?
         {
-            out.push(entity_from_row(row).map_err(|e| {
-                DomainError::storage(format!("failed to decode entity: {e}"))
-            })?);
+            out.push(
+                entity_from_row(row)
+                    .map_err(|e| DomainError::storage(format!("failed to decode entity: {e}")))?,
+            );
         }
         drop(rows);
         drop(stmt);
@@ -473,9 +475,10 @@ impl MemoryRepository for DuckdbStore {
             .next()
             .map_err(|e| DomainError::storage(format!("failed to find entities by name: {e}")))?
         {
-            out.push(entity_from_row(row).map_err(|e| {
-                DomainError::storage(format!("failed to decode entity: {e}"))
-            })?);
+            out.push(
+                entity_from_row(row)
+                    .map_err(|e| DomainError::storage(format!("failed to decode entity: {e}")))?,
+            );
         }
         drop(rows);
         drop(stmt);
@@ -502,9 +505,10 @@ impl MemoryRepository for DuckdbStore {
             .next()
             .map_err(|e| DomainError::storage(format!("failed to list entities: {e}")))?
         {
-            out.push(entity_from_row(row).map_err(|e| {
-                DomainError::storage(format!("failed to decode entity: {e}"))
-            })?);
+            out.push(
+                entity_from_row(row)
+                    .map_err(|e| DomainError::storage(format!("failed to decode entity: {e}")))?,
+            );
         }
         drop(rows);
         drop(stmt);
@@ -534,9 +538,10 @@ impl MemoryRepository for DuckdbStore {
             .next()
             .map_err(|e| DomainError::storage(format!("failed to list entity memories: {e}")))?
         {
-            out.push(memory_from_row(row).map_err(|e| {
-                DomainError::storage(format!("failed to decode memory: {e}"))
-            })?);
+            out.push(
+                memory_from_row(row)
+                    .map_err(|e| DomainError::storage(format!("failed to decode memory: {e}")))?,
+            );
         }
         drop(rows);
         drop(stmt);
@@ -596,9 +601,8 @@ impl MemoryRepository for DuckdbStore {
             .next()
             .map_err(|e| DomainError::storage(format!("failed to search memories: {e}")))?
         {
-            let memory = memory_from_row(row).map_err(|e| {
-                DomainError::storage(format!("failed to decode memory: {e}"))
-            })?;
+            let memory = memory_from_row(row)
+                .map_err(|e| DomainError::storage(format!("failed to decode memory: {e}")))?;
             let score: f64 = row
                 .get(MEMORY_COLUMN_COUNT)
                 .map_err(|e| DomainError::storage(format!("failed to read score: {e}")))?;
@@ -672,12 +676,12 @@ impl MemoryRepository for DuckdbStore {
             .query(&params_ref[..])
             .map_err(|e| DomainError::storage(format!("failed to keyword-search memories: {e}")))?;
         let mut out = Vec::new();
-        while let Some(row) = rows.next().map_err(|e| {
-            DomainError::storage(format!("failed to keyword-search memories: {e}"))
-        })? {
-            let memory = memory_from_row(row).map_err(|e| {
-                DomainError::storage(format!("failed to decode memory: {e}"))
-            })?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| DomainError::storage(format!("failed to keyword-search memories: {e}")))?
+        {
+            let memory = memory_from_row(row)
+                .map_err(|e| DomainError::storage(format!("failed to decode memory: {e}")))?;
             let score: f64 = row
                 .get(MEMORY_COLUMN_COUNT)
                 .map_err(|e| DomainError::storage(format!("failed to read score: {e}")))?;
@@ -720,21 +724,23 @@ impl MemoryRepository for DuckdbStore {
         ordered.push(limit.to_string());
 
         let conn = self.conn.lock().await;
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| DomainError::storage(format!("failed to list memories by recency: {e}")))?;
+        let mut stmt = conn.prepare(&sql).map_err(|e| {
+            DomainError::storage(format!("failed to list memories by recency: {e}"))
+        })?;
         let params_ref: Vec<&dyn duckdb::ToSql> =
             ordered.iter().map(|s| s as &dyn duckdb::ToSql).collect();
         let mut rows = stmt.query(&params_ref[..]).map_err(|e| {
             DomainError::storage(format!("failed to list memories by recency: {e}"))
         })?;
         let mut out = Vec::new();
-        while let Some(row) = rows.next().map_err(|e| {
-            DomainError::storage(format!("failed to list memories by recency: {e}"))
-        })? {
-            out.push(memory_from_row(row).map_err(|e| {
-                DomainError::storage(format!("failed to decode memory: {e}"))
-            })?);
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| DomainError::storage(format!("failed to list memories by recency: {e}")))?
+        {
+            out.push(
+                memory_from_row(row)
+                    .map_err(|e| DomainError::storage(format!("failed to decode memory: {e}")))?,
+            );
         }
         drop(rows);
         drop(stmt);
@@ -748,6 +754,16 @@ impl MemoryRepository for DuckdbStore {
         resource: &MemoryResource,
         vector: Option<&[f32]>,
     ) -> Result<(), DomainError> {
+        // Validate before opening the transaction.
+        if let Some(vector) = vector {
+            if vector.len() != self.dimensions {
+                return Err(DomainError::invalid_input(format!(
+                    "vector width {} does not match pinned dimensions {}",
+                    vector.len(),
+                    self.dimensions
+                )));
+            }
+        }
         let mut conn = self.conn.lock().await;
         let tx = conn
             .transaction()
@@ -775,13 +791,6 @@ impl MemoryRepository for DuckdbStore {
         )
         .map_err(|e| DomainError::storage(format!("failed to clear resource embedding: {e}")))?;
         if let Some(vector) = vector {
-            if vector.len() != self.dimensions {
-                return Err(DomainError::invalid_input(format!(
-                    "vector width {} does not match pinned dimensions {}",
-                    vector.len(),
-                    self.dimensions
-                )));
-            }
             let literal = vector_literal(vector);
             tx.execute(
                 &format!(
@@ -834,9 +843,10 @@ impl MemoryRepository for DuckdbStore {
             .next()
             .map_err(|e| DomainError::storage(format!("failed to list resources: {e}")))?
         {
-            out.push(resource_from_row(row).map_err(|e| {
-                DomainError::storage(format!("failed to decode resource: {e}"))
-            })?);
+            out.push(
+                resource_from_row(row)
+                    .map_err(|e| DomainError::storage(format!("failed to decode resource: {e}")))?,
+            );
         }
         Ok(out)
     }
@@ -873,9 +883,8 @@ impl MemoryRepository for DuckdbStore {
             .next()
             .map_err(|e| DomainError::storage(format!("failed to search resources: {e}")))?
         {
-            let resource = resource_from_row(row).map_err(|e| {
-                DomainError::storage(format!("failed to decode resource: {e}"))
-            })?;
+            let resource = resource_from_row(row)
+                .map_err(|e| DomainError::storage(format!("failed to decode resource: {e}")))?;
             let score: f64 = row
                 .get(RESOURCE_COLUMN_COUNT)
                 .map_err(|e| DomainError::storage(format!("failed to read score: {e}")))?;
@@ -954,12 +963,14 @@ impl MemoryRepository for DuckdbStore {
             .query(params![name])
             .map_err(|e| DomainError::storage(format!("failed to list namespace projects: {e}")))?;
         let mut out = Vec::new();
-        while let Some(row) = rows.next().map_err(|e| {
-            DomainError::storage(format!("failed to list namespace projects: {e}"))
-        })? {
-            out.push(row.get::<_, String>(0).map_err(|e| {
-                DomainError::storage(format!("failed to read project: {e}"))
-            })?);
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| DomainError::storage(format!("failed to list namespace projects: {e}")))?
+        {
+            out.push(
+                row.get::<_, String>(0)
+                    .map_err(|e| DomainError::storage(format!("failed to read project: {e}")))?,
+            );
         }
         Ok(out)
     }
@@ -1040,15 +1051,19 @@ impl MemoryRepository for DuckdbStore {
         Ok(())
     }
 
-    async fn find_session(&self, id: &str) -> Result<Option<ImportedSession>, DomainError> {
+    async fn find_session(
+        &self,
+        source: &str,
+        id: &str,
+    ) -> Result<Option<ImportedSession>, DomainError> {
         let conn = self.conn.lock().await;
         let mut stmt = conn
             .prepare(&format!(
-                "SELECT {SESSION_COLUMNS} FROM memory_sessions WHERE id = ?"
+                "SELECT {SESSION_COLUMNS} FROM memory_sessions WHERE source = ? AND id = ?"
             ))
             .map_err(|e| DomainError::storage(format!("failed to find session: {e}")))?;
         let mut rows = stmt
-            .query(params![id])
+            .query(params![source, id])
             .map_err(|e| DomainError::storage(format!("failed to find session: {e}")))?;
         match rows
             .next()
@@ -1066,48 +1081,81 @@ impl MemoryRepository for DuckdbStore {
         projects: Option<&[String]>,
         limit: usize,
     ) -> Result<Vec<ImportedSession>, DomainError> {
-        let mut params: Vec<String> = Vec::new();
-        // Sessions store project as a real NULL/Optional column rather than
-        // the `''` convention the memories table uses.
-        let scope = match projects {
-            None => String::new(),
-            Some([]) => " AND project IS NULL".to_string(),
-            Some(ps) => {
-                let placeholders = std::iter::repeat_n("?", ps.len())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                for p in ps {
-                    params.push(p.clone());
-                }
-                format!(" AND project IN ({placeholders})")
-            }
-        };
-        let sql = format!(
-            "SELECT {SESSION_COLUMNS} FROM memory_sessions WHERE TRUE{scope} \
-             ORDER BY imported_at DESC LIMIT ?"
-        );
-        params.push(limit.to_string());
-
-        let conn = self.conn.lock().await;
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| DomainError::storage(format!("failed to list sessions: {e}")))?;
-        let params_ref: Vec<&dyn duckdb::ToSql> =
-            params.iter().map(|s| s as &dyn duckdb::ToSql).collect();
-        let mut rows = stmt
-            .query(&params_ref[..])
-            .map_err(|e| DomainError::storage(format!("failed to list sessions: {e}")))?;
-        let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .map_err(|e| DomainError::storage(format!("failed to list sessions: {e}")))?
-        {
-            out.push(session_from_row(row).map_err(|e| {
-                DomainError::storage(format!("failed to decode session: {e}"))
-            })?);
-        }
-        Ok(out)
+        list_sessions_inner(self, None, projects, limit).await
     }
+
+    async fn list_sessions_by_status(
+        &self,
+        status: SessionStatus,
+        projects: Option<&[String]>,
+        limit: usize,
+    ) -> Result<Vec<ImportedSession>, DomainError> {
+        list_sessions_inner(self, Some(status), projects, limit).await
+    }
+}
+
+/// Shared body of `list_sessions` / `list_sessions_by_status` — free
+/// function rather than an inherent method, so the trait impl stays a list
+/// of port methods.
+async fn list_sessions_inner(
+    store: &DuckdbStore,
+    status: Option<SessionStatus>,
+    projects: Option<&[String]>,
+    limit: usize,
+) -> Result<Vec<ImportedSession>, DomainError> {
+    let mut params: Vec<String> = Vec::new();
+    // Sessions store project as a real NULL/Optional column rather than
+    // the `''` convention the memories table uses.
+    let scope = match projects {
+        None => String::new(),
+        Some([]) => " AND project IS NULL".to_string(),
+        Some(ps) => {
+            let placeholders = std::iter::repeat_n("?", ps.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            for p in ps {
+                params.push(p.clone());
+            }
+            format!(" AND project IN ({placeholders})")
+        }
+    };
+    let status_clause = match status {
+        Some(_) => " AND status = ?",
+        None => "",
+    };
+    let sql = format!(
+        "SELECT {SESSION_COLUMNS} FROM memory_sessions \
+             WHERE TRUE{status_clause}{scope} \
+             ORDER BY imported_at DESC LIMIT ?"
+    );
+    // Bind order: status (if any), scope projects, limit.
+    let mut ordered: Vec<String> = Vec::new();
+    if let Some(s) = status {
+        ordered.push(s.as_str().to_string());
+    }
+    ordered.extend(params);
+    ordered.push(limit.to_string());
+
+    let conn = store.conn.lock().await;
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| DomainError::storage(format!("failed to list sessions: {e}")))?;
+    let params_ref: Vec<&dyn duckdb::ToSql> =
+        ordered.iter().map(|s| s as &dyn duckdb::ToSql).collect();
+    let mut rows = stmt
+        .query(&params_ref[..])
+        .map_err(|e| DomainError::storage(format!("failed to list sessions: {e}")))?;
+    let mut out = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| DomainError::storage(format!("failed to list sessions: {e}")))?
+    {
+        out.push(
+            session_from_row(row)
+                .map_err(|e| DomainError::storage(format!("failed to decode session: {e}")))?,
+        );
+    }
+    Ok(out)
 }
 
 fn load_names(conn: &Connection, entity_id: &str) -> Result<Vec<String>, DomainError> {
@@ -1154,10 +1202,8 @@ fn load_entity_ids_for(
     let mut stmt = conn
         .prepare(&sql)
         .map_err(|e| DomainError::storage(format!("failed to load memory entities: {e}")))?;
-    let params_ref: Vec<&dyn duckdb::ToSql> = memory_ids
-        .iter()
-        .map(|s| s as &dyn duckdb::ToSql)
-        .collect();
+    let params_ref: Vec<&dyn duckdb::ToSql> =
+        memory_ids.iter().map(|s| s as &dyn duckdb::ToSql).collect();
     let mut rows = stmt
         .query(&params_ref[..])
         .map_err(|e| DomainError::storage(format!("failed to load memory entities: {e}")))?;
@@ -1178,20 +1224,14 @@ fn load_entity_ids_for(
 
 /// Attach entity ids to a list of memories, in place. One query for the
 /// whole batch.
-fn attach_entity_ids(
-    conn: &Connection,
-    memories: Vec<Memory>,
-) -> Result<Vec<Memory>, DomainError> {
+fn attach_entity_ids(conn: &Connection, memories: Vec<Memory>) -> Result<Vec<Memory>, DomainError> {
     let ids: Vec<String> = memories.iter().map(|m| m.id.clone()).collect();
     let mut by_memory = load_entity_ids_for(conn, &ids)?;
     Ok(memories
         .into_iter()
         .map(|m| {
             let entity_ids = by_memory.remove(&m.id).unwrap_or_default();
-            Memory {
-                entity_ids,
-                ..m
-            }
+            Memory { entity_ids, ..m }
         })
         .collect())
 }

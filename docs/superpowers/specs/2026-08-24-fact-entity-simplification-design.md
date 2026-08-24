@@ -29,27 +29,31 @@ Inspection of the live store (`~/.memory-rs/memory.duckdb`) shows:
 
 ### Data model that survives
 
-**`Memory`** — append-only-ish fact triple:
+**`Memory`** — a self-contained statement plus the entities it mentions:
 ```
-id, kind=Fact, subject: EntityRef, predicate: Predicate, object: EntityRef,
-statement, project: Option<String>, recorded_at, source_session_id,
-source_message_index, source_kind, confidence
+id, kind=Fact, statement, entity_ids: Vec<String>, project: Option<String>,
+recorded_at, source_session_id, source_message_index, source_kind, confidence
 ```
-Plus an embedding over `statement` in a side table.
+Plus an embedding over `statement` in a side table. The memory↔entity link
+is a `memory_entities(memory_id, entity_id)` join table.
 
 **Update model:** hard delete + insert. No `status`, no `valid_from`/`valid_to`,
-no `derived`/`derived_from`. Newest write wins.
+no `derived`/`derived_from`. Newest write wins. The displaced row is deleted
+*after* the new one lands, so a failed write loses nothing.
 
-**`Predicate`** — 17 variants → 7:
-`prefers, avoids, uses, fixes, decided, is_a, relates_to`.
-Dropped: `requires, provides, implements, contains, derived_from, configures,
-causes, prevents, has, works_on`. Callers mapping old values: `requires /
-provides / implements / contains / derived_from / configures / has / works_on`
-fold into `relates_to`; `causes / prevents` fold into `fixes` when the object
-is a problem, else `relates_to`.
+**No `Predicate`.** The verb lives in the statement, where a reader looks
+for it. Inspection of the live store showed most rows landed on `relates_to`
+anyway — the closed vocabulary was not pulling its weight.
+
+**No subject/object split.** A fact mentions zero or more entities via
+`entity_ids`. That is the whole of the memory↔entity relationship.
 
 **`MemoryKind`** — keep the enum with a single `Fact` variant. Keeps the field
 on `Memory` for forward compatibility without carrying dead variants.
+
+**`SourceKind`** — two variants: `user_stated`, `extracted`. The
+`assistant_inferred` / `derived` split was not stable enough to keep; both
+parse-forward into `extracted` for rows written by an older build.
 
 **`Entity`** — keep. `entity_name_key` normalization stays.
 Resolution = exact name-key match only. The embedding-similarity tier and the
@@ -59,8 +63,9 @@ were built for is better handled by the normalization we already have).
 `entity_type` vocabulary: `person, tool, service, library, concept`. The
 `project` type is retired — projects are a column on `Memory`, not entities.
 
-**`ImportedSession`** — keep as-is. Sessions still drive "what was I working
-on" and feed extraction.
+**`ImportedSession`** — kept, with a `(source, id)` composite key. Claude,
+OpenCode and Zed mint ids from independent namespaces, so `id` alone is not
+unique.
 
 ### Data model deleted
 
@@ -88,13 +93,13 @@ Drop and recreate `memory.duckdb`. **No migration.** New tables:
 
 ### Extraction
 
-Prompt asks the model for triples:
-`(subject_name, subject_type, predicate, object_name_or_literal, statement,
-project, source_message_index)`.
+Prompt asks the model for self-contained facts plus entity mentions:
+`(statement, source_kind, confidence, source_message_index, entity_mentions:
+[{name, type}])`.
 
-Predicate vocabulary restricted to the 7 above. No kinds, no L0/L1/L2
-abstracts. Server resolves `subject_name` / `object_name` to entities via
-`entity_name_key`, creating entities on first sight.
+No `kind`, no `predicate`, no `subject`/`object` split. Server resolves each
+mention to an entity via `entity_name_key`, creating it on first sight.
+Entity types outside `VALID_ENTITY_TYPES` map to `unknown`.
 
 ### Recall
 

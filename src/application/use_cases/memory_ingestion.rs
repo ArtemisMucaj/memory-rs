@@ -92,6 +92,10 @@ struct RawMemory {
     source_kind: String,
     #[serde(default)]
     confidence: f32,
+    /// Index of the transcript message the fact came from. Optional — the
+    /// model omits it when it cannot place the fact cleanly.
+    #[serde(default)]
+    source_message_index: Option<i64>,
     #[serde(default)]
     entity_mentions: Vec<RawEntityMention>,
 }
@@ -107,11 +111,19 @@ struct RawEntityMention {
 /// Identity used to collapse duplicate memories within and across sessions:
 /// the normalized statement text plus the project scope. Two memories with
 /// the same statement about the same project are the same fact.
+///
+/// Length-prefixed fields rather than a separator — a plain `a|b` encoding
+/// lets `(statement="a|b", project="c")` collide with `(statement="a",
+/// project="b|c")`, which would silently delete an unrelated memory.
 fn duplicate_key(memory: &Memory) -> String {
+    let statement = memory.statement.trim().to_lowercase();
+    let project = memory.project.as_deref().unwrap_or("");
     format!(
-        "{}|{}",
-        memory.statement.trim().to_lowercase(),
-        memory.project.as_deref().unwrap_or(""),
+        "{}:{}{}:{}",
+        statement.len(),
+        statement,
+        project.len(),
+        project
     )
 }
 
@@ -281,24 +293,28 @@ impl MemoryIngestionUseCase {
                 project: transcript.project.clone(),
                 recorded_at: now,
                 source_session_id: Some(transcript.id.clone()),
-                source_message_index: None,
+                source_message_index: raw_memory.source_message_index,
                 source_kind: SourceKind::parse(&raw_memory.source_kind)
                     .unwrap_or(SourceKind::Extracted),
                 confidence: raw_memory.confidence.clamp(0.0, 1.0),
             };
 
             let key = duplicate_key(&memory);
-            if let Some(existing_id) = seen.get(&key).cloned() {
-                // Hard delete + insert — newest write wins.
-                self.memory_repo.delete_memory(&existing_id).await?;
-                report.memories_deduped += 1;
-            }
+            let displaced = seen.get(&key).cloned();
 
+            // Write the new row first. Deleting the displaced memory before
+            // the write would leave a window where the store has neither —
+            // a failed append would be a lost fact instead of a stale one.
             let vector = self.embed_opt(&memory.statement).await;
             self.memory_repo
                 .append_memory(&memory, vector.as_deref())
                 .await?;
             report.memories_written += 1;
+
+            if let Some(existing_id) = displaced {
+                self.memory_repo.delete_memory(&existing_id).await?;
+                report.memories_deduped += 1;
+            }
             seen.insert(key, memory.id.clone());
         }
         Ok(report)
@@ -323,9 +339,14 @@ impl MemoryIngestionUseCase {
         if trimmed.is_empty() {
             return Ok(None);
         }
-        let entity_type = match mention.entity_type.trim() {
+        // Anything outside the closed vocabulary is remapped to `unknown` —
+        // a malformed response such as `database` must not become a
+        // permanent unsupported type that blocks later valid mentions from
+        // merging with it.
+        let entity_type = match mention.entity_type.trim().to_lowercase().as_str() {
             "" => UNKNOWN_ENTITY_TYPE.to_string(),
-            t => t.to_lowercase(),
+            t if crate::domain::VALID_ENTITY_TYPES.contains(&t) => t.to_string(),
+            _ => UNKNOWN_ENTITY_TYPE.to_string(),
         };
         let key = format!("{}\u{0}{entity_type}", entity_name_key(trimmed));
         if let Some(id) = cache.get(&key) {
@@ -445,6 +466,23 @@ mod tests {
         let mut global = base.clone();
         global.project = None;
         assert_ne!(duplicate_key(&base), duplicate_key(&global));
+    }
+
+    /// The encoding must not let a separator inside one field spill into the
+    /// next — `(statement="a|b", project="c")` and `(statement="a",
+    /// project="b|c")` would otherwise produce the same key, and the dedupe
+    /// pass would delete an unrelated memory.
+    #[test]
+    fn duplicate_key_is_not_ambiguous_across_field_boundaries() {
+        let mut a = memory_with("a", SourceKind::UserStated, 0.5);
+        a.statement = "a|b".to_string();
+        a.project = Some("c".to_string());
+
+        let mut b = memory_with("b", SourceKind::UserStated, 0.5);
+        b.statement = "a".to_string();
+        b.project = Some("b|c".to_string());
+
+        assert_ne!(duplicate_key(&a), duplicate_key(&b));
     }
 
     #[test]

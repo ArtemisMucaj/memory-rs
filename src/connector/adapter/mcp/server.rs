@@ -392,8 +392,8 @@ impl ServerHandler for MemoryMcpServer {
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             server_info: Implementation::from_build_env(),
             instructions: Some(
-                "Long-term memory server. Memory is stored as atomic facts (subject–predicate–object) \
-                 anchored to resolved entities. Recall ranks by RRF over semantic similarity, keyword \
+                "Long-term memory server. Memory is stored as self-contained statements, each anchored \
+                 to the entities it mentions. Recall ranks by RRF over semantic similarity, keyword \
                  match, and recency — newer memories carry more weight.\n\
                  Tools:\n\
                  • resume_work — catch up on recent sessions before starting work in a project\n\

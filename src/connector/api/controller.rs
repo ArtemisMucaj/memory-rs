@@ -8,14 +8,10 @@
 //! format. This keeps the three surfaces in lockstep with zero duplicated
 //! logic.
 
-use crate::application::{
-    DreamReport, ImportOutcome, IngestionOutcome, Recalled, ResumeBriefing,
-};
+use crate::application::{DreamReport, ImportOutcome, IngestionOutcome, Recalled, ResumeBriefing};
 use crate::connector::adapter::{fetch_resource, parse_transcript_file};
 use crate::connector::api::Container;
-use crate::domain::{
-    DomainError, Entity, ImportedSession, Memory, MemoryKind, MemoryResource,
-};
+use crate::domain::{DomainError, Entity, ImportedSession, Memory, MemoryKind, MemoryResource};
 
 /// How a memory should be scoped for a search.
 #[derive(Debug, Clone, Default)]
@@ -47,7 +43,10 @@ pub async fn resolve_scope(
         SearchScope::All => ScopeResolution::All,
         SearchScope::Project(p) => ScopeResolution::Projects(vec![p.clone()]),
         SearchScope::Namespace(ns) => {
-            let projects = container.memory_repository()?.namespace_projects(ns).await?;
+            let projects = container
+                .memory_repository()?
+                .namespace_projects(ns)
+                .await?;
             if projects.is_empty() {
                 ScopeResolution::EmptyNamespace(ns.clone())
             } else {
@@ -183,7 +182,10 @@ pub async fn list_memories(
     container: &Container,
     projects: Option<&[String]>,
 ) -> Result<Vec<Memory>, DomainError> {
-    container.memory_repository()?.list_memories(None, projects).await
+    container
+        .memory_repository()?
+        .list_memories(None, projects)
+        .await
 }
 
 /// What a `show <id>` against the memory store resolves to.
@@ -275,7 +277,39 @@ pub async fn tree(
     let repo = container.memory_repository()?;
     let mut out = Vec::new();
     match uri {
-        None | Some("memory://") | Some("memory://resources") => {
+        None | Some("memory://") => {
+            // Root: every section, so a client can discover the shape.
+            let memories = repo.list_memories(None, None).await?;
+            out.push(serde_json::json!({
+                "uri": "memory://memory",
+                "kind": "memory",
+                "abstract": format!("{} memories", memories.len()),
+            }));
+            for r in repo.list_resources().await? {
+                out.push(serde_json::json!({
+                    "uri": r.uri,
+                    "kind": "resource",
+                    "abstract": r.abstract_,
+                }));
+            }
+            for s in repo.list_sessions(None, 50).await? {
+                out.push(serde_json::json!({
+                    "uri": format!("memory://sessions/{}", s.id),
+                    "kind": "session",
+                    "abstract": format!("{} messages, {} memories", s.message_count, s.items_written),
+                }));
+            }
+        }
+        Some("memory://memory") => {
+            for m in repo.list_memories(None, None).await? {
+                out.push(serde_json::json!({
+                    "uri": format!("memory://memory/{}", m.id),
+                    "kind": "memory",
+                    "abstract": m.statement,
+                }));
+            }
+        }
+        Some("memory://resources") => {
             for r in repo.list_resources().await? {
                 out.push(serde_json::json!({
                     "uri": r.uri,
@@ -355,12 +389,21 @@ pub async fn add_resource(
         "required": ["abstract", "overview"],
         "additionalProperties": false
     });
-    let (abstract_, overview) = match chat.complete_json(system, &user, "add_resource", &schema).await {
+    let (abstract_, overview) = match chat
+        .complete_json(system, &user, "add_resource", &schema)
+        .await
+    {
         Ok(response) => {
             let v: serde_json::Value = serde_json::from_str(&response).unwrap_or_default();
             (
-                v.get("abstract").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-                v.get("overview").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                v.get("abstract")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                v.get("overview")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
             )
         }
         Err(e) => {
@@ -454,5 +497,8 @@ pub async fn namespace_projects(
     container: &Container,
     name: &str,
 ) -> Result<Vec<String>, DomainError> {
-    container.memory_repository()?.namespace_projects(name).await
+    container
+        .memory_repository()?
+        .namespace_projects(name)
+        .await
 }

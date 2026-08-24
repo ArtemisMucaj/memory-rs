@@ -131,14 +131,18 @@ impl DuckdbStore {
             );
             CREATE INDEX IF NOT EXISTS memory_entities_entity_idx ON memory_entities (entity_id);
             CREATE TABLE IF NOT EXISTS memory_sessions (
-                id TEXT PRIMARY KEY,
+                -- Composite identity: `id` alone is not enough, because each
+                -- discovery source (Claude, OpenCode, Zed) has an independent
+                -- ID space and two sources can mint the same value.
+                id TEXT NOT NULL,
                 source TEXT NOT NULL,
                 imported_at BIGINT NOT NULL,
                 message_count BIGINT NOT NULL,
                 items_written BIGINT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'imported',
                 last_error TEXT,
-                project TEXT
+                project TEXT,
+                PRIMARY KEY (source, id)
             );
             CREATE TABLE IF NOT EXISTS memory_resources (
                 uri TEXT PRIMARY KEY,
@@ -313,7 +317,10 @@ fn reject_legacy_schema(conn: &Connection) -> Result<(), DomainError> {
     }
     // The legacy schema carries `predicate` and `subject_entity_id`; the
     // simplified one does not. Either is proof of a pre-simplification file.
-    if columns.iter().any(|c| c == "predicate" || c == "subject_entity_id") {
+    if columns
+        .iter()
+        .any(|c| c == "predicate" || c == "subject_entity_id")
+    {
         return Err(DomainError::storage(
             "this memory database was written by an older version of memory-rs \
              and cannot be upgraded in place. Delete `memory.duckdb` and \

@@ -120,8 +120,7 @@ impl MemoryDreamUseCase {
         // harvest on a machine with years of history would import thousands of
         // unrelated sessions. Manual `memory-rs import` bypasses all of it.
         let namespaces = self.memory_repo.list_namespaces().await?;
-        let mut cutoffs: std::collections::HashMap<String, i64> =
-            std::collections::HashMap::new();
+        let mut cutoffs: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
         for (namespace, _count) in namespaces {
             let Some(created_at) = self.memory_repo.namespace_created_at(&namespace).await? else {
                 continue;

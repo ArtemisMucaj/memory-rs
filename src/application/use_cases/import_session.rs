@@ -61,7 +61,11 @@ impl ImportSessionUseCase {
         }
 
         if !force {
-            if let Some(session) = self.memory_repo.find_session(&transcript.id).await? {
+            if let Some(session) = self
+                .memory_repo
+                .find_session(&transcript.source, &transcript.id)
+                .await?
+            {
                 return Ok(ImportOutcome::AlreadyImported { session });
             }
         }

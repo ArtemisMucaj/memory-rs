@@ -2,13 +2,15 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Strip memory-rs to facts (triples) + entities with name-key resolution; delete MemoryItem / MemoryNode / MemoryEdge / MemoryStatus / Dream consolidation / 10 predicate variants; rank recall by RRF(cosine, recency).
+**Goal:** Strip memory-rs to self-contained fact statements plus the entities they mention; delete MemoryItem / MemoryNode / MemoryEdge / MemoryStatus / Predicate / subject-object split / Dream consolidation; rank recall by RRF(cosine, keyword, recency).
 
-**Architecture:** Single `memories` table (fact triples, no status/validity window), `entities` + `entity_names` (exact name-key lookup only), `memory_embeddings` for statement vectors, `memory_resources` for file/URL resources, `memory_sessions` for imported sessions. Dream = harvest only. MCP tool names preserved; internals rewritten.
+**Architecture:** Single `memories` table (statement + project + provenance, no predicate/subject/object/status), `entities` + `entity_names` (exact name-key lookup only), `memory_entities` join for the many-to-many link, `memory_embeddings` for statement vectors, `memory_resources` for file/URL resources, `memory_sessions` with a composite `(source, id)` primary key. Dream = harvest only. MCP tool names preserved; internals rewritten.
 
 **Tech Stack:** Rust, DuckDB (duckdb-rs), tokio, async-trait, rmcp, clap, serde.
 
 **Spec:** `docs/superpowers/specs/2026-08-24-fact-entity-simplification-design.md`
+
+> **Note:** The plan below describes the intermediate subject/predicate/object design the PR first landed. The merged form replaces it with `statement + entity_ids`, which is what the code and the spec now describe. Kept here as the record of how the work was broken down; the spec is the source of truth for the final shape.
 
 ---
 

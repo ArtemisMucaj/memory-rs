@@ -141,20 +141,36 @@ pub trait MemoryRepository: Send + Sync {
 
     // ── Sessions ─────────────────────────────────────────────────────────
 
-    /// Record an imported session, replacing any prior row with the same id.
-    async fn record_session(&self, session: &crate::domain::ImportedSession)
-        -> Result<(), DomainError>;
+    /// Record an imported session, replacing any prior row with the same
+    /// `(source, id)` identity.
+    async fn record_session(
+        &self,
+        session: &crate::domain::ImportedSession,
+    ) -> Result<(), DomainError>;
 
-    /// Whether a session has already been imported (or attempted). Used by
-    /// the dream harvest to skip re-work.
+    /// Whether a session has already been imported (or attempted), keyed by
+    /// its `(source, id)` pair. Used by the dream harvest to skip re-work.
+    /// The composite key matters because Claude, OpenCode and Zed mint ids
+    /// from independent namespaces — `id` alone is not unique.
     async fn find_session(
         &self,
+        source: &str,
         id: &str,
     ) -> Result<Option<crate::domain::ImportedSession>, DomainError>;
 
     /// List sessions, newest first.
     async fn list_sessions(
         &self,
+        projects: Option<&[String]>,
+        limit: usize,
+    ) -> Result<Vec<crate::domain::ImportedSession>, DomainError>;
+
+    /// List sessions with a `status` filter applied in SQL (before `LIMIT`
+    /// cuts the window). The dream harvest uses this to skip failed-import
+    /// markers without letting them crowd out real sessions.
+    async fn list_sessions_by_status(
+        &self,
+        status: crate::domain::SessionStatus,
         projects: Option<&[String]>,
         limit: usize,
     ) -> Result<Vec<crate::domain::ImportedSession>, DomainError>;

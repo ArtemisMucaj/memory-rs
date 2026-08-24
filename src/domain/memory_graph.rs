@@ -141,7 +141,11 @@ pub fn entity_name_key(name: &str) -> String {
     }
 
     let key = words.join("-");
-    if key.is_empty() { lowered } else { key }
+    if key.is_empty() {
+        lowered
+    } else {
+        key
+    }
 }
 
 /// A single fact in the memory store.

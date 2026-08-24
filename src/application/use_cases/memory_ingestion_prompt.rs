@@ -41,6 +41,7 @@ A fact is ONE self-contained English sentence worth remembering across sessions.
 - `statement` — the fact as a single sentence. This is what gets embedded and shown to a reader, so it must read on its own. Include the name of the thing the fact is about, in the form it is written down ("orders-events", never "the orders-events service").
 - `source_kind` — `user_stated` if the USER asserted it directly, `extracted` for anything you produce from the transcript (whether read straight off the page or pieced together from context).
 - `confidence` — 0..1.
+- `source_message_index` — the `[idx]` of the conversation message the fact came from. Omit when the fact spans several messages.
 - `entity_mentions` — the durable things this fact is *about*. See "Entities" below. Each mention is `{ "name": "...", "type": "..." }`. An empty array is fine — many facts are about the user or about nothing durable.
 
 ## Entities
@@ -86,7 +87,7 @@ User-authored messages are the source of truth for facts about the user; assista
 
 Respond with ONLY a JSON object — no prose, no markdown fence:
 
-{"memories": [{"statement": "...", "source_kind": "user_stated", "confidence": 0.9, "entity_mentions": [{"name": "orders-events", "type": "service"}]}]}
+{"memories": [{"statement": "...", "source_kind": "user_stated", "confidence": 0.9, "source_message_index": 4, "entity_mentions": [{"name": "orders-events", "type": "service"}]}]}
 
 Return `{"memories": []}` when the session contains nothing worth remembering."#
         .to_string()
@@ -234,6 +235,7 @@ pub fn schema() -> serde_json::Value {
                             "enum": ["user_stated", "extracted"]
                         },
                         "confidence": { "type": "number" },
+                        "source_message_index": { "type": "integer" },
                         "entity_mentions": {
                             "type": "array",
                             "items": {

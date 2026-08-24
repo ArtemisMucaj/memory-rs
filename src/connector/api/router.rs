@@ -239,9 +239,21 @@ async fn entities(container: &Container, format: OutputFormat) -> Result<String,
 async fn entity(container: &Container, name: String) -> Result<String, DomainError> {
     let repo = container.memory_repository()?;
     let found = repo.find_entities_by_name(&name).await?;
-    let Some(entity) = found.into_iter().next() else {
+    if found.is_empty() {
         return Ok(format!("No entity named '{name}'."));
-    };
+    }
+    if found.len() > 1 {
+        let mut out = format!("'{name}' matches {} entities:\n\n", found.len());
+        for e in &found {
+            out.push_str(&format!(
+                "  [{}] {} (id: {})\n",
+                e.entity_type, e.canonical_name, e.id
+            ));
+        }
+        out.push_str("\nDisambiguate by id with `memory-rs show <id>`.\n");
+        return Ok(out);
+    }
+    let entity = found.into_iter().next().unwrap();
     let memories = repo.memories_for_entity(&entity.id).await?;
     let mut out = format!(
         "[{}] {} ({} memories)\n",

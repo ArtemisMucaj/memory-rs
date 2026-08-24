@@ -68,14 +68,13 @@ impl MemoryResumeUseCase {
         let limit = limit.clamp(1, MAX_SESSION_LIMIT);
 
         // Failed harvests are markers, not work — they carry no transcript
-        // and no memories, and would crowd out real sessions.
+        // and no memories, and would crowd out real sessions. The filter
+        // lives in the SQL, not in Rust, so a flood of failed rows cannot
+        // shrink the window the limit then applies to.
         let in_scope: Vec<ImportedSession> = self
             .memory_repo
-            .list_sessions(projects, MAX_SESSION_LIMIT)
-            .await?
-            .into_iter()
-            .filter(|s| s.status == SessionStatus::Imported)
-            .collect();
+            .list_sessions_by_status(SessionStatus::Imported, projects, MAX_SESSION_LIMIT)
+            .await?;
 
         let more = in_scope.len().saturating_sub(limit);
         let selected: Vec<ImportedSession> = in_scope.into_iter().take(limit).collect();

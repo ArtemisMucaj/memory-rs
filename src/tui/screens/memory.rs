@@ -90,21 +90,15 @@ impl MemoryScreen {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
-        let chunks = Layout::vertical([
-            Constraint::Length(3),
-            Constraint::Min(0),
-        ])
-        .split(area);
+        let chunks = Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(area);
 
         // Search box.
         let search = Paragraph::new(self.query.as_str()).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(
-                    "Search ({} memories){}",
-                    self.total_memories,
-                    if self.searching { " — typing" } else { "" }
-                )),
+            Block::default().borders(Borders::ALL).title(format!(
+                "Search ({} memories){}",
+                self.total_memories,
+                if self.searching { " — typing" } else { "" }
+            )),
         );
         frame.render_widget(search, chunks[0]);
 
@@ -120,7 +114,9 @@ impl MemoryScreen {
         if self.selected < self.scroll {
             self.scroll = self.selected;
         } else if self.selected >= self.scroll + visible_height {
-            self.scroll = self.selected.saturating_sub(visible_height.saturating_sub(1));
+            self.scroll = self
+                .selected
+                .saturating_sub(visible_height.saturating_sub(1));
         }
 
         let mut lines: Vec<Line> = Vec::new();
@@ -149,7 +145,8 @@ impl MemoryScreen {
                 Style::default().fg(theme::MUTED),
             )));
         }
-        let list = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Memories"));
+        let list =
+            Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Memories"));
         frame.render_widget(list, area);
     }
 

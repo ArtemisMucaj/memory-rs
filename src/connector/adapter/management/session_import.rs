@@ -99,8 +99,10 @@ impl SessionImportService {
         // heterogeneous — a `"zed:…"` tag, an `"opencode:…"` tag, or a Claude
         // file path — so it is normalized back to the source tag).
         let repo = self.container.memory_repository()?;
+        // A large-but-finite cap rather than `usize::MAX`: the adapter binds
+        // `limit` as text, and an oversized number can confuse type coercion.
         let imported: HashSet<SessionKey> = repo
-            .list_sessions(None, usize::MAX)
+            .list_sessions(None, 10_000)
             .await?
             .into_iter()
             .map(|s| (normalize_source_tag(&s.source), s.id))
@@ -219,10 +221,7 @@ impl SessionImportService {
                     if written == 1 { "" } else { "s" }
                 );
                 if report.memories_deduped > 0 {
-                    summary.push_str(&format!(
-                        ", {} deduped",
-                        report.memories_deduped
-                    ));
+                    summary.push_str(&format!(", {} deduped", report.memories_deduped));
                 }
                 summary
             }
