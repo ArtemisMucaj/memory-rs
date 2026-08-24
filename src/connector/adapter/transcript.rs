@@ -14,6 +14,7 @@
 
 use serde_json::Value;
 
+use crate::connector::adapter::project::project_from_cwd;
 use crate::domain::{DomainError, SessionMessage, SessionTranscript};
 
 /// Maximum characters of a tool input rendered into a `ToolCall:` summary.
@@ -82,10 +83,12 @@ pub fn parse_transcript(
     Ok(SessionTranscript {
         id: session_id.unwrap_or_else(|| fallback_id.to_string()),
         source: source.to_string(),
-        // The project is set by the session discovery layer from the session's
-        // cwd. This parser leaves it `None` — the caller (discovery dispatcher)
-        // resolves the cwd to a project name.
-        project: None,
+        // `memory-rs import <path>` bypasses discovery, so the cwd recorded in
+        // the transcript is the only thing that can scope it. Resolved through
+        // the same derivation discovery uses, so a session lands under the same
+        // project whichever way it was imported. `None` when the format carries
+        // no cwd (a generic chat log) — such a session stays global.
+        project: cwd.as_deref().and_then(project_from_cwd),
         messages,
     })
 }
@@ -256,5 +259,38 @@ mod tests {
     #[test]
     fn rejects_non_jsonl_content() {
         assert!(parse_transcript("not json at all", "s", "f.txt").is_err());
+    }
+
+    /// `memory-rs import <path>` never goes through discovery, so the cwd in
+    /// the transcript is the only thing that can scope the session. Dropping it
+    /// left every imported session unattributed, and `resume --project` — which
+    /// refuses to guess an unattributed session into a project — showed nothing.
+    #[test]
+    fn a_recorded_cwd_scopes_the_transcript_to_its_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("memory-rs");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(
+            repo.join(".git").join("config"),
+            "[remote \"origin\"]\n\turl = git@github.com:acme/memory-rs.git\n",
+        )
+        .unwrap();
+
+        let content = format!(
+            r#"{{"type":"user","sessionId":"abc-123","cwd":"{}","message":{{"role":"user","content":"fix the parser"}}}}"#,
+            repo.to_str().unwrap()
+        );
+        let transcript = parse_transcript(&content, "fallback", "test.jsonl").unwrap();
+        assert_eq!(transcript.project.as_deref(), Some("acme/memory-rs"));
+    }
+
+    /// A generic chat log carries no working directory. Guessing one would file
+    /// the session under whatever the importer happened to be standing in, so
+    /// it stays global.
+    #[test]
+    fn a_transcript_without_a_cwd_stays_global() {
+        let content = r#"{"role":"user","content":"I prefer tabs over spaces"}"#;
+        let transcript = parse_transcript(content, "generic-1", "chat.jsonl").unwrap();
+        assert_eq!(transcript.project, None);
     }
 }

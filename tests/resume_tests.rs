@@ -11,7 +11,8 @@ use memory_rs::application::MemoryRepository;
 use memory_rs::domain::{EntityRef, Memory, MemoryKind, MemoryNode, MemoryStatus, SourceKind};
 use memory_rs::Predicate;
 use memory_rs::{
-    DuckdbStore, ImportedSession, MemoryResumeUseCase, NodeKind, NodeRepository, SessionStatus,
+    parse_transcript_file, DuckdbStore, ImportedSession, MemoryResumeUseCase, NodeKind,
+    NodeRepository, SessionStatus,
 };
 
 const DIMS: usize = 4;
@@ -246,6 +247,54 @@ async fn the_limit_is_honoured_and_the_remainder_is_reported() {
             .sessions
             .len(),
         5
+    );
+}
+
+/// The regression behind "prior session list broken": a transcript imported by
+/// path bypasses discovery, so the cwd recorded inside it is the only thing that
+/// can scope the session. The parser collected that cwd and dropped it, leaving
+/// every imported session unattributed — and a briefing scoped to the project
+/// the work was actually done in came back empty.
+#[tokio::test]
+async fn a_session_imported_by_path_is_briefed_under_the_project_it_ran_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("memory-rs");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::write(
+        repo.join(".git").join("config"),
+        "[remote \"origin\"]\n\turl = git@github.com:acme/memory-rs.git\n",
+    )
+    .unwrap();
+
+    let path = dir.path().join("session.jsonl");
+    std::fs::write(
+        &path,
+        format!(
+            r#"{{"type":"user","sessionId":"s-1","cwd":"{}","message":{{"role":"user","content":"fix the resume briefing"}}}}"#,
+            repo.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+
+    let transcript = parse_transcript_file(&path).unwrap();
+    assert_eq!(transcript.project.as_deref(), Some("acme/memory-rs"));
+
+    let store = store();
+    let mut imported = session("s-1", None, 100);
+    imported.project = transcript.project.clone();
+    store.record_session(&imported).await.unwrap();
+
+    let briefing = use_case(&store)
+        .execute(Some(&["acme/memory-rs".to_string()]), 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        briefing
+            .sessions
+            .iter()
+            .map(|r| r.session.id.as_str())
+            .collect::<Vec<_>>(),
+        ["s-1"],
     );
 }
 

@@ -54,6 +54,7 @@ fn summarize_file(path: &Path) -> Result<Option<DiscoveredSession>, DomainError>
     let mut message_count = 0usize;
     let mut total_text_chars = 0usize;
     let mut last_timestamp: Option<String> = None;
+    let mut recorded_cwd: Option<String> = None;
 
     for line in content.lines() {
         let line = line.trim();
@@ -67,6 +68,17 @@ fn summarize_file(path: &Path) -> Result<Option<DiscoveredSession>, DomainError>
         if session_id.is_none() {
             if let Some(id) = value.get("sessionId").and_then(Value::as_str) {
                 session_id = Some(id.to_string());
+            }
+        }
+        // Claude records the working directory on every event. It is the only
+        // lossless source: the directory name it files the session under
+        // encodes `/` as `-`, which cannot be decoded back when the path itself
+        // contains a `-`.
+        if recorded_cwd.is_none() {
+            if let Some(dir) = value.get("cwd").and_then(Value::as_str) {
+                if !dir.trim().is_empty() {
+                    recorded_cwd = Some(dir.to_string());
+                }
             }
         }
         // Claude writes a `{"type":"summary","summary":"..."}` line for named
@@ -131,7 +143,9 @@ fn summarize_file(path: &Path) -> Result<Option<DiscoveredSession>, DomainError>
         .and_then(parse_iso8601_secs)
         .unwrap_or_else(|| file_mtime_secs(path));
 
-    let cwd = decode_project_dir(path);
+    // Prefer what the session recorded; the directory name is a lossy
+    // best-effort fallback for transcripts that carry no `cwd`.
+    let cwd = recorded_cwd.or_else(|| decode_project_dir(path));
 
     Ok(Some(DiscoveredSession {
         source: SessionSource::Claude,
@@ -218,5 +232,44 @@ mod tests {
     fn decodes_project_dir() {
         let p = Path::new("/home/u/.claude/projects/-Users-me-proj/s.jsonl");
         assert_eq!(decode_project_dir(p).as_deref(), Some("/Users/me/proj"));
+    }
+
+    /// The directory name encodes `/` as `-`, so it cannot be decoded back for
+    /// a path containing a `-`: `/home/me/memory-rs` files under
+    /// `-home-me-memory-rs` and decodes to `/home/me/memory/rs`, which resolves
+    /// to the project `rs`. The cwd on the events is exact, so it wins.
+    #[test]
+    fn recorded_cwd_beats_the_lossy_directory_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().join("-home-me-memory-rs");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let transcript = project_dir.join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            r#"{"type":"user","sessionId":"abc","cwd":"/home/me/memory-rs","timestamp":"2026-07-01T10:00:00Z","message":{"role":"user","content":"hello"}}
+"#,
+        )
+        .unwrap();
+
+        let session = summarize_file(&transcript).unwrap().unwrap();
+        assert_eq!(session.cwd.as_deref(), Some("/home/me/memory-rs"));
+    }
+
+    /// Without a recorded cwd there is nothing better than the directory name.
+    #[test]
+    fn the_directory_name_is_the_fallback_when_no_cwd_was_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().join("-home-me-proj");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let transcript = project_dir.join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            r#"{"type":"user","sessionId":"abc","timestamp":"2026-07-01T10:00:00Z","message":{"role":"user","content":"hello"}}
+"#,
+        )
+        .unwrap();
+
+        let session = summarize_file(&transcript).unwrap().unwrap();
+        assert_eq!(session.cwd.as_deref(), Some("/home/me/proj"));
     }
 }
