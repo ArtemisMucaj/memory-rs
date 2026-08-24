@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.4.0](https://github.com/ArtemisMucaj/memory-rs/compare/v0.3.2...v0.4.0) (2026-08-24)
+
+
+### ⚠ BREAKING CHANGES
+
+* Memory no longer carries predicate, subject or object; the repository interfaces are reshaped around facts and entities.
+
+### Features
+
+* simplify memory model to facts + entities only ([#27](https://github.com/ArtemisMucaj/memory-rs/issues/27)) ([ee4d2b5](https://github.com/ArtemisMucaj/memory-rs/commit/ee4d2b5d312b0040070d84a0240c4e93ec3b48ad)), closes [#24](https://github.com/ArtemisMucaj/memory-rs/issues/24)
+
 ## [0.3.2](https://github.com/ArtemisMucaj/memory-rs/compare/v0.3.1...v0.3.2) (2026-08-24)
 
 
