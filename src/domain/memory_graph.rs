@@ -203,120 +203,51 @@ impl Predicate {
     }
 }
 
-/// Lifecycle state of a memory. The current-truth projection is the set of
-/// [`MemoryStatus::Active`] memories.
+/// A single fact in the memory store.
 ///
-/// There is no "unresolved conflict" state, on purpose. Two memories that
-/// contradict each other both stay `Active` and both keep answering queries,
-/// with the `contradicts` edge between them reported alongside. Hiding both
-/// would be the more cautious-looking choice and the less honest one: the true
-/// answer to a contested question is *these two things are on record and they
-/// disagree*, not silence. The conflict queue is therefore derived — the
-/// contradictions whose endpoints are still active — rather than a status a
-/// memory can get stuck in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MemoryStatus {
-    /// Current and believed true.
-    Active,
-    /// Replaced by a newer memory via a `supersedes` edge; kept for history.
-    Superseded,
-    /// Marked as never having been true (a bad extraction).
-    Retracted,
+/// Updates are hard delete + insert at the repository layer; there is no
+/// lifecycle status and no validity window. Newest write wins.
+///
+/// Fields are public because a memory is a record-like value, constructed by
+/// the ingestion path and read back by retrieval; it carries no invariants
+/// beyond those the store enforces.
+///
+/// Field order is load-bearing for the storage adapter, which builds its
+/// `INSERT`/`SELECT` column lists in this order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Memory {
+    pub id: String,
+    /// Taxonomy kept as a single-variant enum so the storage column is
+    /// forward-compatible — see [`MemoryKind`].
+    pub kind: MemoryKind,
+    /// Resolved subject — normally an [`EntityRef::Entity`].
+    pub subject: EntityRef,
+    /// The relation, from a closed vocabulary — see [`Predicate`].
+    pub predicate: Predicate,
+    pub object: EntityRef,
+    /// Human-readable rendering of the triple, used for embedding and display.
+    pub statement: String,
+    /// Project/namespace scope, or `None` for a global memory. Storage
+    /// flattens `None` to the empty string rather than `NULL`, because SQL
+    /// treats `NULL`s as distinct inside a `UNIQUE` and would let duplicate
+    /// global rows through.
+    pub project: Option<String>,
+
+    /// When this memory entered the store.
+    pub recorded_at: i64,
+
+    /// Session this memory was extracted from (provenance, half 1).
+    pub source_session_id: Option<String>,
+    /// Index of the transcript message it came from (provenance, half 2).
+    pub source_message_index: Option<i64>,
+    pub source_kind: SourceKind,
+    /// Best-effort confidence in `[0, 1]`; advisory only.
+    pub confidence: f32,
 }
 
-impl MemoryStatus {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            MemoryStatus::Active => "active",
-            MemoryStatus::Superseded => "superseded",
-            MemoryStatus::Retracted => "retracted",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<MemoryStatus> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "active" => Some(MemoryStatus::Active),
-            "superseded" => Some(MemoryStatus::Superseded),
-            "retracted" => Some(MemoryStatus::Retracted),
-            _ => None,
-        }
-    }
-}
-
-/// The typed relationship between two memories.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EdgeType {
-    /// Temporal replacement — old was true, new is true now.
-    Supersedes,
-    /// Genuine conflict, no temporal ordering.
-    Contradicts,
-    /// Enrichment / specialization of a broader memory.
-    Refines,
-    /// The target memory was never true (bad extraction).
-    Retracts,
-    /// An independent source confirms the target memory.
-    Corroborates,
-    /// Generic association discovered later; navigational only.
-    RelatesTo,
-}
-
-impl EdgeType {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            EdgeType::Supersedes => "supersedes",
-            EdgeType::Contradicts => "contradicts",
-            EdgeType::Refines => "refines",
-            EdgeType::Retracts => "retracts",
-            EdgeType::Corroborates => "corroborates",
-            EdgeType::RelatesTo => "relates_to",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<EdgeType> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "supersedes" => Some(EdgeType::Supersedes),
-            "contradicts" => Some(EdgeType::Contradicts),
-            "refines" => Some(EdgeType::Refines),
-            "retracts" => Some(EdgeType::Retracts),
-            "corroborates" => Some(EdgeType::Corroborates),
-            "relates_to" => Some(EdgeType::RelatesTo),
-            _ => None,
-        }
-    }
-}
-
-/// Who created an edge — provenance for the graph itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EdgeOrigin {
-    /// Written on the online ingestion path.
-    Ingestion,
-    /// Written by the offline consolidation ("dream") pass.
-    Consolidation,
-    /// Written by an explicit user/manual action.
-    Manual,
-}
-
-impl EdgeOrigin {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            EdgeOrigin::Ingestion => "ingestion",
-            EdgeOrigin::Consolidation => "consolidation",
-            EdgeOrigin::Manual => "manual",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<EdgeOrigin> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "ingestion" => Some(EdgeOrigin::Ingestion),
-            "consolidation" => Some(EdgeOrigin::Consolidation),
-            "manual" => Some(EdgeOrigin::Manual),
-            _ => None,
-        }
-    }
-}
+/// Entity types the extraction model may use. `project` is deliberately not
+/// on the list — projects live on `Memory.project`, not as entities.
+pub const VALID_ENTITY_TYPES: &[&str] = &["person", "tool", "service", "library", "concept"];
 
 /// A resolved, canonical entity: the anchor a memory's subject/object points at.
 ///
@@ -417,85 +348,6 @@ pub fn entity_name_key(name: &str) -> String {
     }
 }
 
-/// A single immutable memory in the append-only log.
-///
-/// Fields are public because a memory is a record-like value (as with
-/// [`ImportedSession`](super::ImportedSession) / [`DreamRun`](super::DreamRun)),
-/// constructed by the ingestion path and read back by retrieval; it carries no
-/// invariants beyond those the store enforces.
-///
-/// Field order is load-bearing for the storage adapter, which builds its
-/// `INSERT`/`SELECT` column lists in this order.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Memory {
-    pub id: String,
-    /// Taxonomy shared with [`MemoryItem`](super::MemoryItem) rather than a
-    /// memory-only vocabulary, so one recall path can filter both projections by
-    /// the same kind instead of maintaining a mapping between two enums.
-    pub kind: MemoryKind,
-    /// Resolved subject — normally an [`EntityRef::Entity`].
-    pub subject: EntityRef,
-    /// The relation, from a closed vocabulary — see [`Predicate`].
-    pub predicate: Predicate,
-    pub object: EntityRef,
-    /// Human-readable rendering of the triple, used for embedding and display.
-    pub statement: String,
-    /// Project/namespace scope, or `None` for a global memory. Resolved at
-    /// ingestion, mirroring `MemoryItem::project`. Storage flattens `None` to
-    /// the empty string rather than `NULL`, because SQL treats `NULL`s as
-    /// distinct inside a `UNIQUE` and would let duplicate global rows through.
-    pub project: Option<String>,
-
-    /// When this memory entered the log (the single event timeline).
-    pub recorded_at: i64,
-    /// Defaults to `recorded_at`; only distinct when an explicit date was lifted
-    /// from the source text.
-    pub valid_from: i64,
-    /// Set to the recording time of the memory that supersedes this one; `None`
-    /// while the memory is still current.
-    pub valid_to: Option<i64>,
-
-    /// Session this memory was extracted from (provenance, half 1).
-    pub source_session_id: Option<String>,
-    /// Index of the transcript message it came from (provenance, half 2).
-    pub source_message_index: Option<i64>,
-    pub source_kind: SourceKind,
-    /// Best-effort confidence in `[0, 1]`; advisory only — see [`arbitrate`]
-    /// for exactly how little weight it carries.
-    pub confidence: f32,
-
-    pub status: MemoryStatus,
-    /// True when produced by consolidation rather than ingestion.
-    pub derived: bool,
-    /// Source memory ids this was derived from (empty for primary memories).
-    pub derived_from: Vec<String>,
-}
-
-/// A typed, directed edge between two memories.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MemoryEdge {
-    pub from_memory: String,
-    pub to_memory: String,
-    pub edge_type: EdgeType,
-    pub created_at: i64,
-    pub created_by: EdgeOrigin,
-    pub confidence: f32,
-}
-
-/// Aggregate statistics about the memory store.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct MemoryStoreStats {
-    pub total_memories: u64,
-    /// Memory counts by `status` string. Everything not `active` is history:
-    /// superseded links in a chain, or retractions.
-    pub memories_by_status: Vec<(String, u64)>,
-    /// Memory counts by [`MemoryKind`] string, mirroring the item store's
-    /// per-kind breakdown so the same UI can render it.
-    pub memories_by_kind: Vec<(String, u64)>,
-    pub total_entities: u64,
-    pub total_edges: u64,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -562,44 +414,15 @@ mod tests {
         for kind in KINDS {
             assert_eq!(SourceKind::parse(kind.as_str()), Some(kind));
         }
-        for status in [
-            MemoryStatus::Active,
-            MemoryStatus::Superseded,
-            MemoryStatus::Retracted,
-        ] {
-            assert_eq!(MemoryStatus::parse(status.as_str()), Some(status));
-        }
-        for edge_type in [
-            EdgeType::Supersedes,
-            EdgeType::Contradicts,
-            EdgeType::Refines,
-            EdgeType::Retracts,
-            EdgeType::Corroborates,
-            EdgeType::RelatesTo,
-        ] {
-            assert_eq!(EdgeType::parse(edge_type.as_str()), Some(edge_type));
-        }
-        for origin in [
-            EdgeOrigin::Ingestion,
-            EdgeOrigin::Consolidation,
-            EdgeOrigin::Manual,
-        ] {
-            assert_eq!(EdgeOrigin::parse(origin.as_str()), Some(origin));
-        }
         assert_eq!(
             SourceKind::parse("  USER_STATED "),
             Some(SourceKind::UserStated)
         );
-        assert_eq!(MemoryStatus::parse("nonsense"), None);
     }
 
-    /// The status a memory could once get stuck in is gone. A store written by
-    /// an older build may still hold the string, and it must not resurrect the
-    /// variant or silently parse as something else — the adapter's
-    /// `unwrap_or(Active)` is what puts such a row back in circulation.
     #[test]
-    fn the_retired_needs_resolution_status_no_longer_parses() {
-        assert_eq!(MemoryStatus::parse("needs_resolution"), None);
+    fn project_is_not_an_entity_type() {
+        assert!(!VALID_ENTITY_TYPES.contains(&"project"));
     }
 
     #[test]

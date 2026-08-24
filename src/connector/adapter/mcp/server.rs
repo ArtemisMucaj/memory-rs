@@ -1,9 +1,13 @@
 //! MCP server exposing the memory operations as tools.
 //!
 //! Every tool is a thin adapter over the shared
-//! [`controller`](crate::connector::api::controller) layer — the same logic the
-//! CLI and HTTP API use — so an assistant (over stdio) or a native app (over
-//! HTTP) drives memory through one implementation.
+//! [`controller`](crate::connector::api::controller) layer — the same logic
+//! the CLI and HTTP API use — so an assistant (over stdio) or a native app
+//! (over HTTP) drives memory through one implementation.
+//!
+//! Tool names are stable across the simplification: external clients depend
+//! on them. Some parameters that no longer have meaning (`kind`, `status`)
+//! are accepted and ignored.
 
 use std::sync::Arc;
 
@@ -22,7 +26,7 @@ use crate::connector::api::controller::{
     self, ForgetOutcome, MemorySearchOutcome, MemoryShowOutcome, ResumeOutcome, SearchScope,
 };
 use crate::connector::api::Container;
-use crate::domain::{Memory, MemoryKind, MemoryStatus};
+use crate::domain::Memory;
 
 /// Server-side cap on how many results a single call returns.
 const MAX_LIMIT: usize = 100;
@@ -35,10 +39,9 @@ fn default_session_limit() -> usize {
     DEFAULT_SESSION_LIMIT
 }
 
-/// One scope, built the same way for every tool that takes one. `project` and
-/// `namespace` are mutually exclusive; passing both is a caller error rather
-/// than a silent preference for one, because the two answer different questions
-/// and quietly dropping either returns a plausible wrong set.
+/// One scope, built the same way for every tool that takes one. `project`
+/// and `namespace` are mutually exclusive; passing both is a caller error
+/// rather than a silent preference for one.
 fn scope_from(project: Option<String>, namespace: Option<String>) -> Result<SearchScope, McpError> {
     match (namespace, project) {
         (Some(_), Some(_)) => Err(McpError::invalid_params(
@@ -76,26 +79,28 @@ pub struct SearchInput {
     /// Max results (default 10, server cap 100).
     #[serde(default = "default_limit")]
     pub limit: usize,
-    /// Restrict to a memory kind: preference / experience / skill / fact.
+    /// Accepted for backward compatibility; only `fact` exists now.
     #[serde(default)]
+    #[allow(dead_code)]
     pub kind: Option<String>,
     /// Scope to one project (its items + globals).
     #[serde(default)]
     pub project: Option<String>,
-    /// Scope to a namespace (its member projects' items + globals). Mutually
-    /// exclusive with `project`.
+    /// Scope to a namespace (its member projects' items + globals).
+    /// Mutually exclusive with `project`.
     #[serde(default)]
     pub namespace: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListInput {
-    /// Restrict to a memory kind.
+    /// Accepted for backward compatibility; ignored (only `fact` exists).
     #[serde(default)]
+    #[allow(dead_code)]
     pub kind: Option<String>,
-    /// Lifecycle status: `active` (default), `superseded`, `retracted`, or
-    /// `all`. Only active memories answer queries; the rest are history.
+    /// Accepted for backward compatibility; ignored (no lifecycle status).
     #[serde(default)]
+    #[allow(dead_code)]
     pub status: Option<String>,
 }
 
@@ -115,13 +120,14 @@ pub struct ResumeInput {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ShowInput {
-    /// A memory id, or a `memory://` node URI.
+    /// A memory id, or a `memory://resources/<name>` URI.
     pub id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TreeInput {
-    /// Directory URI to list (e.g. `memory://sessions`); omit for the root.
+    /// Optional subtree: `memory://sessions` or `memory://resources`. Omit
+    /// for the root.
     #[serde(default)]
     pub uri: Option<String>,
 }
@@ -130,7 +136,7 @@ pub struct TreeInput {
 pub struct AddResourceInput {
     /// A local file path or an http(s):// URL.
     pub source: String,
-    /// Optional slug for the resource node; derived from the source otherwise.
+    /// Optional slug for the resource; derived from the source otherwise.
     #[serde(default)]
     pub name: Option<String>,
 }
@@ -153,24 +159,23 @@ pub struct AssignInput {
 
 #[tool_router]
 impl MemoryMcpServer {
-    /// Recall long-term memory (preferences, experiences, skills, facts) by
-    /// natural-language query, optionally scoped to a project or namespace.
-    /// Returns atomic memories, best match first. Only current memories are
-    /// returned — superseded, retracted and unsettled ones are never surfaced.
+    /// Recall long-term memory by natural-language query, optionally scoped
+    /// to a project or namespace. Returns atomic facts, best match first.
+    /// Ranking is RRF over semantic similarity, keyword match, and recency —
+    /// newer memories carry more weight.
     #[tool(name = "search_memories")]
     async fn search_memories(
         &self,
         params: Parameters<SearchInput>,
     ) -> Result<CallToolResult, McpError> {
         let input = params.0;
-        let kind = parse_kind(input.kind.as_deref())?;
         let scope = scope_from(input.project, input.namespace)?;
         let limit = input.limit.min(MAX_LIMIT);
 
         let value = match controller::recall_memories(
             &self.container,
             &input.query,
-            kind,
+            None,
             &scope,
             limit,
         )
@@ -184,32 +189,7 @@ impl MemoryMcpServer {
                     .map_err(internal)?;
                 json!(hits
                     .iter()
-                    .map(|hit| {
-                        let mut value = memory_json(&hit.memory, &labels, Some(hit.score));
-                        // Compact provenance: enough for the assistant to say "this
-                        // replaced an older answer" or "this is disputed" without
-                        // reading a whole history per result. The full path comes
-                        // back from `read_memory`.
-                        let p = &hit.provenance;
-                        if !p.is_empty() {
-                            if let Some(obj) = value.as_object_mut() {
-                                obj.insert(
-                                "provenance".to_string(),
-                                json!({
-                                    "replaced": p.supersedes.len(),
-                                    "chain_truncated": p.chain_truncated,
-                                    "corroborations": p.corroborations,
-                                    "contradicted_by": p
-                                        .contradicted_by
-                                        .iter()
-                                        .map(|r| json!({ "id": r.id, "statement": r.statement }))
-                                        .collect::<Vec<_>>(),
-                                }),
-                            );
-                            }
-                        }
-                        value
-                    })
+                    .map(|hit| memory_json(&hit.memory, &labels, Some(hit.score)))
                     .collect::<Vec<_>>())
             }
             MemorySearchOutcome::EmptyNamespace(ns) => {
@@ -219,17 +199,14 @@ impl MemoryMcpServer {
         ok_json(&value)
     }
 
-    /// List stored memories, newest first, optionally filtered by kind and
-    /// lifecycle status. Use kind="preference" at session start to load all
-    /// user preferences at once, or status="all" to include history.
+    /// List stored memories, newest first. Use at session start to load
+    /// everything currently on record.
     #[tool(name = "list_memories")]
     async fn list_memories(
         &self,
-        params: Parameters<ListInput>,
+        _params: Parameters<ListInput>,
     ) -> Result<CallToolResult, McpError> {
-        let kind = parse_kind(params.0.kind.as_deref())?;
-        let status = parse_status(params.0.status.as_deref())?;
-        let memories = controller::list_memories(&self.container, kind, status)
+        let memories = controller::list_memories(&self.container, None)
             .await
             .map_err(internal)?;
         let labels = controller::entity_labels(&self.container, &memories)
@@ -242,10 +219,10 @@ impl MemoryMcpServer {
     }
 
     /// Catch up on recent work before doing anything else in a project: the
-    /// latest sessions, what each was about and how it went, and the durable
-    /// memories they produced. Call this at the start of a session so the user
-    /// does not have to re-explain what they were doing. Scope it with
-    /// `project` (or `namespace`) to the work you are about to continue.
+    /// latest sessions and the durable memories each produced. Call this at
+    /// the start of a session so the user does not have to re-explain what
+    /// they were doing. Scope it with `project` (or `namespace`) to the work
+    /// you are about to continue.
     #[tool(name = "resume_work")]
     async fn resume_work(
         &self,
@@ -274,8 +251,6 @@ impl MemoryMcpServer {
                 "project": recap.session.project,
                 "imported_at": recap.session.imported_at,
                 "message_count": recap.session.message_count,
-                "summary": recap.summary,
-                "overview": recap.overview,
                 "memories": recap
                     .memories
                     .iter()
@@ -290,9 +265,7 @@ impl MemoryMcpServer {
         }))
     }
 
-    /// Read one memory by id — with its typed edges, so the surrounding context
-    /// (what refines it, what it superseded, what contradicts it) comes back in
-    /// the same call — or a `memory://` node (its L0/L1/L2 levels).
+    /// Read one memory by id, or a `memory://resources/<name>` resource.
     #[tool(name = "read_memory")]
     async fn read_memory(&self, params: Parameters<ShowInput>) -> Result<CallToolResult, McpError> {
         let id = params.0.id;
@@ -300,43 +273,32 @@ impl MemoryMcpServer {
             .await
             .map_err(internal)?
         {
-            MemoryShowOutcome::Memory { memory, edges } => {
+            MemoryShowOutcome::Memory(memory) => {
                 let labels = controller::entity_labels(&self.container, &[*memory.clone()])
                     .await
                     .map_err(internal)?;
                 let mut value = memory_json(&memory, &labels, None);
                 if let Some(obj) = value.as_object_mut() {
                     obj.insert("type".to_string(), json!("memory"));
-                    obj.insert(
-                        "edges".to_string(),
-                        json!(edges
-                            .iter()
-                            .map(|e| json!({
-                                "from": e.from_memory,
-                                "to": e.to_memory,
-                                "type": e.edge_type.as_str(),
-                                "created_by": e.created_by.as_str(),
-                            }))
-                            .collect::<Vec<_>>()),
-                    );
                 }
                 value
             }
-            MemoryShowOutcome::Node(node) => json!({
-                "type": "node",
-                "uri": node.uri(),
-                "kind": node.kind().to_string(),
-                "abstract": node.abstract_(),
-                "overview": node.overview(),
-                "content": if controller::node_has_visible_content(&node) { node.content() } else { "" },
+            MemoryShowOutcome::Resource(resource) => json!({
+                "type": "resource",
+                "uri": resource.uri,
+                "source": resource.source,
+                "name": resource.name,
+                "abstract": resource.abstract_,
+                "overview": resource.overview,
+                "content": resource.content,
             }),
             MemoryShowOutcome::NotFound => json!({ "type": "not_found", "id": id }),
         };
         ok_json(&value)
     }
 
-    /// Browse the memory virtual filesystem: with no URI, the top-level roots;
-    /// with a directory URI, its children and their one-line abstracts.
+    /// List what is in the store: resources at the root, sessions under
+    /// `memory://sessions`.
     #[tool(name = "browse_memory")]
     async fn browse_memory(
         &self,
@@ -345,15 +307,10 @@ impl MemoryMcpServer {
         let nodes = controller::tree(&self.container, params.0.uri.as_deref())
             .await
             .map_err(internal)?;
-        ok_json(&json!(nodes
-            .iter()
-            .map(|n| json!({ "uri": n.uri(), "kind": n.kind().to_string(), "abstract": n.abstract_() }))
-            .collect::<Vec<_>>()))
+        ok_json(&json!(nodes))
     }
 
-    /// Forget a memory by id: mark it as never having been true. The memory is
-    /// retracted, not deleted — it stays in the log for provenance and simply
-    /// stops being returned by recall.
+    /// Forget a memory by id. Hard delete: the row is gone.
     #[tool(name = "forget_memory")]
     async fn forget_memory(
         &self,
@@ -364,13 +321,13 @@ impl MemoryMcpServer {
             .await
             .map_err(internal)?
         {
-            ForgetOutcome::Retracted => json!({ "retracted": true, "id": id }),
-            ForgetOutcome::NotFound => json!({ "retracted": false, "reason": "not found" }),
+            ForgetOutcome::Deleted => json!({ "deleted": true, "id": id }),
+            ForgetOutcome::NotFound => json!({ "deleted": false, "reason": "not found" }),
         };
         ok_json(&value)
     }
 
-    /// Add a resource (a file path or URL) to the memory virtual filesystem.
+    /// Add a resource (a file path or URL) to the store.
     #[tool(name = "add_resource")]
     async fn add_resource(
         &self,
@@ -381,10 +338,10 @@ impl MemoryMcpServer {
             .await
             .map_err(internal)?;
         ok_json(&json!({
-            "uri": added.node.uri(),
+            "uri": added.resource.uri,
             "source": added.source,
             "chars": added.chars,
-            "abstract": added.node.abstract_(),
+            "abstract": added.resource.abstract_,
         }))
     }
 
@@ -435,18 +392,17 @@ impl ServerHandler for MemoryMcpServer {
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             server_info: Implementation::from_build_env(),
             instructions: Some(
-                "Long-term memory server, backed by an append-only memory graph: memory is \
-                 stored as atomic statements linked by typed edges, so an update is a new \
-                 memory that supersedes an old one rather than an overwrite. Only current \
-                 memories are ever returned.\n\
+                "Long-term memory server. Memory is stored as atomic facts (subject–predicate–object) \
+                 anchored to resolved entities. Recall ranks by RRF over semantic similarity, keyword \
+                 match, and recency — newer memories carry more weight.\n\
                  Tools:\n\
                  • resume_work — catch up on recent sessions before starting work in a project\n\
                  • search_memories — recall memories by natural language (scope to a project or namespace)\n\
-                 • list_memories — list memories, optionally by kind or lifecycle status\n\
-                 • read_memory — read one memory with its edges, or a memory:// node\n\
-                 • browse_memory — browse the memory virtual filesystem\n\
-                 • forget_memory — retract a memory (kept for provenance, no longer recalled)\n\
-                 • add_resource — store a file/URL as a recallable resource\n\
+                 • list_memories — list every memory, newest first\n\
+                 • read_memory — read one memory, or a memory://resources/<name> resource\n\
+                 • browse_memory — list what is in the store\n\
+                 • forget_memory — hard-delete a memory\n\
+                 • add_resource — store a file/URL for later recall\n\
                  • list_namespaces / create_namespace / assign_project — manage project groups"
                     .into(),
             ),
@@ -457,12 +413,6 @@ impl ServerHandler for MemoryMcpServer {
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /// One memory as the wire shape every tool here returns.
-///
-/// The triple is flattened into the statement rather than exposed as separate
-/// subject/predicate/object fields: `statement` is written to read on its own,
-/// and an assistant consuming this wants a sentence, not a tuple to reassemble.
-/// `status` is included even though only active memories are ever returned, so a
-/// caller reading a specific id can see why one it expected is missing.
 fn memory_json(
     memory: &Memory,
     labels: &std::collections::HashMap<String, String>,
@@ -472,13 +422,12 @@ fn memory_json(
         "id": memory.id,
         "kind": memory.kind.as_str(),
         "statement": memory.statement,
-        // The readable subject — an entity id would be meaningless to a model
-        // deciding whether this memory answers the question.
+        // The readable subject — an entity id would be meaningless to a
+        // model deciding whether this memory answers the question.
         "subject": controller::entity_ref_label(&memory.subject, labels),
-        "predicate": memory.predicate,
+        "predicate": memory.predicate.as_str(),
         "object": controller::entity_ref_label(&memory.object, labels),
         "project": memory.project,
-        "status": memory.status.as_str(),
         "source_kind": memory.source_kind.as_str(),
         "confidence": memory.confidence,
         "recorded_at": memory.recorded_at,
@@ -487,26 +436,6 @@ fn memory_json(
         obj.insert("score".to_string(), json!(score));
     }
     value
-}
-
-/// Absent means `active`; `all` is the only way to reach the whole log.
-fn parse_status(status: Option<&str>) -> Result<Option<MemoryStatus>, McpError> {
-    match status {
-        None => Ok(Some(MemoryStatus::Active)),
-        Some(s) if s.eq_ignore_ascii_case("all") => Ok(None),
-        Some(s) => MemoryStatus::parse(s)
-            .map(Some)
-            .ok_or_else(|| McpError::invalid_params(format!("unknown memory status '{s}'"), None)),
-    }
-}
-
-fn parse_kind(kind: Option<&str>) -> Result<Option<MemoryKind>, McpError> {
-    match kind {
-        None => Ok(None),
-        Some(k) => MemoryKind::parse(k)
-            .map(Some)
-            .ok_or_else(|| McpError::invalid_params(format!("unknown memory kind '{k}'"), None)),
-    }
 }
 
 fn internal(e: crate::domain::DomainError) -> McpError {

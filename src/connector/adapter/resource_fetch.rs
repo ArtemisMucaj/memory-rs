@@ -170,6 +170,32 @@ fn file_title(path: &Path) -> String {
         .to_string()
 }
 
+/// Slugify a resource name for use in a `memory://resources/<slug>` URI.
+///
+/// Lowercases, replaces every non-alphanumeric run with a single `-`, and
+/// trims dashes from the ends. The result is stable, so re-adding a resource
+/// under the same name overwrites the previous row.
+pub fn resource_slug(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut pending_dash = false;
+    for c in name.trim().chars() {
+        if c.is_ascii_alphanumeric() {
+            if pending_dash && !out.is_empty() {
+                out.push('-');
+            }
+            out.push(c.to_ascii_lowercase());
+            pending_dash = false;
+        } else {
+            pending_dash = true;
+        }
+    }
+    if out.is_empty() {
+        "resource".to_string()
+    } else {
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

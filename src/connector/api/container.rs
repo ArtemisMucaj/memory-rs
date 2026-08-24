@@ -13,9 +13,8 @@ use crate::connector::adapter::LlmUsage;
 
 use crate::application::interfaces::Embedder;
 use crate::application::{
-    ImportSessionUseCase, MemoryBrowseUseCase, MemoryDreamUseCase, MemoryIngestionUseCase,
-    MemoryRecallUseCase, MemoryRepository, MemoryResumeUseCase, MemorySearchUseCase,
-    NodeRepository, SessionDiscovery, SummarizeMemoryUseCase,
+    ImportSessionUseCase, MemoryDreamUseCase, MemoryIngestionUseCase, MemoryRecallUseCase,
+    MemoryRepository, MemoryResumeUseCase, SessionDiscovery,
 };
 use crate::connector::adapter::{
     build_chat_client, build_embedding_client, DuckdbStore, LocalSessionDiscovery, MemoryConfig,
@@ -159,8 +158,14 @@ impl Container {
     }
 
     /// The embedder that embeds queries with the store's recorded model.
-    fn embedder(&self) -> Result<Embedder, DomainError> {
+    pub fn embedder(&self) -> Result<Embedder, DomainError> {
         Ok(self.open()?.embedder)
+    }
+
+    /// Alias used by the resource path, named for its caller so a future
+    /// split (resource embedder vs memory embedder) has a place to land.
+    pub fn embedder_for_resources(&self) -> Result<Embedder, DomainError> {
+        self.embedder()
     }
 
     pub fn data_dir(&self) -> &str {
@@ -224,47 +229,21 @@ impl Container {
 
     /// Open (or return the cached) memory repository. Pins a fresh store to the
     /// configured embedding model + dimensions; an existing store keeps its own.
-    pub fn node_repository(&self) -> Result<Arc<dyn NodeRepository>, DomainError> {
-        Ok(self.open()?.repo)
-    }
-
-    /// The same store, viewed through the memory-graph port.
-    ///
-    /// Deliberately the *same* object as [`Self::node_repository`]: memories
-    /// live in `memory.duckdb` beside nodes and sessions, and a second handle
-    /// would put two writers on one file — DuckDB permits one.
     pub fn memory_repository(&self) -> Result<Arc<dyn MemoryRepository>, DomainError> {
         Ok(self.open()?.repo)
     }
 
-    /// Session import + memory extraction + virtual-filesystem summarization,
-    /// driven by the resolved chat model.
+    /// Session import + memory extraction, driven by the resolved chat model.
     pub fn memory_import_use_case(&self) -> Result<ImportSessionUseCase, DomainError> {
-        let node_repo = self.node_repository()?;
-        let embedder = self.embedder()?;
-        // Ingestion and summarization are separate usages: ingestion needs a
-        // model that holds a JSON schema, summarization is cheap and
-        // high-volume, so each resolves its own client.
         let ingestion = MemoryIngestionUseCase::new(
             self.chat_client_for(LlmUsage::ExtractMemories)?,
             self.memory_repository()?,
-            embedder.clone(),
+            self.embedder()?,
         );
-        let summary = SummarizeMemoryUseCase::new(
-            self.chat_client_for(LlmUsage::Summarize)?,
-            Arc::clone(&node_repo),
-            self.memory_repository()?,
-            Arc::new(embedder),
-        );
-        Ok(ImportSessionUseCase::new(node_repo, ingestion, summary))
+        Ok(ImportSessionUseCase::new(self.memory_repository()?, ingestion))
     }
 
-    /// Memory-graph ingestion, driven by the extraction model.
-    ///
-    /// Shares [`LlmUsage::ExtractMemories`] with the item extractor rather than
-    /// memorying a usage of its own: the two do the same job — read a transcript,
-    /// emit durable memory as JSON — so a user who has picked a model for
-    /// extraction has picked it for this too.
+    /// Memory ingestion, driven by the extraction model.
     pub fn memory_ingestion_use_case(&self) -> Result<MemoryIngestionUseCase, DomainError> {
         Ok(MemoryIngestionUseCase::new(
             self.chat_client_for(LlmUsage::ExtractMemories)?,
@@ -273,8 +252,8 @@ impl Container {
         ))
     }
 
-    /// Memory-graph recall. No chat model — retrieval is search plus a graph
-    /// walk, with no generation step.
+    /// Memory recall. No chat model — retrieval is search only, with no
+    /// generation step.
     pub fn memory_recall_use_case(&self) -> Result<MemoryRecallUseCase, DomainError> {
         Ok(MemoryRecallUseCase::new(
             self.memory_repository()?,
@@ -284,61 +263,17 @@ impl Container {
 
     /// The "what was I working on" briefing over recent sessions.
     pub fn memory_resume_use_case(&self) -> Result<MemoryResumeUseCase, DomainError> {
-        Ok(MemoryResumeUseCase::new(
-            self.node_repository()?,
-            self.memory_repository()?,
-        ))
+        Ok(MemoryResumeUseCase::new(self.memory_repository()?))
     }
 
-    pub fn memory_search_use_case(&self) -> Result<MemorySearchUseCase, DomainError> {
-        Ok(MemorySearchUseCase::new(
-            self.node_repository()?,
-            Arc::new(self.embedder()?),
-        ))
-    }
-
-    /// Unified search/browse over items + filesystem nodes (used by the TUI).
-    pub fn memory_browse_use_case(&self) -> Result<MemoryBrowseUseCase, DomainError> {
-        Ok(MemoryBrowseUseCase::new(
-            self.node_repository()?,
-            self.memory_repository()?,
-            self.embedder()?,
-        ))
-    }
-
-    /// Summarization use case (session/resource nodes + digest), driven by the
-    /// resolved chat model. Used to add resources and regenerate the digest.
-    pub fn memory_summary_use_case(&self) -> Result<SummarizeMemoryUseCase, DomainError> {
-        Ok(SummarizeMemoryUseCase::new(
-            self.chat_client_for(LlmUsage::Summarize)?,
-            self.node_repository()?,
-            self.memory_repository()?,
-            Arc::new(self.embedder()?),
-        ))
-    }
-
-    /// The dream cycle (harvest finished sessions + consolidate the store),
-    /// driven by the resolved chat model.
+    /// The harvest pass (import finished sessions), driven by the resolved
+    /// chat model.
     pub fn memory_dream_use_case(&self) -> Result<MemoryDreamUseCase, DomainError> {
-        // The consolidation pass reasons over the whole store, so it gets its
-        // own usage; the summary pass it composes keeps Summarize's.
-        let chat_client = self.chat_client_for(LlmUsage::Consolidate)?;
-        let node_repo = self.node_repository()?;
-        let embedder = self.embedder()?;
         let import = self.memory_import_use_case()?;
-        let summary = SummarizeMemoryUseCase::new(
-            self.chat_client_for(LlmUsage::Summarize)?,
-            Arc::clone(&node_repo),
-            self.memory_repository()?,
-            Arc::new(embedder.clone()),
-        );
         Ok(MemoryDreamUseCase::new(
-            node_repo,
-            chat_client,
-            Arc::new(embedder),
+            self.memory_repository()?,
             Arc::new(LocalSessionDiscovery::new(None)),
             import,
-            summary,
         ))
     }
 

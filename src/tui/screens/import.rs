@@ -124,16 +124,14 @@ impl ImportScreen {
     }
 
     fn seed_imported(&mut self, container: &Container) {
-        let Ok(repo) = container.node_repository() else {
+        let Ok(repo) = container.memory_repository() else {
             return;
         };
         let events_tx = self.events_tx.clone();
         // Read the imported set off-thread and feed each id back as an
-        // AlreadyImported marker. The stored session id matches the discovery
-        // id; source is not stored, so marks are keyed by id (applied to
-        // whichever discovered session carries that id, whenever it loads).
+        // AlreadyImported marker.
         tokio::spawn(async move {
-            if let Ok(sessions) = repo.list_sessions().await {
+            if let Ok(sessions) = repo.list_sessions(None, usize::MAX).await {
                 for s in sessions {
                     let _ = events_tx.send(ImportEvent::AlreadyImported(s.id));
                 }

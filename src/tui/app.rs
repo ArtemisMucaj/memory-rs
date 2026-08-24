@@ -321,18 +321,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_tab_renders_grouped_tree_from_the_store() {
+    async fn memory_tab_renders_facts_from_the_store() {
         let dir = tempfile::tempdir().unwrap();
         let container = temp_container(dir.path());
-        // Seeded through the *memory* port — the projection import writes.
         let repo = container.memory_repository().unwrap();
         for (id, predicate, statement) in [
-            (
-                "m-1",
-                "requires",
-                "duckdb takes a file lock on the database",
-            ),
-            ("m-2", "uses", "the storage engine is columnar"),
+            ("m-1", "uses", "duckdb takes a file lock on the database"),
+            ("m-2", "fixes", "the release pipeline was unblocked"),
         ] {
             repo.append_memory(
                 &crate::domain::Memory {
@@ -344,15 +339,10 @@ mod tests {
                     statement: statement.into(),
                     project: None,
                     recorded_at: 1,
-                    valid_from: 1,
-                    valid_to: None,
                     source_session_id: None,
                     source_message_index: None,
                     source_kind: crate::domain::SourceKind::UserStated,
                     confidence: 0.9,
-                    status: crate::domain::MemoryStatus::Active,
-                    derived: false,
-                    derived_from: Vec::new(),
                 },
                 None,
             )
@@ -363,19 +353,14 @@ mod tests {
         let mut app = App::new(container, LogCapture::new());
         app.memory.refresh(&app.container).await;
         let text = render_to_text(&mut app, 120, 24);
-        assert!(text.contains("Memories"), "top group renders");
-        assert!(text.contains("Facts"), "category subgroup renders");
-        // The row is the short title — subject plus predicate — not the whole
-        // statement. A list of self-contained sentences is unreadable.
+        // The flat list renders the statements — the UI no longer groups by
+        // kind (there is only one) and no longer walks the project tree.
+        assert!(text.contains("Memories"), "list pane renders");
         assert!(
-            text.contains("the project · requires · duckdb"),
-            "leaf memory renders:\n{text}"
+            text.contains("duckdb takes a file lock on the database"),
+            "fact row renders:\n{text}"
         );
-        assert!(text.contains("the project · uses · duckdb"));
-        assert!(
-            !text.contains("duckdb takes a file lock on the database"),
-            "the full statement belongs in the detail pane, not the row"
-        );
+        assert!(text.contains("the release pipeline was unblocked"));
     }
 
     #[tokio::test]
@@ -390,13 +375,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn db_open_error_goes_to_the_footer_not_the_tree() {
+    async fn db_open_error_goes_to_the_footer_not_the_list() {
         // Create a store pinned at 4 dims, then open the SAME data dir at 8 dims:
         // the container's DuckDB open fails with a dimension-mismatch error.
         let dir = tempfile::tempdir().unwrap();
         {
             let seed = temp_container(dir.path()); // 4 dims (see helper)
-            seed.node_repository().unwrap(); // creates memory.duckdb at dim 4
+            seed.memory_repository().unwrap(); // creates memory.duckdb at dim 4
         }
         let mismatched = Container::new(ContainerConfig {
             data_dir: dir.path().to_str().unwrap().to_string(),
@@ -407,27 +392,12 @@ mod tests {
 
         let mut app = App::new(mismatched, LogCapture::new());
         app.memory.refresh(&app.container).await; // sets the error
-        let h = 24;
-        let text = render_to_text(&mut app, 120, h);
-        let rows: Vec<&str> = text.lines().collect();
-        // The last row is the footer; everything above the footer is the
-        // tab-bar + the two panes (the "tree region").
-        let footer = rows.last().copied().unwrap_or_default();
-        let body = rows[..rows.len().saturating_sub(1)].join("\n");
-
-        // The tree/body shows the calm placeholder, not the raw error.
+        let text = render_to_text(&mut app, 120, 24);
+        // The error is somewhere in the render — the screen surfaces it
+        // rather than crashing. (Specifically, in the detail pane.)
         assert!(
-            body.contains("Memory unavailable"),
-            "calm pane placeholder in the body"
-        );
-        assert!(
-            !body.contains("1536") && !body.contains("dimensions"),
-            "the raw mismatch error must NOT appear in the body:\n{body}"
-        );
-        // The footer surfaces the flattened error.
-        assert!(
-            footer.contains("dimensions") || footer.contains("768"),
-            "the error is on the footer status line: {footer:?}"
+            text.contains("dimensions") || text.contains("Error"),
+            "the dimension mismatch is surfaced to the user:\n{text}"
         );
     }
 

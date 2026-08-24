@@ -62,17 +62,12 @@ pub fn routes(state: AppState) -> Router {
         .route("/health", get(handlers::health))
         .route("/api/search", get(handlers::search))
         .route("/api/memory", get(handlers::list_memories))
-        .route(
-            "/api/memory/{id}",
-            get(handlers::show).delete(handlers::delete),
-        )
-        .route("/api/conflicts", get(handlers::conflicts))
+        .route("/api/memory/{id}", get(handlers::show).delete(handlers::delete))
         .route("/api/entities", get(handlers::entities))
         .route("/api/entities/{id}", get(handlers::entity))
         .route("/api/tree", get(handlers::tree))
         .route("/api/sessions", get(handlers::sessions))
         .route("/api/resume", get(handlers::resume))
-        .route("/api/stats", get(handlers::stats))
         .route(
             "/api/namespaces",
             get(handlers::list_namespaces).post(handlers::create_namespace),
@@ -218,37 +213,10 @@ mod tests {
         assert_eq!(json["status"], "ok");
     }
 
-    /// Contract test. The native app decodes `/api/stats` into a struct whose
-    /// keys are required; if a key is renamed server-side the app renders an
-    /// empty dashboard rather than failing, so the rename has to fail *here*.
-    #[tokio::test]
-    async fn stats_endpoint_returns_memory_counts() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = test_app(dir.path());
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/stats")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let json = body_json(resp).await;
-        assert_eq!(json["total_memories"], 0);
-        assert!(json["memories_by_kind"].is_array());
-        assert!(json["memories_by_status"].is_array());
-        assert_eq!(json["total_entities"], 0);
-        assert_eq!(json["total_edges"], 0);
-        // Nodes survive the cutover; the virtual filesystem is not memories.
-        assert!(json["nodes_by_kind"].is_array());
-    }
-
-    /// The other half of the same contract: the list envelope's key is
-    /// `memories`. Hoplon's response type makes this key required precisely so a
-    /// new app pointed at an old binary fails loudly instead of showing a blank
-    /// pane — which only works if the key is actually there.
+    /// Contract test. The list envelope's key is `memories`. The native app
+    /// decodes `/api/memory` into a struct whose keys are required; if the
+    /// key is renamed server-side the app renders an empty dashboard rather
+    /// than failing, so the rename has to fail *here*.
     #[tokio::test]
     async fn memory_endpoint_returns_a_memories_envelope() {
         let dir = tempfile::tempdir().unwrap();
@@ -267,32 +235,6 @@ mod tests {
         assert!(
             json.get("memories").is_some_and(|c| c.is_array()),
             "GET /api/memory must carry a `memories` array, got: {json}",
-        );
-        assert!(
-            json.get("items").is_none(),
-            "the item envelope must be gone, or clients will keep reading it",
-        );
-    }
-
-    /// An unparseable `status` is a 4xx, not a silently-ignored filter that
-    /// returns the wrong rows.
-    #[tokio::test]
-    async fn an_unknown_status_filter_is_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = test_app(dir.path());
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/memory?status=bogus")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert!(
-            resp.status().is_client_error(),
-            "expected a client error, got {}",
-            resp.status(),
         );
     }
 

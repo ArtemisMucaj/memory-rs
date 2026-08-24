@@ -12,11 +12,13 @@
 pub mod error;
 pub mod memory;
 pub mod memory_graph;
+pub mod resource;
 pub mod session;
 pub mod similarity;
 
 pub use error::*;
 pub use memory::*;
 pub use memory_graph::*;
+pub use resource::*;
 pub use session::*;
 pub use similarity::*;
