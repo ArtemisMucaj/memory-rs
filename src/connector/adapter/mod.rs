@@ -18,6 +18,9 @@ mod duckdb_store;
 mod embedding;
 pub mod management;
 pub mod mcp;
+/// Working-directory → project-name derivation, shared by session discovery
+/// and the transcript parser so both scope a session identically.
+mod project;
 mod resource_fetch;
 mod session_discovery;
 mod transcript;
